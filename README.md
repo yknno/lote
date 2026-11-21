@@ -1,24 +1,61 @@
 # lote
 
-[![Package Version](https://img.shields.io/hexpm/v/lote)](https://hex.pm/packages/lote)
-[![Hex Docs](https://img.shields.io/badge/hex-docs-ffaff3)](https://lote.hexdocs.pm/)
+Gleam + PostgreSQL + Lustre Server Components (WebSocket) で作るリアルタイム micropost アプリ。
+
+## Stack
+
+- **Language / Runtime**: Gleam (Erlang/BEAM)
+- **Web / WebSocket**: Mist + Wisp + Lustre Server Components
+- **Database**: PostgreSQL 18 (`pog` + `cake` / `cake_pog` + `cigogne`)
+- **Auth**: Session Cookie (PostgreSQL) + Argon2id (`argus`)
+
+## Local Development
+
+### Prerequisites
+
+- [mise](https://mise.jdx.dev/)（[mise.toml](mise.toml) で Erlang / Gleam バージョンを管理）
+- Docker / Docker Compose
+
+### 1. Start PostgreSQL
 
 ```sh
-gleam add lote@1
-```
-```gleam
-import lote
-
-pub fn main() -> Nil {
-  // TODO: An example of the project in use
-}
+docker compose up -d
 ```
 
-Further documentation can be found at <https://lote.hexdocs.pm/>.
-
-## Development
+### 2. Run Migrations
 
 ```sh
-gleam run   # Run the project
-gleam test  # Run the tests
+DATABASE_URL=postgres://postgres:postgres@localhost:5432/lote \
+  mise exec -- gleam run -m cigogne -- all
+```
+
+### 3. Seed Development Users
+
+`alice` / `bob`（パスワード: `password1234`）を作成します（冪等）。
+
+```sh
+mise exec -- gleam run -m lote/seed
+```
+
+### 4. Start Server
+
+```sh
+AUTH_ADAPTERS=password mise exec -- gleam run
+```
+
+ブラウザで `http://localhost:8080` を開きます。
+
+## Environment Variables
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `PORT` | HTTP サーバーの待ち受けポート | `8080` |
+| `DATABASE_URL` | PostgreSQL 接続 URL | `postgres://postgres:postgres@localhost:5432/lote` |
+| `SECRET_KEY_BASE` | Cookie 署名キー | 起動時にランダム生成 |
+| `AUTH_ADAPTERS` | 有効にするログイン方式（カンマ区切り、例: `password`） | 空（すべて無効） |
+
+## Test
+
+```sh
+mise exec -- gleam test
 ```
