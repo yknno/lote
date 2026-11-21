@@ -2,7 +2,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/string
-import lote/db/sql
+import lote/db/post_repo
 import lote/realtime/pubsub.{type PubSub}
 import lustre
 import lustre/attribute
@@ -40,9 +40,8 @@ pub fn app() -> lustre.App(Flags, Model, Msg) {
 }
 
 fn init(flags: Flags) -> #(Model, Effect(Msg)) {
-  let posts = case sql.list_posts(flags.db, 50) {
-    Ok(returned) ->
-      list.map(returned.rows, fn(row) { Post(id: row.id, body: row.body) })
+  let posts = case post_repo.list_recent(flags.db, 50) {
+    Ok(rows) -> list.map(rows, fn(row) { Post(id: row.id, body: row.body) })
     Error(_) -> []
   }
 
@@ -72,12 +71,12 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         _ -> {
           let save_and_publish =
             effect.from(fn(_dispatch) {
-              case sql.create_post(model.db, body) {
-                Ok(pog.Returned(rows: [row, ..], ..)) -> {
+              case post_repo.create(model.db, body) {
+                Ok(row) -> {
                   let post = Post(id: row.id, body: row.body)
                   pubsub.publish(model.pubsub, post)
                 }
-                _ -> Nil
+                Error(_) -> Nil
               }
             })
           #(Model(..model, form_key: model.form_key + 1), save_and_publish)

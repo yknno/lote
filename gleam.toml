@@ -25,7 +25,8 @@ gleam_http = ">= 4.5.0 and < 5.0.0"
 pog = ">= 4.1.0 and < 5.0.0"
 cigogne = ">= 5.0.6 and < 6.0.0"
 gleam_time = ">= 1.11.0 and < 2.0.0"
+cake = ">= 4.1.0 and < 5.0.0"
+cake_pog = ">= 1.5.0 and < 2.0.0"
 
 [dev_dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"
-squirrel = ">= 4.7.0 and < 5.0.0"
