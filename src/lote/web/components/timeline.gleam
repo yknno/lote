@@ -1,7 +1,9 @@
 import gleam/erlang/process
 import gleam/int
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/string
+import lote/auth/user.{type AuthUser}
 import lote/db/post_repo
 import lote/realtime/pubsub.{type PubSub}
 import lustre
@@ -18,13 +20,14 @@ pub type Post {
 }
 
 pub type Flags {
-  Flags(db: pog.Connection, pubsub: PubSub(Post))
+  Flags(db: pog.Connection, pubsub: PubSub(Post), user: Option(AuthUser))
 }
 
 pub type Model {
   Model(
     db: pog.Connection,
     pubsub: PubSub(Post),
+    user: Option(AuthUser),
     posts: List(Post),
     form_key: Int,
   )
@@ -53,7 +56,13 @@ fn init(flags: Flags) -> #(Model, Effect(Msg)) {
     })
 
   #(
-    Model(db: flags.db, pubsub: flags.pubsub, posts:, form_key: 0),
+    Model(
+      db: flags.db,
+      pubsub: flags.pubsub,
+      user: flags.user,
+      posts:,
+      form_key: 0,
+    ),
     subscribe_effect,
   )
 }
@@ -61,25 +70,30 @@ fn init(flags: Flags) -> #(Model, Effect(Msg)) {
 fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     UserSubmittedForm(fields) -> {
-      let body = case list.key_find(fields, "body") {
-        Ok(value) -> string.trim(value)
-        Error(_) -> ""
-      }
+      case model.user {
+        None -> #(model, effect.none())
+        Some(_) -> {
+          let body = case list.key_find(fields, "body") {
+            Ok(value) -> string.trim(value)
+            Error(_) -> ""
+          }
 
-      case body {
-        "" -> #(model, effect.none())
-        _ -> {
-          let save_and_publish =
-            effect.from(fn(_dispatch) {
-              case post_repo.create(model.db, body) {
-                Ok(row) -> {
-                  let post = Post(id: row.id, body: row.body)
-                  pubsub.publish(model.pubsub, post)
-                }
-                Error(_) -> Nil
-              }
-            })
-          #(Model(..model, form_key: model.form_key + 1), save_and_publish)
+          case body {
+            "" -> #(model, effect.none())
+            _ -> {
+              let save_and_publish =
+                effect.from(fn(_dispatch) {
+                  case post_repo.create(model.db, body) {
+                    Ok(row) -> {
+                      let post = Post(id: row.id, body: row.body)
+                      pubsub.publish(model.pubsub, post)
+                    }
+                    Error(_) -> Nil
+                  }
+                })
+              #(Model(..model, form_key: model.form_key + 1), save_and_publish)
+            }
+          }
         }
       }
     }
@@ -92,23 +106,29 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 }
 
 fn view(model: Model) -> Element(Msg) {
+  let composer = case model.user {
+    Some(_) ->
+      html.form(
+        [
+          attribute.id("post-form-" <> int.to_string(model.form_key)),
+          event.on_submit(UserSubmittedForm),
+        ],
+        [
+          html.input([
+            attribute.type_("text"),
+            attribute.name("body"),
+            attribute.placeholder("いまどうしてる？"),
+            attribute.value(""),
+            attribute.required(True),
+          ]),
+          html.button([attribute.type_("submit")], [html.text("Post")]),
+        ],
+      )
+    None -> html.p([], [html.text("投稿するにはログインしてください。")])
+  }
+
   html.div([], [
-    html.form(
-      [
-        attribute.id("post-form-" <> int.to_string(model.form_key)),
-        event.on_submit(UserSubmittedForm),
-      ],
-      [
-        html.input([
-          attribute.type_("text"),
-          attribute.name("body"),
-          attribute.placeholder("いまどうしてる？"),
-          attribute.value(""),
-          attribute.required(True),
-        ]),
-        html.button([attribute.type_("submit")], [html.text("Post")]),
-      ],
-    ),
+    composer,
     html.ul(
       [],
       list.map(model.posts, fn(post) { html.li([], [html.text(post.body)]) }),

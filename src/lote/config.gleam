@@ -1,10 +1,17 @@
 import envoy
 import gleam/int
+import gleam/list
 import gleam/result
+import gleam/string
 import wisp
 
 pub type Config {
-  Config(port: Int, secret_key_base: String, database_url: String)
+  Config(
+    port: Int,
+    secret_key_base: String,
+    database_url: String,
+    auth_adapters: List(String),
+  )
 }
 
 pub fn load() -> Config {
@@ -21,5 +28,12 @@ pub fn load() -> Config {
     envoy.get("DATABASE_URL")
     |> result.unwrap("postgres://postgres:postgres@localhost:5432/lote")
 
-  Config(port:, secret_key_base:, database_url:)
+  let auth_adapters =
+    envoy.get("AUTH_ADAPTERS")
+    |> result.unwrap("")
+    |> string.split(",")
+    |> list.map(fn(s) { string.lowercase(string.trim(s)) })
+    |> list.filter(fn(s) { s != "" })
+
+  Config(port:, secret_key_base:, database_url:, auth_adapters:)
 }

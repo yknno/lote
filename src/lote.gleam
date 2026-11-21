@@ -2,7 +2,10 @@ import gleam/erlang/process.{type Subject}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/json
+import gleam/list
 import gleam/option.{Some}
+import lote/auth.{type Auth, Auth, Password}
+import lote/auth/session
 import lote/config
 import lote/db/pool
 import lote/realtime/pubsub.{type PubSub}
@@ -20,13 +23,25 @@ pub fn main() -> Nil {
 
   let cfg = config.load()
   let db = pool.start(cfg.database_url)
+
+  let methods =
+    list.filter_map(cfg.auth_adapters, fn(name) {
+      case name {
+        "password" -> Ok(Password)
+        _ -> Error(Nil)
+      }
+    })
+
+  let auth_ctx = Auth(db:, secret_key_base: cfg.secret_key_base, methods:)
+
   let assert Ok(post_pubsub) = pubsub.start()
-  let http_handler = wisp_mist.handler(router.handle_request, cfg.secret_key_base)
+  let http_handler =
+    wisp_mist.handler(router.handle_request(_, auth_ctx), cfg.secret_key_base)
 
   let assert Ok(_) =
     fn(req: Request(Connection)) -> Response(ResponseData) {
       case request.path_segments(req) {
-        ["ws"] -> serve_timeline_ws(req, db, post_pubsub)
+        ["ws"] -> serve_timeline_ws(req, db, post_pubsub, auth_ctx)
         _ -> http_handler(req)
       }
     }
@@ -49,11 +64,15 @@ fn serve_timeline_ws(
   req: Request(Connection),
   db: pog.Connection,
   post_pubsub: PubSub(timeline.Post),
+  auth_ctx: Auth,
 ) -> Response(ResponseData) {
+  let current_user =
+    session.current_user(req, auth_ctx.db, auth_ctx.secret_key_base)
+
   mist.websocket(
     request: req,
     on_init: fn(_conn) {
-      let flags = timeline.Flags(db:, pubsub: post_pubsub)
+      let flags = timeline.Flags(db:, pubsub: post_pubsub, user: current_user)
       let assert Ok(component) =
         lustre.start_server_component(timeline.app(), flags)
       let self = process.new_subject()
