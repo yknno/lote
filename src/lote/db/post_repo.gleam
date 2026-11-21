@@ -2,6 +2,7 @@ import cake/adapter/postgres
 import cake/insert as i
 import cake/select as s
 import gleam/dynamic/decode
+import gleam/time/calendar
 import gleam/time/timestamp.{type Timestamp}
 import pog
 
@@ -43,6 +44,12 @@ pub fn list_recent(
 fn post_decoder() -> decode.Decoder(PostRow) {
   use id <- decode.field(0, decode.int)
   use body <- decode.field(1, decode.string)
-  use created_at <- decode.field(2, pog.timestamp_decoder())
+  use created_at <- decode.field(2, timestamptz_decoder())
   decode.success(PostRow(id:, body:, created_at:))
+}
+
+fn timestamptz_decoder() -> decode.Decoder(Timestamp) {
+  use date <- decode.field(0, pog.calendar_date_decoder())
+  use time <- decode.field(1, pog.calendar_time_of_day_decoder())
+  decode.success(timestamp.from_calendar(date, time, calendar.utc_offset))
 }
