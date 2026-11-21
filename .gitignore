@@ -2,6 +2,5 @@
 *.ez
 /build
 erl_crash.dump
-.env
 .lustre
 priv/static/app.css
