@@ -8,22 +8,78 @@ import wisp
 
 pub fn login_page(methods: List(Method), error: Option(String)) -> wisp.Response {
   let error_el = case error {
-    Some(msg) -> html.p([], [html.text(msg)])
+    Some(msg) ->
+      html.p(
+        [
+          attribute.class(
+            "mb-3 border border-red-300 bg-red-50 px-3 py-2 text-xs text-red-700",
+          ),
+        ],
+        [html.text(msg)],
+      )
     None -> element.none()
   }
 
   let sections = case methods {
-    [] -> [html.p([], [html.text("利用可能な認証方法がありません。")])]
+    [] -> [
+      html.p([attribute.class("text-xs text-neutral-500")], [
+        html.text("No login methods enabled."),
+      ]),
+    ]
     _ -> list.map(methods, method_section)
   }
 
   let doc =
-    html.html([attribute.lang("ja")], [
+    html.html([attribute.lang("ja"), attribute.class("bg-white")], [
       html.head([], [
         html.meta([attribute.charset("utf-8")]),
-        html.title([], "Login - lote"),
+        html.meta([
+          attribute.name("viewport"),
+          attribute.content("width=device-width, initial-scale=1"),
+        ]),
+        html.title([], "Log in - lote"),
+        html.link([
+          attribute.rel("stylesheet"),
+          attribute.href("/static/app.css"),
+        ]),
       ]),
-      html.body([], [html.h1([], [html.text("lote")]), error_el, ..sections]),
+      html.body([attribute.class("min-h-screen bg-white text-neutral-950")], [
+        html.div(
+          [
+            attribute.class(
+              "mx-auto min-h-screen max-w-2xl border-x border-neutral-200",
+            ),
+          ],
+          [
+            html.header(
+              [
+                attribute.class(
+                  "flex h-11 items-center justify-between border-b border-neutral-200 px-4",
+                ),
+              ],
+              [
+                html.a(
+                  [
+                    attribute.href("/"),
+                    attribute.class(
+                      "font-mono text-sm font-bold tracking-tight text-neutral-950",
+                    ),
+                  ],
+                  [html.text("lote")],
+                ),
+              ],
+            ),
+            html.main([attribute.class("max-w-xs px-4 py-6")], [
+              html.h1(
+                [attribute.class("mb-4 text-sm font-semibold text-neutral-950")],
+                [html.text("Log in")],
+              ),
+              error_el,
+              ..sections
+            ]),
+          ],
+        ),
+      ]),
     ])
     |> element.to_document_string
 
@@ -33,26 +89,59 @@ pub fn login_page(methods: List(Method), error: Option(String)) -> wisp.Response
 fn method_section(method: Method) -> element.Element(Nil) {
   case method {
     Password ->
-      html.section([], [
-        html.h2([], [html.text("Login")]),
-        html.form(
-          [attribute.method("post"), attribute.action("/auth/password/login")],
-          [
+      html.form(
+        [
+          attribute.method("post"),
+          attribute.action("/auth/password/login"),
+          attribute.class("flex flex-col gap-3"),
+        ],
+        [
+          html.div([attribute.class("flex flex-col gap-1")], [
+            html.label(
+              [
+                attribute.for("login_id"),
+                attribute.class("text-xs text-neutral-600"),
+              ],
+              [html.text("Login ID")],
+            ),
             html.input([
+              attribute.id("login_id"),
               attribute.type_("text"),
               attribute.name("login_id"),
-              attribute.placeholder("Login ID"),
               attribute.required(True),
+              attribute.class(
+                "w-full border border-neutral-300 px-2.5 py-1.5 text-sm text-neutral-950 focus:border-neutral-950 focus:outline-none",
+              ),
             ]),
+          ]),
+          html.div([attribute.class("flex flex-col gap-1")], [
+            html.label(
+              [
+                attribute.for("password"),
+                attribute.class("text-xs text-neutral-600"),
+              ],
+              [html.text("Password")],
+            ),
             html.input([
+              attribute.id("password"),
               attribute.type_("password"),
               attribute.name("password"),
-              attribute.placeholder("Password"),
               attribute.required(True),
+              attribute.class(
+                "w-full border border-neutral-300 px-2.5 py-1.5 text-sm text-neutral-950 focus:border-neutral-950 focus:outline-none",
+              ),
             ]),
-            html.button([attribute.type_("submit")], [html.text("Login")]),
-          ],
-        ),
-      ])
+          ]),
+          html.button(
+            [
+              attribute.type_("submit"),
+              attribute.class(
+                "mt-1 w-fit cursor-pointer bg-neutral-950 px-4 py-1.5 text-xs font-medium text-white hover:bg-neutral-800",
+              ),
+            ],
+            [html.text("Log in")],
+          ),
+        ],
+      )
   }
 }

@@ -37,7 +37,14 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/lote \
 mise exec -- gleam run -m lote/seed
 ```
 
-### 4. Start Server
+### 4. Build CSS (Tailwind)
+
+```sh
+mise exec -- gleam run -m lustre/dev add tailwind
+.lustre/bin/tailwindcss-linux-x64/tailwindcss-linux-x64 -i src/lote.css -o priv/static/app.css --minify
+```
+
+### 5. Start Server
 
 ```sh
 AUTH_ADAPTERS=password mise exec -- gleam run
