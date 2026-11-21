@@ -16,7 +16,7 @@ import lustre/server_component
 import pog
 
 pub type Post {
-  Post(id: Int, body: String)
+  Post(id: Int, author_name: String, body: String)
 }
 
 pub type Flags {
@@ -44,7 +44,10 @@ pub fn app() -> lustre.App(Flags, Model, Msg) {
 
 fn init(flags: Flags) -> #(Model, Effect(Msg)) {
   let posts = case post_repo.list_recent(flags.db, 50) {
-    Ok(rows) -> list.map(rows, fn(row) { Post(id: row.id, body: row.body) })
+    Ok(rows) ->
+      list.map(rows, fn(row) {
+        Post(id: row.id, author_name: row.author_name, body: row.body)
+      })
     Error(_) -> []
   }
 
@@ -72,7 +75,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     UserSubmittedForm(fields) -> {
       case model.user {
         None -> #(model, effect.none())
-        Some(_) -> {
+        Some(auth_user) -> {
           let body = case list.key_find(fields, "body") {
             Ok(value) -> string.trim(value)
             Error(_) -> ""
@@ -83,9 +86,14 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             _ -> {
               let save_and_publish =
                 effect.from(fn(_dispatch) {
-                  case post_repo.create(model.db, body) {
+                  case post_repo.create(model.db, auth_user.id, body) {
                     Ok(row) -> {
-                      let post = Post(id: row.id, body: row.body)
+                      let post =
+                        Post(
+                          id: row.id,
+                          author_name: auth_user.name,
+                          body: row.body,
+                        )
                       pubsub.publish(model.pubsub, post)
                     }
                     Error(_) -> Nil
@@ -131,7 +139,12 @@ fn view(model: Model) -> Element(Msg) {
     composer,
     html.ul(
       [],
-      list.map(model.posts, fn(post) { html.li([], [html.text(post.body)]) }),
+      list.map(model.posts, fn(post) {
+        html.li([], [
+          html.strong([], [html.text(post.author_name)]),
+          html.text(": " <> post.body),
+        ])
+      }),
     ),
   ])
 }
