@@ -1,3 +1,4 @@
 [tools]
 erlang = "29.1.2"
 gleam = "1.19.2"
+rebar = "3.28.0"
