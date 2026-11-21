@@ -4,6 +4,7 @@ import gleam/http/response.{type Response}
 import gleam/json
 import gleam/option.{Some}
 import lote/config
+import lote/realtime/pubsub
 import lote/web/components/counter
 import lote/web/router
 import lustre
@@ -16,12 +17,14 @@ pub fn main() -> Nil {
   wisp.configure_logger()
 
   let cfg = config.load()
+  let assert Ok(counter_pubsub) = pubsub.start()
+  let assert Ok(counter_store) = counter.start_store(counter_pubsub)
   let http_handler = wisp_mist.handler(router.handle_request, cfg.secret_key_base)
 
   let assert Ok(_) =
     fn(req: Request(Connection)) -> Response(ResponseData) {
       case request.path_segments(req) {
-        ["ws"] -> serve_counter_ws(req)
+        ["ws"] -> serve_counter_ws(req, counter_store)
         _ -> http_handler(req)
       }
     }
@@ -40,11 +43,15 @@ type WsState {
   )
 }
 
-fn serve_counter_ws(req: Request(Connection)) -> Response(ResponseData) {
+fn serve_counter_ws(
+  req: Request(Connection),
+  store: counter.Store,
+) -> Response(ResponseData) {
   mist.websocket(
     request: req,
     on_init: fn(_conn) {
-      let assert Ok(component) = lustre.start_server_component(counter.app(), Nil)
+      let assert Ok(component) =
+        lustre.start_server_component(counter.app(), store)
       let self = process.new_subject()
       let selector = process.new_selector() |> process.select(self)
 
@@ -77,7 +84,10 @@ fn serve_counter_ws(req: Request(Connection)) -> Response(ResponseData) {
       }
     },
     on_close: fn(state: WsState) {
-      lustre.send(state.component, server_component.deregister_subject(state.self))
+      lustre.send(
+        state.component,
+        server_component.deregister_subject(state.self),
+      )
       lustre.send(state.component, lustre.shutdown())
     },
   )
