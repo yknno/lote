@@ -4,12 +4,14 @@ import gleam/http/response.{type Response}
 import gleam/json
 import gleam/option.{Some}
 import lote/config
-import lote/realtime/pubsub
-import lote/web/components/counter
+import lote/db/pool
+import lote/realtime/pubsub.{type PubSub}
+import lote/web/components/timeline
 import lote/web/router
 import lustre
 import lustre/server_component
 import mist.{type Connection, type ResponseData}
+import pog
 import wisp
 import wisp/wisp_mist
 
@@ -17,14 +19,14 @@ pub fn main() -> Nil {
   wisp.configure_logger()
 
   let cfg = config.load()
-  let assert Ok(counter_pubsub) = pubsub.start()
-  let assert Ok(counter_store) = counter.start_store(counter_pubsub)
+  let db = pool.start(cfg.database_url)
+  let assert Ok(post_pubsub) = pubsub.start()
   let http_handler = wisp_mist.handler(router.handle_request, cfg.secret_key_base)
 
   let assert Ok(_) =
     fn(req: Request(Connection)) -> Response(ResponseData) {
       case request.path_segments(req) {
-        ["ws"] -> serve_counter_ws(req, counter_store)
+        ["ws"] -> serve_timeline_ws(req, db, post_pubsub)
         _ -> http_handler(req)
       }
     }
@@ -38,20 +40,22 @@ pub fn main() -> Nil {
 
 type WsState {
   WsState(
-    component: lustre.Runtime(counter.Msg),
-    self: Subject(server_component.ClientMessage(counter.Msg)),
+    component: lustre.Runtime(timeline.Msg),
+    self: Subject(server_component.ClientMessage(timeline.Msg)),
   )
 }
 
-fn serve_counter_ws(
+fn serve_timeline_ws(
   req: Request(Connection),
-  store: counter.Store,
+  db: pog.Connection,
+  post_pubsub: PubSub(timeline.Post),
 ) -> Response(ResponseData) {
   mist.websocket(
     request: req,
     on_init: fn(_conn) {
+      let flags = timeline.Flags(db:, pubsub: post_pubsub)
       let assert Ok(component) =
-        lustre.start_server_component(counter.app(), store)
+        lustre.start_server_component(timeline.app(), flags)
       let self = process.new_subject()
       let selector = process.new_selector() |> process.select(self)
 

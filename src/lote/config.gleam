@@ -4,7 +4,7 @@ import gleam/result
 import wisp
 
 pub type Config {
-  Config(port: Int, secret_key_base: String)
+  Config(port: Int, secret_key_base: String, database_url: String)
 }
 
 pub fn load() -> Config {
@@ -17,5 +17,9 @@ pub fn load() -> Config {
     envoy.get("SECRET_KEY_BASE")
     |> result.lazy_unwrap(fn() { wisp.random_string(64) })
 
-  Config(port:, secret_key_base:)
+  let database_url =
+    envoy.get("DATABASE_URL")
+    |> result.unwrap("postgres://postgres:postgres@localhost:5432/lote")
+
+  Config(port:, secret_key_base:, database_url:)
 }
