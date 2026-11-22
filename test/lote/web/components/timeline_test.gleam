@@ -3,6 +3,7 @@ import gleam/erlang/process
 import gleam/json
 import gleam/list
 import gleam/option.{Some}
+import gleam/string
 import lote/auth/user
 import lote/db/post_repo
 import lote/realtime/pubsub
@@ -207,6 +208,179 @@ pub fn unauthenticated_user_cannot_submit_post_test() {
   let assert Ok(_reconcile) = process.receive(client, 500)
   assert process.receive(pubsub_sub, 50) == Error(Nil)
   assert post_repo.list_recent(tx, 10) == Ok([])
+
+  shutdown_and_wait(component)
+}
+
+fn receive_json(
+  client: process.Subject(server_component.ClientMessage(timeline.Msg)),
+) -> String {
+  let assert Ok(msg) = process.receive(client, 500)
+  msg
+  |> server_component.client_message_to_json
+  |> json.to_string
+}
+
+pub fn incoming_post_shows_pending_banner_until_refreshed_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(bob) = user.create(tx, "Bob")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let flags =
+    timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "test-csrf-token",
+    )
+  let assert Ok(component) =
+    lustre.start_server_component(timeline.app(), flags)
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+  let _mount = receive_json(client)
+
+  // Bob publishes two posts while Alice has auto-refresh off
+  let assert Ok(row1) = post_repo.create(tx, bob.id, "bob first post")
+  pubsub.publish(
+    post_pubsub,
+    timeline.Post(id: row1.id, author_name: bob.name, body: row1.body),
+  )
+  let patch1 = receive_json(client)
+  assert string.contains(patch1, "Show 1 new post")
+  assert !string.contains(patch1, "bob first post")
+
+  let assert Ok(row2) = post_repo.create(tx, bob.id, "bob second post")
+  pubsub.publish(
+    post_pubsub,
+    timeline.Post(id: row2.id, author_name: bob.name, body: row2.body),
+  )
+  let patch2 = receive_json(client)
+  assert string.contains(patch2, "Show 2 new posts")
+  assert !string.contains(patch2, "bob second post")
+
+  // Clicking refresh reloads both posts from DB and clears pending banner
+  lustre.dispatch(timeline.UserClickedRefresh)
+  |> lustre.send(to: component)
+  let refresh_patch = receive_json(client)
+  assert string.contains(refresh_patch, "bob first post")
+  assert string.contains(refresh_patch, "bob second post")
+  assert !string.contains(refresh_patch, "Show 2 new posts")
+
+  shutdown_and_wait(component)
+}
+
+pub fn submitting_own_post_refreshes_pending_posts_without_echo_banner_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(bob) = user.create(tx, "Bob")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let flags =
+    timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "test-csrf-token",
+    )
+  let assert Ok(component) =
+    lustre.start_server_component(timeline.app(), flags)
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+  let _mount = receive_json(client)
+
+  // Bob posts first, queued as pending for Alice
+  let assert Ok(bob_row) = post_repo.create(tx, bob.id, "bob pending post")
+  pubsub.publish(
+    post_pubsub,
+    timeline.Post(id: bob_row.id, author_name: bob.name, body: bob_row.body),
+  )
+  let pending_patch = receive_json(client)
+  assert string.contains(pending_patch, "Show 1 new post")
+
+  // Alice submits her own post: should reset form, reload DB (showing Bob's + Alice's posts),
+  // and ignore the echoed PostCreated for her own post without showing a new pending banner.
+  lustre.dispatch(timeline.UserSubmittedForm([#("body", "alice own post")]))
+  |> lustre.send(to: component)
+
+  let _form_replace_patch = receive_json(client)
+  let reloaded_patch = receive_json(client)
+  assert string.contains(reloaded_patch, "alice own post")
+  assert string.contains(reloaded_patch, "bob pending post")
+
+  // Echoed PostCreated(alice_post) produces an empty no-op patch (no pending banner)
+  let echo_patch = receive_json(client)
+  assert !string.contains(echo_patch, "Show 1 new post")
+
+  shutdown_and_wait(component)
+}
+
+pub fn toggling_auto_refresh_flushes_pending_and_streams_new_posts_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(bob) = user.create(tx, "Bob")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let flags =
+    timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "test-csrf-token",
+    )
+  let assert Ok(component) =
+    lustre.start_server_component(timeline.app(), flags)
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+  let _mount = receive_json(client)
+
+  // Bob posts while auto-refresh is OFF -> buffered
+  let assert Ok(row1) = post_repo.create(tx, bob.id, "pending before live")
+  pubsub.publish(
+    post_pubsub,
+    timeline.Post(id: row1.id, author_name: bob.name, body: row1.body),
+  )
+  let pending_patch = receive_json(client)
+  assert string.contains(pending_patch, "Show 1 new post")
+
+  // Toggle Live ON -> immediately reloads pending post from DB
+  lustre.dispatch(timeline.UserToggledAutoRefresh)
+  |> lustre.send(to: component)
+  let live_on_patch = receive_json(client)
+  assert string.contains(live_on_patch, "pending before live")
+
+  // New post while Live is ON -> streamed immediately into feed
+  let assert Ok(row2) = post_repo.create(tx, bob.id, "streamed live post")
+  pubsub.publish(
+    post_pubsub,
+    timeline.Post(id: row2.id, author_name: bob.name, body: row2.body),
+  )
+  let live_patch = receive_json(client)
+  assert string.contains(live_patch, "streamed live post")
+  assert !string.contains(live_patch, "Show 1 new post")
+
+  // Toggle Live back OFF -> subsequent posts are buffered again
+  lustre.dispatch(timeline.UserToggledAutoRefresh)
+  |> lustre.send(to: component)
+  let _live_off_patch = receive_json(client)
+
+  let assert Ok(row3) = post_repo.create(tx, bob.id, "buffered after live off")
+  pubsub.publish(
+    post_pubsub,
+    timeline.Post(id: row3.id, author_name: bob.name, body: row3.body),
+  )
+  let buffered_again_patch = receive_json(client)
+  assert string.contains(buffered_again_patch, "Show 1 new post")
+  assert !string.contains(buffered_again_patch, "buffered after live off")
 
   shutdown_and_wait(component)
 }

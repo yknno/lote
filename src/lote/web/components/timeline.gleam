@@ -17,6 +17,8 @@ import lustre/event
 import lustre/server_component
 import pog
 
+const recent_posts_limit = 50
+
 pub type Post {
   Post(id: Int, author_name: String, body: String)
 }
@@ -37,12 +39,17 @@ pub type Model {
     user: Option(AuthUser),
     csrf_token: String,
     posts: List(Post),
+    pending_count: Int,
+    auto_refresh: Bool,
     form_key: Int,
   )
 }
 
 pub type Msg {
   UserSubmittedForm(List(#(String, String)))
+  UserClickedRefresh
+  UserToggledAutoRefresh
+  PostsReloaded(List(Post))
   PostCreated(Post)
 }
 
@@ -50,12 +57,28 @@ pub fn app() -> lustre.App(Flags, Model, Msg) {
   lustre.application(init:, update:, view:)
 }
 
-fn init(flags: Flags) -> #(Model, Effect(Msg)) {
-  let posts = case post_repo.list_recent(flags.db, 50) {
+fn load_recent_posts(db: pog.Connection) -> Result(List(Post), pog.QueryError) {
+  case post_repo.list_recent(db, recent_posts_limit) {
     Ok(rows) ->
-      list.map(rows, fn(row) {
-        Post(id: row.id, author_name: row.author_name, body: row.body)
-      })
+      Ok(
+        list.map(rows, fn(row) {
+          Post(id: row.id, author_name: row.author_name, body: row.body)
+        }),
+      )
+    Error(err) -> Error(err)
+  }
+}
+
+fn latest_post_id(posts: List(Post)) -> Int {
+  case posts {
+    [first, ..] -> first.id
+    [] -> 0
+  }
+}
+
+fn init(flags: Flags) -> #(Model, Effect(Msg)) {
+  let posts = case load_recent_posts(flags.db) {
+    Ok(posts) -> posts
     Error(_) -> []
   }
 
@@ -73,6 +96,8 @@ fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       user: flags.user,
       csrf_token: flags.csrf_token,
       posts:,
+      pending_count: 0,
+      auto_refresh: False,
       form_key: 0,
     ),
     subscribe_effect,
@@ -94,7 +119,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             "" -> #(model, effect.none())
             _ -> {
               let save_and_publish =
-                effect.from(fn(_dispatch) {
+                effect.from(fn(dispatch) {
                   case post_repo.create(model.db, auth_user.id, body) {
                     Ok(row) -> {
                       let post =
@@ -103,6 +128,10 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                           author_name: auth_user.name,
                           body: row.body,
                         )
+                      case load_recent_posts(model.db) {
+                        Ok(posts) -> dispatch(PostsReloaded(posts))
+                        Error(_) -> Nil
+                      }
                       pubsub.publish(model.pubsub, post)
                     }
                     Error(_) -> Nil
@@ -115,10 +144,53 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
     }
 
-    PostCreated(post) -> #(
-      Model(..model, posts: [post, ..model.posts]),
+    UserClickedRefresh ->
+      case load_recent_posts(model.db) {
+        Ok(posts) -> #(Model(..model, posts:, pending_count: 0), effect.none())
+        Error(_) -> #(model, effect.none())
+      }
+
+    UserToggledAutoRefresh ->
+      case model.auto_refresh {
+        True -> #(Model(..model, auto_refresh: False), effect.none())
+        False ->
+          case model.pending_count > 0 {
+            True ->
+              case load_recent_posts(model.db) {
+                Ok(posts) -> #(
+                  Model(..model, posts:, pending_count: 0, auto_refresh: True),
+                  effect.none(),
+                )
+                Error(_) -> #(Model(..model, auto_refresh: True), effect.none())
+              }
+            False -> #(Model(..model, auto_refresh: True), effect.none())
+          }
+      }
+
+    PostsReloaded(posts) -> #(
+      Model(..model, posts:, pending_count: 0),
       effect.none(),
     )
+
+    PostCreated(post) ->
+      case post.id <= latest_post_id(model.posts) {
+        True -> #(model, effect.none())
+        False ->
+          case model.auto_refresh {
+            True -> #(
+              Model(
+                ..model,
+                posts: list.take([post, ..model.posts], recent_posts_limit),
+                pending_count: 0,
+              ),
+              effect.none(),
+            )
+            False -> #(
+              Model(..model, pending_count: model.pending_count + 1),
+              effect.none(),
+            )
+          }
+      }
   }
 }
 
@@ -171,11 +243,15 @@ fn view(model: Model) -> Element(Msg) {
             ],
             [html.text("Timeline")],
           ),
-          html.span([attribute.class("font-mono text-xs text-neutral-400")], [
-            html.text(int.to_string(list.length(model.posts)) <> " posts"),
+          html.div([attribute.class("flex items-center gap-3")], [
+            auto_refresh_toggle(model.auto_refresh),
+            html.span([attribute.class("font-mono text-xs text-neutral-400")], [
+              html.text(int.to_string(list.length(model.posts)) <> " posts"),
+            ]),
           ]),
         ],
       ),
+      pending_banner(model.pending_count),
       feed(model.posts),
     ])
 
@@ -183,6 +259,56 @@ fn view(model: Model) -> Element(Msg) {
     sidebar,
     timeline_pane,
   ])
+}
+
+fn auto_refresh_toggle(enabled: Bool) -> Element(Msg) {
+  let #(button_class, dot_class, pressed) = case enabled {
+    True -> #(
+      "inline-flex cursor-pointer items-center gap-1.5 border border-neutral-950 bg-neutral-950 px-2 py-0.5 text-xs font-medium text-white hover:bg-neutral-800",
+      "inline-block h-1.5 w-1.5 rounded-full bg-emerald-400",
+      "true",
+    )
+    False -> #(
+      "inline-flex cursor-pointer items-center gap-1.5 border border-neutral-300 bg-white px-2 py-0.5 text-xs font-medium text-neutral-600 hover:border-neutral-950 hover:text-neutral-950",
+      "inline-block h-1.5 w-1.5 rounded-full bg-neutral-300",
+      "false",
+    )
+  }
+
+  html.button(
+    [
+      attribute.type_("button"),
+      attribute.attribute("aria-pressed", pressed),
+      event.on_click(UserToggledAutoRefresh),
+      attribute.class(button_class),
+    ],
+    [
+      html.span([attribute.class(dot_class)], []),
+      html.text("Live"),
+    ],
+  )
+}
+
+fn pending_banner(pending_count: Int) -> Element(Msg) {
+  case pending_count {
+    count if count > 0 -> {
+      let label = case count {
+        1 -> "Show 1 new post"
+        n -> "Show " <> int.to_string(n) <> " new posts"
+      }
+      html.button(
+        [
+          attribute.type_("button"),
+          event.on_click(UserClickedRefresh),
+          attribute.class(
+            "w-full cursor-pointer border-b border-neutral-200 bg-neutral-50 px-4 py-2 text-center text-xs font-medium text-neutral-900 hover:bg-neutral-100",
+          ),
+        ],
+        [html.text(label)],
+      )
+    }
+    _ -> element.none()
+  }
 }
 
 fn account_bar(
