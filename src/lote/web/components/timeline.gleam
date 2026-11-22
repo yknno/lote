@@ -60,6 +60,7 @@ pub type Model {
     auto_refresh: Bool,
     confirming_delete: Option(String),
     form_key: Int,
+    form_error: Option(String),
   )
 }
 
@@ -163,6 +164,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       auto_refresh: False,
       confirming_delete: None,
       form_key: 0,
+      form_error: None,
     ),
     subscribe_effect,
   )
@@ -174,14 +176,34 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       case model.user {
         None -> #(model, effect.none())
         Some(auth_user) -> {
-          let body = case list.key_find(fields, "body") {
-            Ok(value) -> string.trim(value)
+          let raw_body = case list.key_find(fields, "body") {
+            Ok(value) -> value
             Error(_) -> ""
           }
 
-          case body {
-            "" -> #(model, effect.none())
-            _ -> {
+          case post_repo.validate_body(raw_body) {
+            Error(post_repo.EmptyBody) -> #(
+              Model(..model, form_error: None),
+              effect.none(),
+            )
+
+            Error(post_repo.BodyTooLong(length:, max:)) -> #(
+              Model(
+                ..model,
+                form_error: Some(
+                  "Post must be "
+                  <> int.to_string(max)
+                  <> " characters or fewer ("
+                  <> int.to_string(length)
+                  <> " / "
+                  <> int.to_string(max)
+                  <> ").",
+                ),
+              ),
+              effect.none(),
+            )
+
+            Ok(body) -> {
               let save_and_publish =
                 effect.from(fn(dispatch) {
                   case post_repo.create(model.db, auth_user.id, body) {
@@ -204,7 +226,10 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                     Error(_) -> Nil
                   }
                 })
-              #(Model(..model, form_key: model.form_key + 1), save_and_publish)
+              #(
+                Model(..model, form_key: model.form_key + 1, form_error: None),
+                save_and_publish,
+              )
             }
           }
         }
@@ -595,7 +620,20 @@ fn account_bar(
 
 fn composer_pane(model: Model) -> Element(Msg) {
   case model.user {
-    Some(_) ->
+    Some(_) -> {
+      let max_str = int.to_string(post_repo.max_body_length)
+      let error_el = case model.form_error {
+        Some(message) ->
+          html.p(
+            [
+              attribute.role("alert"),
+              attribute.class("text-xs text-red-600"),
+            ],
+            [html.text(message)],
+          )
+        None -> element.none()
+      }
+
       keyed.fragment([
         #(
           "post-form-" <> int.to_string(model.form_key),
@@ -605,33 +643,58 @@ fn composer_pane(model: Model) -> Element(Msg) {
               attribute.class("flex flex-col gap-3 p-4"),
             ],
             [
-              html.textarea(
+              element.element(
+                "lote-composer",
                 [
-                  attribute.name("body"),
-                  attribute.rows(4),
-                  attribute.placeholder("What is on your mind?"),
-                  attribute.required(True),
-                  attribute.class(
-                    "block w-full resize-none border border-neutral-300 bg-white p-2.5 text-sm leading-normal text-neutral-950 placeholder:text-neutral-400 focus:border-neutral-950 focus:outline-none",
+                  attribute.attribute("max", max_str),
+                  attribute.class("flex flex-col gap-3"),
+                ],
+                [
+                  html.textarea(
+                    [
+                      attribute.name("body"),
+                      attribute.rows(4),
+                      attribute.placeholder("What is on your mind?"),
+                      attribute.required(True),
+                      attribute.class(
+                        "block w-full resize-none border border-neutral-300 bg-white p-2.5 text-sm leading-normal text-neutral-950 placeholder:text-neutral-400 focus:border-neutral-950 focus:outline-none aria-[invalid=true]:border-red-500 aria-[invalid=true]:focus:border-red-600",
+                      ),
+                    ],
+                    "",
+                  ),
+                  html.div(
+                    [attribute.class("flex items-center justify-between gap-2")],
+                    [
+                      html.span(
+                        [
+                          attribute.attribute("data-char-counter", ""),
+                          attribute.attribute("data-state", "ok"),
+                          attribute.attribute("aria-live", "polite"),
+                          attribute.class(
+                            "font-mono text-xs tabular-nums text-neutral-400 data-[state=near]:text-neutral-700 data-[state=over]:font-medium data-[state=over]:text-red-600",
+                          ),
+                        ],
+                        [html.text("0 / " <> max_str)],
+                      ),
+                      html.button(
+                        [
+                          attribute.type_("submit"),
+                          attribute.class(
+                            "cursor-pointer bg-neutral-950 px-4 py-1.5 text-xs font-medium text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:bg-neutral-300 disabled:hover:bg-neutral-300",
+                          ),
+                        ],
+                        [html.text("Post")],
+                      ),
+                    ],
                   ),
                 ],
-                "",
               ),
-              html.div([attribute.class("flex justify-end")], [
-                html.button(
-                  [
-                    attribute.type_("submit"),
-                    attribute.class(
-                      "cursor-pointer bg-neutral-950 px-4 py-1.5 text-xs font-medium text-white hover:bg-neutral-800",
-                    ),
-                  ],
-                  [html.text("Post")],
-                ),
-              ]),
+              error_el,
             ],
           ),
         ),
       ])
+    }
 
     None ->
       html.div([attribute.class("p-4 text-xs text-neutral-600")], [
