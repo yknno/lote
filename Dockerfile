@@ -15,7 +15,7 @@ RUN gleam run -m lustre/dev add tailwind \
     && .lustre/bin/tailwindcss-*/tailwindcss-* -i src/lote.css -o priv/static/app.css --minify \
     && gleam export erlang-shipment
 
-FROM erlang:29-slim AS runtime
+FROM erlang:29.1.2-slim AS runtime
 
 RUN groupadd --system app && useradd --system --gid app app
 
