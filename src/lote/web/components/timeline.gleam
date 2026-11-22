@@ -1,3 +1,4 @@
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
 import gleam/list
@@ -20,7 +21,7 @@ import lustre/event
 import lustre/server_component
 import pog
 
-const recent_posts_limit = 50
+pub const page_size = 20
 
 pub type Post {
   Post(
@@ -53,6 +54,8 @@ pub type Model {
     user: Option(AuthUser),
     csrf_token: String,
     posts: List(Post),
+    has_more: Bool,
+    loading_more: Bool,
     pending_count: Int,
     auto_refresh: Bool,
     confirming_delete: Option(String),
@@ -64,10 +67,13 @@ pub type Msg {
   UserSubmittedForm(List(#(String, String)))
   UserClickedRefresh
   UserToggledAutoRefresh
+  UserRequestedLoadMore
   UserRequestedDelete(String)
   UserCanceledDelete
   UserConfirmedDelete(String)
-  PostsReloaded(List(Post))
+  PostsReloaded(List(Post), Bool)
+  OlderPostsLoaded(cursor: String, posts: List(Post), has_more: Bool)
+  OlderPostsLoadFailed
   PostCreated(Post)
   PostDeleted(String)
 }
@@ -76,21 +82,46 @@ pub fn app() -> lustre.App(Flags, Model, Msg) {
   lustre.application(init:, update:, view:)
 }
 
-fn load_recent_posts(db: pog.Connection) -> Result(List(Post), pog.QueryError) {
-  case post_repo.list_recent(db, recent_posts_limit) {
-    Ok(rows) ->
-      Ok(
-        list.map(rows, fn(row) {
-          Post(
-            id: row.id,
-            user_id: row.user_id,
-            author_name: row.author_name,
-            body: row.body,
-            created_at: row.created_at,
-          )
-        }),
+fn rows_to_page(rows: List(post_repo.PostRow)) -> #(List(Post), Bool) {
+  let has_more = list.length(rows) > page_size
+  let posts =
+    rows
+    |> list.take(page_size)
+    |> list.map(fn(row) {
+      Post(
+        id: row.id,
+        user_id: row.user_id,
+        author_name: row.author_name,
+        body: row.body,
+        created_at: row.created_at,
       )
+    })
+  #(posts, has_more)
+}
+
+fn load_recent_page(
+  db: pog.Connection,
+) -> Result(#(List(Post), Bool), pog.QueryError) {
+  case post_repo.list_recent(db, page_size + 1) {
+    Ok(rows) -> Ok(rows_to_page(rows))
     Error(err) -> Error(err)
+  }
+}
+
+fn load_older_page(
+  db: pog.Connection,
+  before_id: String,
+) -> Result(#(List(Post), Bool), pog.QueryError) {
+  case post_repo.list_before(db, before_id, page_size + 1) {
+    Ok(rows) -> Ok(rows_to_page(rows))
+    Error(err) -> Error(err)
+  }
+}
+
+fn last_post_id(posts: List(Post)) -> Option(String) {
+  case list.last(posts) {
+    Ok(post) -> Some(post.id)
+    Error(_) -> None
   }
 }
 
@@ -102,9 +133,9 @@ fn is_newer_than_loaded(post: Post, loaded: List(Post)) -> Bool {
 }
 
 fn init(flags: Flags) -> #(Model, Effect(Msg)) {
-  let posts = case load_recent_posts(flags.db) {
-    Ok(posts) -> posts
-    Error(_) -> []
+  let #(posts, has_more) = case load_recent_page(flags.db) {
+    Ok(page) -> page
+    Error(_) -> #([], False)
   }
 
   let subscribe_effect =
@@ -126,6 +157,8 @@ fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       user: flags.user,
       csrf_token: flags.csrf_token,
       posts:,
+      has_more:,
+      loading_more: False,
       pending_count: 0,
       auto_refresh: False,
       confirming_delete: None,
@@ -161,8 +194,9 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                           body: row.body,
                           created_at: row.created_at,
                         )
-                      case load_recent_posts(model.db) {
-                        Ok(posts) -> dispatch(PostsReloaded(posts))
+                      case load_recent_page(model.db) {
+                        Ok(#(posts, has_more)) ->
+                          dispatch(PostsReloaded(posts, has_more))
                         Error(_) -> Nil
                       }
                       pubsub.publish(model.pubsub, Created(post))
@@ -178,8 +212,17 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
 
     UserClickedRefresh ->
-      case load_recent_posts(model.db) {
-        Ok(posts) -> #(Model(..model, posts:, pending_count: 0), effect.none())
+      case load_recent_page(model.db) {
+        Ok(#(posts, has_more)) -> #(
+          Model(
+            ..model,
+            posts:,
+            has_more:,
+            loading_more: False,
+            pending_count: 0,
+          ),
+          effect.none(),
+        )
         Error(_) -> #(model, effect.none())
       }
 
@@ -189,14 +232,48 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         False ->
           case model.pending_count > 0 {
             True ->
-              case load_recent_posts(model.db) {
-                Ok(posts) -> #(
-                  Model(..model, posts:, pending_count: 0, auto_refresh: True),
+              case load_recent_page(model.db) {
+                Ok(#(posts, has_more)) -> #(
+                  Model(
+                    ..model,
+                    posts:,
+                    has_more:,
+                    loading_more: False,
+                    pending_count: 0,
+                    auto_refresh: True,
+                  ),
                   effect.none(),
                 )
                 Error(_) -> #(Model(..model, auto_refresh: True), effect.none())
               }
             False -> #(Model(..model, auto_refresh: True), effect.none())
+          }
+      }
+
+    UserRequestedLoadMore ->
+      case model.loading_more || !model.has_more {
+        True -> #(model, effect.none())
+        False ->
+          case last_post_id(model.posts) {
+            None -> #(
+              Model(..model, has_more: False, loading_more: False),
+              effect.none(),
+            )
+            Some(cursor) -> {
+              let load_effect =
+                effect.from(fn(dispatch) {
+                  case load_older_page(model.db, cursor) {
+                    Ok(#(older, has_more)) ->
+                      dispatch(OlderPostsLoaded(
+                        cursor:,
+                        posts: older,
+                        has_more:,
+                      ))
+                    Error(_) -> dispatch(OlderPostsLoadFailed)
+                  }
+                })
+              #(Model(..model, loading_more: True), load_effect)
+            }
           }
       }
 
@@ -237,8 +314,27 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         }
       }
 
-    PostsReloaded(posts) -> #(
-      Model(..model, posts:, pending_count: 0),
+    PostsReloaded(posts, has_more) -> #(
+      Model(..model, posts:, has_more:, loading_more: False, pending_count: 0),
+      effect.none(),
+    )
+
+    OlderPostsLoaded(cursor, older, has_more) ->
+      case last_post_id(model.posts) == Some(cursor) {
+        True -> #(
+          Model(
+            ..model,
+            posts: list.append(model.posts, older),
+            has_more:,
+            loading_more: False,
+          ),
+          effect.none(),
+        )
+        False -> #(Model(..model, loading_more: False), effect.none())
+      }
+
+    OlderPostsLoadFailed -> #(
+      Model(..model, loading_more: False),
       effect.none(),
     )
 
@@ -248,11 +344,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         True ->
           case model.auto_refresh {
             True -> #(
-              Model(
-                ..model,
-                posts: list.take([post, ..model.posts], recent_posts_limit),
-                pending_count: 0,
-              ),
+              Model(..model, posts: [post, ..model.posts], pending_count: 0),
               effect.none(),
             )
             False -> #(
@@ -267,14 +359,24 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Some(id) if id == post_id -> None
         other -> other
       }
-      #(
-        Model(
-          ..model,
-          posts: list.filter(model.posts, fn(p) { p.id != post_id }),
-          confirming_delete:,
-        ),
-        effect.none(),
-      )
+      let remaining = list.filter(model.posts, fn(p) { p.id != post_id })
+      case remaining, model.has_more {
+        [], True -> {
+          let reload_effect =
+            effect.from(fn(dispatch) {
+              case load_recent_page(model.db) {
+                Ok(#(posts, has_more)) ->
+                  dispatch(PostsReloaded(posts, has_more))
+                Error(_) -> Nil
+              }
+            })
+          #(Model(..model, posts: remaining, confirming_delete:), reload_effect)
+        }
+        _, _ -> #(
+          Model(..model, posts: remaining, confirming_delete:),
+          effect.none(),
+        )
+      }
     }
   }
 }
@@ -311,6 +413,13 @@ fn view(model: Model) -> Element(Msg) {
       ],
     )
 
+  let post_count_label =
+    int.to_string(list.length(model.posts))
+    <> case model.has_more {
+      True -> "+ posts"
+      False -> " posts"
+    }
+
   let timeline_pane =
     html.main([attribute.class("flex min-w-0 flex-1 flex-col")], [
       html.div(
@@ -331,19 +440,67 @@ fn view(model: Model) -> Element(Msg) {
           html.div([attribute.class("flex items-center gap-3")], [
             auto_refresh_toggle(model.auto_refresh),
             html.span([attribute.class("font-mono text-xs text-neutral-400")], [
-              html.text(int.to_string(list.length(model.posts)) <> " posts"),
+              html.text(post_count_label),
             ]),
           ]),
         ],
       ),
       pending_banner(model.pending_count),
       feed(model.posts, model.user, model.confirming_delete),
+      load_more_footer(model),
     ])
 
   html.div([attribute.class("flex min-h-screen flex-col md:flex-row")], [
     sidebar,
     timeline_pane,
   ])
+}
+
+fn load_more_footer(model: Model) -> Element(Msg) {
+  case model.has_more, last_post_id(model.posts) {
+    True, Some(cursor) ->
+      element.element(
+        "lote-sentinel",
+        [
+          attribute.class("block border-t border-neutral-200"),
+          attribute.attribute("cursor", cursor),
+          attribute.attribute("aria-busy", case model.loading_more {
+            True -> "true"
+            False -> "false"
+          }),
+          case model.loading_more {
+            True -> attribute.attribute("disabled", "")
+            False -> attribute.none()
+          },
+          event.on("load-more", decode.success(UserRequestedLoadMore)),
+        ],
+        [
+          case model.loading_more {
+            True ->
+              html.p(
+                [
+                  attribute.class(
+                    "px-4 py-3 text-center font-mono text-xs text-neutral-400",
+                  ),
+                ],
+                [html.text("Loading...")],
+              )
+            False ->
+              html.button(
+                [
+                  attribute.type_("button"),
+                  event.on_click(UserRequestedLoadMore),
+                  attribute.class(
+                    "w-full cursor-pointer px-4 py-3 text-center text-xs text-neutral-500 hover:bg-neutral-50 hover:text-neutral-950",
+                  ),
+                ],
+                [html.text("Load older posts")],
+              )
+          },
+        ],
+      )
+    _, _ -> element.none()
+  }
 }
 
 fn auto_refresh_toggle(enabled: Bool) -> Element(Msg) {
