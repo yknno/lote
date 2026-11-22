@@ -42,6 +42,10 @@ fn index_html() -> String {
         attribute.href("/static/app.css"),
       ]),
       server_component.script(),
+      html.script(
+        [attribute.type_("module"), attribute.src("/static/lote-time.js")],
+        "",
+      ),
     ]),
     html.body([attribute.class("min-h-screen bg-white text-neutral-950")], [
       server_component.element([server_component.route("/ws")], []),

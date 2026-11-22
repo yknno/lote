@@ -4,6 +4,8 @@ import gleam/json
 import gleam/list
 import gleam/option.{Some}
 import gleam/string
+import gleam/time/calendar
+import gleam/time/timestamp
 import lote/auth/user
 import lote/db/post_repo
 import lote/realtime/pubsub
@@ -247,7 +249,12 @@ pub fn incoming_post_shows_pending_banner_until_refreshed_test() {
   let assert Ok(row1) = post_repo.create(tx, bob.id, "bob first post")
   pubsub.publish(
     post_pubsub,
-    timeline.Post(id: row1.id, author_name: bob.name, body: row1.body),
+    timeline.Post(
+      id: row1.id,
+      author_name: bob.name,
+      body: row1.body,
+      created_at: row1.created_at,
+    ),
   )
   let patch1 = receive_json(client)
   assert string.contains(patch1, "Show 1 new post")
@@ -256,7 +263,12 @@ pub fn incoming_post_shows_pending_banner_until_refreshed_test() {
   let assert Ok(row2) = post_repo.create(tx, bob.id, "bob second post")
   pubsub.publish(
     post_pubsub,
-    timeline.Post(id: row2.id, author_name: bob.name, body: row2.body),
+    timeline.Post(
+      id: row2.id,
+      author_name: bob.name,
+      body: row2.body,
+      created_at: row2.created_at,
+    ),
   )
   let patch2 = receive_json(client)
   assert string.contains(patch2, "Show 2 new posts")
@@ -299,7 +311,12 @@ pub fn submitting_own_post_refreshes_pending_posts_without_echo_banner_test() {
   let assert Ok(bob_row) = post_repo.create(tx, bob.id, "bob pending post")
   pubsub.publish(
     post_pubsub,
-    timeline.Post(id: bob_row.id, author_name: bob.name, body: bob_row.body),
+    timeline.Post(
+      id: bob_row.id,
+      author_name: bob.name,
+      body: bob_row.body,
+      created_at: bob_row.created_at,
+    ),
   )
   let pending_patch = receive_json(client)
   assert string.contains(pending_patch, "Show 1 new post")
@@ -347,7 +364,12 @@ pub fn toggling_auto_refresh_flushes_pending_and_streams_new_posts_test() {
   let assert Ok(row1) = post_repo.create(tx, bob.id, "pending before live")
   pubsub.publish(
     post_pubsub,
-    timeline.Post(id: row1.id, author_name: bob.name, body: row1.body),
+    timeline.Post(
+      id: row1.id,
+      author_name: bob.name,
+      body: row1.body,
+      created_at: row1.created_at,
+    ),
   )
   let pending_patch = receive_json(client)
   assert string.contains(pending_patch, "Show 1 new post")
@@ -362,7 +384,12 @@ pub fn toggling_auto_refresh_flushes_pending_and_streams_new_posts_test() {
   let assert Ok(row2) = post_repo.create(tx, bob.id, "streamed live post")
   pubsub.publish(
     post_pubsub,
-    timeline.Post(id: row2.id, author_name: bob.name, body: row2.body),
+    timeline.Post(
+      id: row2.id,
+      author_name: bob.name,
+      body: row2.body,
+      created_at: row2.created_at,
+    ),
   )
   let live_patch = receive_json(client)
   assert string.contains(live_patch, "streamed live post")
@@ -376,11 +403,48 @@ pub fn toggling_auto_refresh_flushes_pending_and_streams_new_posts_test() {
   let assert Ok(row3) = post_repo.create(tx, bob.id, "buffered after live off")
   pubsub.publish(
     post_pubsub,
-    timeline.Post(id: row3.id, author_name: bob.name, body: row3.body),
+    timeline.Post(
+      id: row3.id,
+      author_name: bob.name,
+      body: row3.body,
+      created_at: row3.created_at,
+    ),
   )
   let buffered_again_patch = receive_json(client)
   assert string.contains(buffered_again_patch, "Show 1 new post")
   assert !string.contains(buffered_again_patch, "buffered after live off")
+
+  shutdown_and_wait(component)
+}
+
+pub fn post_renders_lote_time_with_rfc3339_datetime_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "TimeUser")
+  let assert Ok(created) = post_repo.create(tx, author.id, "timestamped post")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let flags =
+    timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(author),
+      csrf_token: "test-csrf-token",
+    )
+  let assert Ok(component) =
+    lustre.start_server_component(timeline.app(), flags)
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+
+  let payload = receive_json(client)
+
+  let expected_iso =
+    timestamp.to_rfc3339(created.created_at, calendar.utc_offset)
+  assert string.contains(payload, "\"tag\":\"lote-time\"")
+  assert string.contains(payload, expected_iso)
+  assert string.contains(payload, " UTC")
 
   shutdown_and_wait(component)
 }

@@ -3,6 +3,8 @@ import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/string
+import gleam/time/calendar
+import gleam/time/timestamp.{type Timestamp}
 import lote/auth/user.{type AuthUser}
 import lote/db/post_repo
 import lote/realtime/pubsub.{type PubSub}
@@ -20,7 +22,7 @@ import pog
 const recent_posts_limit = 50
 
 pub type Post {
-  Post(id: Int, author_name: String, body: String)
+  Post(id: Int, author_name: String, body: String, created_at: Timestamp)
 }
 
 pub type Flags {
@@ -62,7 +64,12 @@ fn load_recent_posts(db: pog.Connection) -> Result(List(Post), pog.QueryError) {
     Ok(rows) ->
       Ok(
         list.map(rows, fn(row) {
-          Post(id: row.id, author_name: row.author_name, body: row.body)
+          Post(
+            id: row.id,
+            author_name: row.author_name,
+            body: row.body,
+            created_at: row.created_at,
+          )
         }),
       )
     Error(err) -> Error(err)
@@ -127,6 +134,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                           id: row.id,
                           author_name: auth_user.name,
                           body: row.body,
+                          created_at: row.created_at,
                         )
                       case load_recent_posts(model.db) {
                         Ok(posts) -> dispatch(PostsReloaded(posts))
@@ -423,6 +431,8 @@ fn feed(posts: List(Post)) -> Element(Msg) {
 }
 
 fn post_row(post: Post) -> Element(Msg) {
+  let created_iso = timestamp.to_rfc3339(post.created_at, calendar.utc_offset)
+
   html.li([attribute.class("px-4 py-3 hover:bg-neutral-50/70")], [
     html.div([attribute.class("flex items-baseline gap-2 text-xs")], [
       html.span([attribute.class("font-semibold text-neutral-950")], [
@@ -431,6 +441,20 @@ fn post_row(post: Post) -> Element(Msg) {
       html.span([attribute.class("font-mono text-neutral-400")], [
         html.text("#" <> int.to_string(post.id)),
       ]),
+      element.element(
+        "lote-time",
+        [
+          attribute.attribute("datetime", created_iso),
+          attribute.class(
+            "ml-auto shrink-0 font-mono text-xs text-neutral-400 tabular-nums",
+          ),
+        ],
+        [
+          html.time([attribute.datetime(created_iso)], [
+            html.text(format_utc_fallback(post.created_at)),
+          ]),
+        ],
+      ),
     ]),
     html.p(
       [
@@ -441,4 +465,25 @@ fn post_row(post: Post) -> Element(Msg) {
       [html.text(post.body)],
     ),
   ])
+}
+
+fn format_utc_fallback(ts: Timestamp) -> String {
+  let #(date, time) = timestamp.to_calendar(ts, calendar.utc_offset)
+  int.to_string(date.year)
+  <> "-"
+  <> pad2(calendar.month_to_int(date.month))
+  <> "-"
+  <> pad2(date.day)
+  <> " "
+  <> pad2(time.hours)
+  <> ":"
+  <> pad2(time.minutes)
+  <> " UTC"
+}
+
+fn pad2(n: Int) -> String {
+  case n < 10 {
+    True -> "0" <> int.to_string(n)
+    False -> int.to_string(n)
+  }
 }
