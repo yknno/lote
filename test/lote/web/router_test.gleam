@@ -1,18 +1,26 @@
+import gleam/erlang/process
 import gleam/http
 import gleam/option.{None, Some}
 import lote/auth.{Auth, Password}
 import lote/auth/password
 import lote/auth/session
 import lote/auth/user
+import lote/realtime/pubsub
 import lote/test_helper
 import lote/web/router
 import wisp/simulate
 
 pub fn health_endpoint_returns_ok_test() {
   use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
 
   let auth_ctx =
-    Auth(db: tx, secret_key_base: simulate.default_secret_key_base, methods: [])
+    Auth(
+      db: tx,
+      secret_key_base: simulate.default_secret_key_base,
+      methods: [],
+      session_revocations:,
+    )
   let req = simulate.request(http.Get, "/health")
   let resp = router.handle_request(req, auth_ctx)
 
@@ -22,9 +30,15 @@ pub fn health_endpoint_returns_ok_test() {
 
 pub fn password_login_returns_404_when_adapter_disabled_test() {
   use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
 
   let auth_ctx =
-    Auth(db: tx, secret_key_base: simulate.default_secret_key_base, methods: [])
+    Auth(
+      db: tx,
+      secret_key_base: simulate.default_secret_key_base,
+      methods: [],
+      session_revocations:,
+    )
   let req =
     simulate.browser_request(http.Post, "/auth/password/login")
     |> simulate.form_body([
@@ -38,13 +52,20 @@ pub fn password_login_returns_404_when_adapter_disabled_test() {
 
 pub fn password_login_issues_session_cookie_when_enabled_test() {
   use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
 
   let assert Ok(created) = user.create(tx, "Router User")
   let assert Ok(Nil) =
     password.create(tx, created.id, "router_user", "secretpass123")
 
   let secret = simulate.default_secret_key_base
-  let auth_ctx = Auth(db: tx, secret_key_base: secret, methods: [Password])
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: secret,
+      methods: [Password],
+      session_revocations:,
+    )
 
   let login_req =
     simulate.browser_request(http.Post, "/auth/password/login")
@@ -59,13 +80,19 @@ pub fn password_login_issues_session_cookie_when_enabled_test() {
   let next_req =
     simulate.browser_request(http.Get, "/")
     |> simulate.session(login_req, login_resp)
-  assert session.current_user(next_req, tx, secret) == Some(created)
+  let assert Some(active_session) =
+    session.current_session(next_req, tx, secret)
+  assert active_session.user == created
+
+  let revocation_sub = process.new_subject()
+  pubsub.subscribe(session_revocations, revocation_sub)
 
   let logout_req =
     simulate.browser_request(http.Post, "/auth/logout")
     |> simulate.session(login_req, login_resp)
   let logout_resp = router.handle_request(logout_req, auth_ctx)
   assert logout_resp.status == 303
+  assert process.receive(revocation_sub, 100) == Ok(active_session.id)
 
   let after_req =
     simulate.browser_request(http.Get, "/")

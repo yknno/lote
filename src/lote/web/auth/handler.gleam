@@ -1,8 +1,9 @@
 import gleam/http
 import gleam/list
-import gleam/option.{None}
+import gleam/option.{None, Some}
 import lote/auth.{type Auth, Password}
 import lote/auth/session
+import lote/realtime/pubsub
 import lote/web/auth/password_handler
 import lote/web/auth/view
 import wisp
@@ -15,9 +16,17 @@ pub fn handle_request(
   case req.method, segments {
     http.Get, ["login"] -> view.login_page(auth_ctx.methods, None)
 
-    http.Post, ["logout"] ->
-      wisp.redirect(to: "/")
-      |> session.destroy(req, auth_ctx.db, auth_ctx.secret_key_base)
+    http.Post, ["logout"] -> {
+      let revoked_id = session.session_id(req, auth_ctx.secret_key_base)
+      let resp =
+        wisp.redirect(to: "/")
+        |> session.destroy(req, auth_ctx.db, auth_ctx.secret_key_base)
+      case revoked_id {
+        Some(id) -> pubsub.publish(auth_ctx.session_revocations, id)
+        None -> Nil
+      }
+      resp
+    }
 
     _, ["password", ..rest] ->
       case list.contains(auth_ctx.methods, Password) {

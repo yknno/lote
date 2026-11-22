@@ -75,14 +75,43 @@ pub fn destroy(
   wisp.set_cookie(resp, req, cookie_name, "", wisp.Signed, 0)
 }
 
+pub type ActiveSession {
+  ActiveSession(id: String, user: AuthUser)
+}
+
+pub fn session_id(
+  req: Request(body),
+  secret_key_base: String,
+) -> Option(String) {
+  case read_session_id(req, secret_key_base) {
+    Ok(id) -> Some(id)
+    Error(_) -> None
+  }
+}
+
+pub fn current_session(
+  req: Request(body),
+  db: pog.Connection,
+  secret_key_base: String,
+) -> Option(ActiveSession) {
+  case read_session_id(req, secret_key_base) {
+    Ok(id) ->
+      case find_user(db, id) {
+        Some(user) -> Some(ActiveSession(id:, user:))
+        None -> None
+      }
+    Error(_) -> None
+  }
+}
+
 pub fn current_user(
   req: Request(body),
   db: pog.Connection,
   secret_key_base: String,
 ) -> Option(AuthUser) {
-  case read_session_id(req, secret_key_base) {
-    Ok(session_id) -> find_user(db, session_id)
-    Error(_) -> None
+  case current_session(req, db, secret_key_base) {
+    Some(active) -> Some(active.user)
+    None -> None
   }
 }
 

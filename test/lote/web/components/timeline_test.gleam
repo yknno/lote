@@ -123,3 +123,31 @@ pub fn submitting_blank_post_does_not_replace_form_test() {
 
   lustre.send(component, lustre.shutdown())
 }
+
+pub fn shutting_down_timeline_component_removes_pubsub_subscriber_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "TimelineUser")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let flags = timeline.Flags(db: tx, pubsub: post_pubsub, user: Some(author))
+  let assert Ok(component) =
+    lustre.start_server_component(timeline.app(), flags)
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+  let assert Ok(_mount) = process.receive(client, 500)
+
+  assert pubsub.subscriber_count(post_pubsub) == 1
+
+  let mon = process.monitor(server_component.pid(component))
+  lustre.send(component, lustre.shutdown())
+  let down_selector =
+    process.new_selector()
+    |> process.select_specific_monitor(mon, fn(down) { down })
+  let assert Ok(_) = process.selector_receive(down_selector, 500)
+
+  process.sleep(10)
+  assert pubsub.subscriber_count(post_pubsub) == 0
+}
