@@ -1,6 +1,7 @@
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import lote/auth.{type Method, Password}
+import lote/web/csrf
 import lustre/attribute
 import lustre/element
 import lustre/element/html
@@ -9,6 +10,7 @@ import wisp
 pub fn login_page(
   methods: List(Method),
   error: Option(String),
+  csrf_token: String,
 ) -> wisp.Response {
   let error_el = case error {
     Some(msg) ->
@@ -29,7 +31,7 @@ pub fn login_page(
         html.text("No login methods enabled."),
       ]),
     ]
-    _ -> list.map(methods, method_section)
+    _ -> list.map(methods, method_section(_, csrf_token))
   }
 
   let doc =
@@ -89,7 +91,7 @@ pub fn login_page(
   wisp.html_response(doc, 200)
 }
 
-fn method_section(method: Method) -> element.Element(Nil) {
+fn method_section(method: Method, csrf_token: String) -> element.Element(Nil) {
   case method {
     Password ->
       html.form(
@@ -99,6 +101,11 @@ fn method_section(method: Method) -> element.Element(Nil) {
           attribute.class("flex flex-col gap-3"),
         ],
         [
+          html.input([
+            attribute.type_("hidden"),
+            attribute.name(csrf.form_field_name),
+            attribute.value(csrf_token),
+          ]),
           html.div([attribute.class("flex flex-col gap-1")], [
             html.label(
               [

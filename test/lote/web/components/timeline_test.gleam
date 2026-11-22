@@ -61,7 +61,13 @@ pub fn submitting_post_replaces_form_element_to_reset_input_test() {
   let pubsub_sub = process.new_subject()
   pubsub.subscribe(post_pubsub, pubsub_sub)
 
-  let flags = timeline.Flags(db: tx, pubsub: post_pubsub, user: Some(author))
+  let flags =
+    timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(author),
+      csrf_token: "test-csrf-token",
+    )
   let assert Ok(component) =
     lustre.start_server_component(timeline.app(), flags)
 
@@ -100,7 +106,13 @@ pub fn submitting_blank_post_does_not_replace_form_test() {
   let assert Ok(author) = user.create(tx, "TimelineUser")
   let assert Ok(post_pubsub) = pubsub.start()
 
-  let flags = timeline.Flags(db: tx, pubsub: post_pubsub, user: Some(author))
+  let flags =
+    timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(author),
+      csrf_token: "test-csrf-token",
+    )
   let assert Ok(component) =
     lustre.start_server_component(timeline.app(), flags)
 
@@ -130,7 +142,13 @@ pub fn shutting_down_timeline_component_removes_pubsub_subscriber_test() {
   let assert Ok(author) = user.create(tx, "TimelineUser")
   let assert Ok(post_pubsub) = pubsub.start()
 
-  let flags = timeline.Flags(db: tx, pubsub: post_pubsub, user: Some(author))
+  let flags =
+    timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(author),
+      csrf_token: "test-csrf-token",
+    )
   let assert Ok(component) =
     lustre.start_server_component(timeline.app(), flags)
 

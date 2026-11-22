@@ -1,5 +1,6 @@
 import lote/auth.{type Auth}
 import lote/web/auth/handler as auth_handler
+import lote/web/csrf
 import lustre/attribute
 import lustre/element
 import lustre/element/html
@@ -10,20 +11,29 @@ pub fn handle_request(req: Request, auth_ctx: Auth) -> Response {
   use req <- middleware(req)
 
   case wisp.path_segments(req) {
-    [] -> wisp.html_response(index_html(), 200)
+    [] -> {
+      let #(csrf_token, should_set_cookie) =
+        csrf.ensure_token(req, auth_ctx.secret_key_base)
+      wisp.html_response(index_html(csrf_token), 200)
+      |> csrf.attach_cookie(req, csrf_token, should_set_cookie)
+    }
     ["auth", ..rest] -> auth_handler.handle_request(req, rest, auth_ctx)
     ["health"] -> wisp.response(200) |> wisp.string_body("ok")
     _ -> wisp.not_found()
   }
 }
 
-fn index_html() -> String {
+fn index_html(csrf_token: String) -> String {
   html.html([attribute.lang("ja"), attribute.class("bg-white")], [
     html.head([], [
       html.meta([attribute.charset("utf-8")]),
       html.meta([
         attribute.name("viewport"),
         attribute.content("width=device-width, initial-scale=1"),
+      ]),
+      html.meta([
+        attribute.name("csrf-token"),
+        attribute.content(csrf_token),
       ]),
       html.title([], "lote"),
       html.link([
@@ -47,6 +57,7 @@ fn middleware(
   use <- wisp.log_request(req)
   use <- wisp.rescue_crashes
   use req <- wisp.handle_head(req)
+  use req <- wisp.csrf_known_header_protection(req)
 
   let static_dir = case wisp.priv_directory("lote") {
     Ok(priv) -> priv <> "/static"
