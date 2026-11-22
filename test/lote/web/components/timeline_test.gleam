@@ -1,9 +1,8 @@
-import gleam/dynamic/decode
+import gleam/dynamic
 import gleam/erlang/process
 import gleam/int
-import gleam/json
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{None, Some}
 import gleam/string
 import gleam/time/calendar
 import gleam/time/timestamp
@@ -13,49 +12,68 @@ import lote/realtime/pubsub
 import lote/test_helper
 import lote/web/components/timeline
 import lustre
+import lustre/effect.{type Effect}
+import lustre/element
 import lustre/server_component
 
-type ReplaceFormChange {
-  ReplaceFormChange(kind: Int, tag: String, key: String)
+fn render_html(model: timeline.Model) -> String {
+  model
+  |> timeline.view
+  |> element.to_string
 }
 
-fn patch_replace_form_decoder() -> decode.Decoder(List(ReplaceFormChange)) {
-  use <- decode.recursive
-
-  let change_decoder = {
-    use kind <- decode.field("kind", decode.int)
-    case kind {
-      5 -> {
-        use tag <- decode.subfield(["with", "tag"], decode.string)
-        use key <- decode.subfield(["with", "key"], decode.string)
-        decode.success([ReplaceFormChange(kind:, tag:, key:)])
-      }
-      _ -> decode.success([])
-    }
+fn extract_tag_keys(html: String, tag: String) -> List(String) {
+  let prefix = "<" <> tag <> " data-lustre-key=\""
+  case string.split(html, prefix) {
+    [] | [_] -> []
+    [_, ..rest] ->
+      list.filter_map(rest, fn(chunk) {
+        case string.split_once(chunk, "\"") {
+          Ok(#(key, _)) -> Ok(key)
+          Error(_) -> Error(Nil)
+        }
+      })
   }
-
-  use changes <- decode.optional_field(
-    "changes",
-    [],
-    decode.list(change_decoder),
-  )
-  use children <- decode.optional_field(
-    "children",
-    [],
-    decode.list(patch_replace_form_decoder()),
-  )
-  decode.success(list.flatten([list.flatten(changes), ..children]))
 }
 
-fn collect_replace_form_changes(
-  patch_json: String,
-) -> Result(List(ReplaceFormChange), json.DecodeError) {
-  let msg_decoder = {
-    use patch <- decode.field("patch", patch_replace_form_decoder())
-    decode.success(patch)
-  }
+fn run_effect(eff: Effect(msg)) -> List(msg) {
+  let subject = process.new_subject()
+  effect.perform(
+    eff,
+    fn(msg) { process.send(subject, msg) },
+    fn(_, _) { Nil },
+    fn(_) { Nil },
+    fn() { dynamic.nil() },
+    fn(_, _) { Nil },
+    fn(_, _) { Nil },
+    fn(_) { Nil },
+  )
+  drain_subject(subject, [])
+}
 
-  json.parse(patch_json, msg_decoder)
+fn drain_subject(subject: process.Subject(msg), acc: List(msg)) -> List(msg) {
+  case process.receive(subject, 0) {
+    Ok(msg) -> drain_subject(subject, [msg, ..acc])
+    Error(_) -> list.reverse(acc)
+  }
+}
+
+fn step(model: timeline.Model, msg: timeline.Msg) -> timeline.Model {
+  let #(next_model, eff) = timeline.update(model, msg)
+  list.fold(run_effect(eff), next_model, step)
+}
+
+fn to_timeline_post(
+  row: post_repo.CreatedPost,
+  author: user.AuthUser,
+) -> timeline.Post {
+  timeline.Post(
+    id: row.id,
+    user_id: author.id,
+    author_name: author.name,
+    body: row.body,
+    created_at: row.created_at,
+  )
 }
 
 fn shutdown_and_wait(component: lustre.Runtime(timeline.Msg)) -> Nil {
@@ -68,7 +86,7 @@ fn shutdown_and_wait(component: lustre.Runtime(timeline.Msg)) -> Nil {
   Nil
 }
 
-pub fn submitting_post_replaces_form_element_to_reset_input_test() {
+pub fn submitting_post_increments_form_key_and_publishes_post_test() {
   use tx <- test_helper.with_db
 
   let assert Ok(author) = user.create(tx, "TimelineUser")
@@ -76,110 +94,57 @@ pub fn submitting_post_replaces_form_element_to_reset_input_test() {
   let pubsub_sub = process.new_subject()
   pubsub.subscribe(post_pubsub, pubsub_sub)
 
-  let flags =
-    timeline.Flags(
+  let #(model0, _init_eff) =
+    timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
       user: Some(author),
       csrf_token: "test-csrf-token",
-    )
-  let assert Ok(component) =
-    lustre.start_server_component(timeline.app(), flags)
+    ))
 
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
+  assert model0.form_key == 0
+  assert extract_tag_keys(render_html(model0), "form") == ["post-form-0"]
 
-  // Initial mount message
-  let assert Ok(_mount) = process.receive(client, 500)
+  // Submitting a valid post increments form_key (so the keyed <form> is
+  // reconstructed and the uncontrolled <textarea> is cleared), saves to DB,
+  // reloads recent posts, and broadcasts Created(post) via PubSub.
+  let model1 =
+    step(model0, timeline.UserSubmittedForm([#("body", "hello world")]))
 
-  // Submitting a post should emit a VDOM Replace patch for the <form>
-  // with an incremented key so the browser resets the uncontrolled textarea.
-  lustre.dispatch(timeline.UserSubmittedForm([#("body", "hello world")]))
-  |> lustre.send(to: component)
+  assert model1.form_key == 1
+  assert extract_tag_keys(render_html(model1), "form") == ["post-form-1"]
+  assert list.map(model1.posts, fn(p) { #(p.author_name, p.body) })
+    == [#("TimelineUser", "hello world")]
 
-  let assert Ok(reconcile_msg) = process.receive(client, 500)
-  let payload =
-    reconcile_msg
-    |> server_component.client_message_to_json
-    |> json.to_string
-
-  assert collect_replace_form_changes(payload)
-    == Ok([ReplaceFormChange(kind: 5, tag: "form", key: "post-form-1")])
-
-  // Wait for the save_and_publish effect to complete before transaction rollback
-  let assert Ok(timeline.Created(created)) = process.receive(pubsub_sub, 500)
+  let assert Ok(timeline.Created(created)) = process.receive(pubsub_sub, 100)
   assert created.user_id == author.id
   assert created.body == "hello world"
   assert created.author_name == "TimelineUser"
-
-  shutdown_and_wait(component)
 }
 
-pub fn submitting_blank_post_does_not_replace_form_test() {
+pub fn submitting_blank_post_keeps_form_key_and_does_not_save_test() {
   use tx <- test_helper.with_db
 
   let assert Ok(author) = user.create(tx, "TimelineUser")
   let assert Ok(post_pubsub) = pubsub.start()
+  let pubsub_sub = process.new_subject()
+  pubsub.subscribe(post_pubsub, pubsub_sub)
 
-  let flags =
-    timeline.Flags(
+  let #(model0, _init_eff) =
+    timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
       user: Some(author),
       csrf_token: "test-csrf-token",
-    )
-  let assert Ok(component) =
-    lustre.start_server_component(timeline.app(), flags)
+    ))
 
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
+  let model1 = step(model0, timeline.UserSubmittedForm([#("body", "   ")]))
 
-  let assert Ok(_mount) = process.receive(client, 500)
-
-  lustre.dispatch(timeline.UserSubmittedForm([#("body", "   ")]))
-  |> lustre.send(to: component)
-
-  let assert Ok(reconcile_msg) = process.receive(client, 500)
-  let payload =
-    reconcile_msg
-    |> server_component.client_message_to_json
-    |> json.to_string
-
-  assert collect_replace_form_changes(payload) == Ok([])
-
-  shutdown_and_wait(component)
-}
-
-pub fn shutting_down_timeline_component_removes_pubsub_subscriber_test() {
-  use tx <- test_helper.with_db
-
-  let assert Ok(author) = user.create(tx, "TimelineUser")
-  let assert Ok(post_pubsub) = pubsub.start()
-
-  let flags =
-    timeline.Flags(
-      db: tx,
-      pubsub: post_pubsub,
-      user: Some(author),
-      csrf_token: "test-csrf-token",
-    )
-  let assert Ok(component) =
-    lustre.start_server_component(timeline.app(), flags)
-
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
-  let assert Ok(_mount) = process.receive(client, 500)
-
-  assert pubsub.subscriber_count(post_pubsub) == 1
-
-  shutdown_and_wait(component)
-
-  assert test_helper.wait_until(100, 5, fn() {
-    pubsub.subscriber_count(post_pubsub) == 0
-  })
+  assert model1.form_key == 0
+  assert extract_tag_keys(render_html(model1), "form") == ["post-form-0"]
+  assert model1.posts == []
+  assert process.receive(pubsub_sub, 20) == Error(Nil)
+  assert post_repo.list_recent(tx, 10) == Ok([])
 }
 
 pub fn unauthenticated_user_cannot_submit_post_test() {
@@ -189,40 +154,26 @@ pub fn unauthenticated_user_cannot_submit_post_test() {
   let pubsub_sub = process.new_subject()
   pubsub.subscribe(post_pubsub, pubsub_sub)
 
-  let flags =
-    timeline.Flags(
+  let #(model0, _init_eff) =
+    timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
-      user: option.None,
+      user: None,
       csrf_token: "anon-csrf-token",
+    ))
+
+  assert extract_tag_keys(render_html(model0), "form") == []
+  assert string.contains(render_html(model0), "Sign in to publish posts.")
+
+  let model1 =
+    step(
+      model0,
+      timeline.UserSubmittedForm([#("body", "unauthorized attempt")]),
     )
-  let assert Ok(component) =
-    lustre.start_server_component(timeline.app(), flags)
 
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
-  let assert Ok(_mount) = process.receive(client, 500)
-
-  lustre.dispatch(
-    timeline.UserSubmittedForm([#("body", "unauthorized attempt")]),
-  )
-  |> lustre.send(to: component)
-
-  let assert Ok(_reconcile) = process.receive(client, 500)
-  assert process.receive(pubsub_sub, 50) == Error(Nil)
+  assert model1 == model0
+  assert process.receive(pubsub_sub, 20) == Error(Nil)
   assert post_repo.list_recent(tx, 10) == Ok([])
-
-  shutdown_and_wait(component)
-}
-
-fn receive_json(
-  client: process.Subject(server_component.ClientMessage(timeline.Msg)),
-) -> String {
-  let assert Ok(msg) = process.receive(client, 500)
-  msg
-  |> server_component.client_message_to_json
-  |> json.to_string
 }
 
 pub fn incoming_post_shows_pending_banner_until_refreshed_test() {
@@ -232,61 +183,40 @@ pub fn incoming_post_shows_pending_banner_until_refreshed_test() {
   let assert Ok(bob) = user.create(tx, "Bob")
   let assert Ok(post_pubsub) = pubsub.start()
 
-  let flags =
-    timeline.Flags(
+  let #(model0, _init_eff) =
+    timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
       user: Some(alice),
       csrf_token: "test-csrf-token",
-    )
-  let assert Ok(component) =
-    lustre.start_server_component(timeline.app(), flags)
-
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
-  let _mount = receive_json(client)
+    ))
 
   // Bob publishes two posts while Alice has auto-refresh off
   let assert Ok(row1) = post_repo.create(tx, bob.id, "bob first post")
-  pubsub.publish(
-    post_pubsub,
-    timeline.Created(timeline.Post(
-      id: row1.id,
-      user_id: bob.id,
-      author_name: bob.name,
-      body: row1.body,
-      created_at: row1.created_at,
-    )),
-  )
-  let patch1 = receive_json(client)
-  assert string.contains(patch1, "Show 1 new post")
-  assert !string.contains(patch1, "bob first post")
+  let model1 = step(model0, timeline.PostCreated(to_timeline_post(row1, bob)))
+  assert model1.pending_count == 1
+  assert model1.posts == []
+  let html1 = render_html(model1)
+  assert string.contains(html1, "Show 1 new post")
+  assert !string.contains(html1, "bob first post")
 
   let assert Ok(row2) = post_repo.create(tx, bob.id, "bob second post")
-  pubsub.publish(
-    post_pubsub,
-    timeline.Created(timeline.Post(
-      id: row2.id,
-      user_id: bob.id,
-      author_name: bob.name,
-      body: row2.body,
-      created_at: row2.created_at,
-    )),
-  )
-  let patch2 = receive_json(client)
-  assert string.contains(patch2, "Show 2 new posts")
-  assert !string.contains(patch2, "bob second post")
+  let model2 = step(model1, timeline.PostCreated(to_timeline_post(row2, bob)))
+  assert model2.pending_count == 2
+  assert model2.posts == []
+  let html2 = render_html(model2)
+  assert string.contains(html2, "Show 2 new posts")
+  assert !string.contains(html2, "bob second post")
 
   // Clicking refresh reloads both posts from DB and clears pending banner
-  lustre.dispatch(timeline.UserClickedRefresh)
-  |> lustre.send(to: component)
-  let refresh_patch = receive_json(client)
-  assert string.contains(refresh_patch, "bob first post")
-  assert string.contains(refresh_patch, "bob second post")
-  assert !string.contains(refresh_patch, "Show 2 new posts")
-
-  shutdown_and_wait(component)
+  let model3 = step(model2, timeline.UserClickedRefresh)
+  assert model3.pending_count == 0
+  assert list.map(model3.posts, fn(p) { p.body })
+    == ["bob second post", "bob first post"]
+  let html3 = render_html(model3)
+  assert string.contains(html3, "bob first post")
+  assert string.contains(html3, "bob second post")
+  assert !string.contains(html3, "Show 2 new posts")
 }
 
 pub fn submitting_own_post_refreshes_pending_posts_without_echo_banner_test() {
@@ -295,52 +225,39 @@ pub fn submitting_own_post_refreshes_pending_posts_without_echo_banner_test() {
   let assert Ok(alice) = user.create(tx, "Alice")
   let assert Ok(bob) = user.create(tx, "Bob")
   let assert Ok(post_pubsub) = pubsub.start()
+  let pubsub_sub = process.new_subject()
+  pubsub.subscribe(post_pubsub, pubsub_sub)
 
-  let flags =
-    timeline.Flags(
+  let #(model0, _init_eff) =
+    timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
       user: Some(alice),
       csrf_token: "test-csrf-token",
-    )
-  let assert Ok(component) =
-    lustre.start_server_component(timeline.app(), flags)
-
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
-  let _mount = receive_json(client)
+    ))
 
   // Bob posts first, queued as pending for Alice
   let assert Ok(bob_row) = post_repo.create(tx, bob.id, "bob pending post")
-  pubsub.publish(
-    post_pubsub,
-    timeline.Created(timeline.Post(
-      id: bob_row.id,
-      user_id: bob.id,
-      author_name: bob.name,
-      body: bob_row.body,
-      created_at: bob_row.created_at,
-    )),
-  )
-  let pending_patch = receive_json(client)
-  assert string.contains(pending_patch, "Show 1 new post")
+  let model1 =
+    step(model0, timeline.PostCreated(to_timeline_post(bob_row, bob)))
+  assert model1.pending_count == 1
+  assert string.contains(render_html(model1), "Show 1 new post")
 
-  // Alice submits her own post: should reset form, reload DB (showing Bob's + Alice's posts),
-  // and ignore the echoed PostCreated for her own post without showing a new pending banner.
-  lustre.dispatch(timeline.UserSubmittedForm([#("body", "alice own post")]))
-  |> lustre.send(to: component)
+  // Alice submits her own post: increments form_key, reloads DB (showing Alice's + Bob's posts),
+  // and clears pending_count.
+  let model2 =
+    step(model1, timeline.UserSubmittedForm([#("body", "alice own post")]))
+  assert model2.pending_count == 0
+  assert list.map(model2.posts, fn(p) { p.body })
+    == ["alice own post", "bob pending post"]
 
-  let _form_replace_patch = receive_json(client)
-  let reloaded_patch = receive_json(client)
-  assert string.contains(reloaded_patch, "alice own post")
-  assert string.contains(reloaded_patch, "bob pending post")
-
-  // Echoed PostCreated(alice_post) produces an empty no-op patch (no pending banner)
-  let echo_patch = receive_json(client)
-  assert !string.contains(echo_patch, "Show 1 new post")
-
-  shutdown_and_wait(component)
+  // When the echoed PostCreated for Alice's own post arrives from PubSub,
+  // it is ignored because its ID is not newer than the head of model.posts.
+  let assert Ok(timeline.Created(alice_post)) = process.receive(pubsub_sub, 100)
+  let model3 = step(model2, timeline.PostCreated(alice_post))
+  assert model3.pending_count == 0
+  assert model3.posts == model2.posts
+  assert !string.contains(render_html(model3), "Show 1 new post")
 }
 
 pub fn toggling_auto_refresh_flushes_pending_and_streams_new_posts_test() {
@@ -350,112 +267,72 @@ pub fn toggling_auto_refresh_flushes_pending_and_streams_new_posts_test() {
   let assert Ok(bob) = user.create(tx, "Bob")
   let assert Ok(post_pubsub) = pubsub.start()
 
-  let flags =
-    timeline.Flags(
+  let #(model0, _init_eff) =
+    timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
       user: Some(alice),
       csrf_token: "test-csrf-token",
-    )
-  let assert Ok(component) =
-    lustre.start_server_component(timeline.app(), flags)
-
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
-  let _mount = receive_json(client)
+    ))
 
   // Bob posts while auto-refresh is OFF -> buffered
   let assert Ok(row1) = post_repo.create(tx, bob.id, "pending before live")
-  pubsub.publish(
-    post_pubsub,
-    timeline.Created(timeline.Post(
-      id: row1.id,
-      user_id: bob.id,
-      author_name: bob.name,
-      body: row1.body,
-      created_at: row1.created_at,
-    )),
-  )
-  let pending_patch = receive_json(client)
-  assert string.contains(pending_patch, "Show 1 new post")
+  let model1 = step(model0, timeline.PostCreated(to_timeline_post(row1, bob)))
+  assert model1.pending_count == 1
+  assert !model1.auto_refresh
 
   // Toggle Live ON -> immediately reloads pending post from DB
-  lustre.dispatch(timeline.UserToggledAutoRefresh)
-  |> lustre.send(to: component)
-  let live_on_patch = receive_json(client)
-  assert string.contains(live_on_patch, "pending before live")
+  let model2 = step(model1, timeline.UserToggledAutoRefresh)
+  assert model2.auto_refresh
+  assert model2.pending_count == 0
+  assert list.map(model2.posts, fn(p) { p.body }) == ["pending before live"]
+  assert string.contains(render_html(model2), "aria-pressed=\"true\"")
 
   // New post while Live is ON -> streamed immediately into feed
   let assert Ok(row2) = post_repo.create(tx, bob.id, "streamed live post")
-  pubsub.publish(
-    post_pubsub,
-    timeline.Created(timeline.Post(
-      id: row2.id,
-      user_id: bob.id,
-      author_name: bob.name,
-      body: row2.body,
-      created_at: row2.created_at,
-    )),
-  )
-  let live_patch = receive_json(client)
-  assert string.contains(live_patch, "streamed live post")
-  assert !string.contains(live_patch, "Show 1 new post")
+  let model3 = step(model2, timeline.PostCreated(to_timeline_post(row2, bob)))
+  assert model3.pending_count == 0
+  assert list.map(model3.posts, fn(p) { p.body })
+    == ["streamed live post", "pending before live"]
 
   // Toggle Live back OFF -> subsequent posts are buffered again
-  lustre.dispatch(timeline.UserToggledAutoRefresh)
-  |> lustre.send(to: component)
-  let _live_off_patch = receive_json(client)
+  let model4 = step(model3, timeline.UserToggledAutoRefresh)
+  assert !model4.auto_refresh
+  assert string.contains(render_html(model4), "aria-pressed=\"false\"")
 
   let assert Ok(row3) = post_repo.create(tx, bob.id, "buffered after live off")
-  pubsub.publish(
-    post_pubsub,
-    timeline.Created(timeline.Post(
-      id: row3.id,
-      user_id: bob.id,
-      author_name: bob.name,
-      body: row3.body,
-      created_at: row3.created_at,
-    )),
-  )
-  let buffered_again_patch = receive_json(client)
-  assert string.contains(buffered_again_patch, "Show 1 new post")
-  assert !string.contains(buffered_again_patch, "buffered after live off")
-
-  shutdown_and_wait(component)
+  let model5 = step(model4, timeline.PostCreated(to_timeline_post(row3, bob)))
+  assert model5.pending_count == 1
+  assert list.map(model5.posts, fn(p) { p.body })
+    == ["streamed live post", "pending before live"]
+  let html5 = render_html(model5)
+  assert string.contains(html5, "Show 1 new post")
+  assert !string.contains(html5, "buffered after live off")
 }
 
-pub fn post_renders_lote_time_with_rfc3339_datetime_test() {
+pub fn post_renders_lote_time_with_rfc3339_datetime_and_permalink_test() {
   use tx <- test_helper.with_db
 
   let assert Ok(author) = user.create(tx, "TimeUser")
   let assert Ok(created) = post_repo.create(tx, author.id, "timestamped post")
   let assert Ok(post_pubsub) = pubsub.start()
 
-  let flags =
-    timeline.Flags(
+  let #(model, _init_eff) =
+    timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
       user: Some(author),
       csrf_token: "test-csrf-token",
-    )
-  let assert Ok(component) =
-    lustre.start_server_component(timeline.app(), flags)
+    ))
 
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
-
-  let payload = receive_json(client)
-
+  let html = render_html(model)
   let expected_iso =
     timestamp.to_rfc3339(created.created_at, calendar.utc_offset)
-  assert string.contains(payload, "\"/posts/" <> created.id <> "\"")
-  assert string.contains(payload, "\"tag\":\"lote-time\"")
-  assert string.contains(payload, expected_iso)
-  assert string.contains(payload, " UTC")
 
-  shutdown_and_wait(component)
+  assert string.contains(html, "href=\"/posts/" <> created.id <> "\"")
+  assert string.contains(html, "<lote-time")
+  assert string.contains(html, "datetime=\"" <> expected_iso <> "\"")
+  assert string.contains(html, " UTC</time></lote-time>")
 }
 
 pub fn owner_can_delete_post_with_confirmation_and_broadcasts_deletion_test() {
@@ -468,72 +345,56 @@ pub fn owner_can_delete_post_with_confirmation_and_broadcasts_deletion_test() {
   let pubsub_sub = process.new_subject()
   pubsub.subscribe(post_pubsub, pubsub_sub)
 
-  let assert Ok(alice_component) =
-    lustre.start_server_component(
-      timeline.app(),
-      timeline.Flags(
-        db: tx,
-        pubsub: post_pubsub,
-        user: Some(alice),
-        csrf_token: "alice-csrf",
-      ),
-    )
-  let alice_client = process.new_subject()
-  server_component.register_subject(alice_client)
-  |> lustre.send(to: alice_component)
-  let alice_mount = receive_json(alice_client)
-  assert string.contains(alice_mount, "alice deletable post")
-  assert string.contains(alice_mount, "Delete")
+  let #(alice_model0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "alice-csrf",
+    ))
+  let alice_html0 = render_html(alice_model0)
+  assert string.contains(alice_html0, "alice deletable post")
+  assert string.contains(alice_html0, ">Delete</button>")
 
-  let assert Ok(bob_component) =
-    lustre.start_server_component(
-      timeline.app(),
-      timeline.Flags(
-        db: tx,
-        pubsub: post_pubsub,
-        user: Some(bob),
-        csrf_token: "bob-csrf",
-      ),
-    )
-  let bob_client = process.new_subject()
-  server_component.register_subject(bob_client)
-  |> lustre.send(to: bob_component)
-  let bob_mount = receive_json(bob_client)
-  assert string.contains(bob_mount, "alice deletable post")
-  assert !string.contains(bob_mount, "Delete")
+  let #(bob_model0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(bob),
+      csrf_token: "bob-csrf",
+    ))
+  let bob_html0 = render_html(bob_model0)
+  assert string.contains(bob_html0, "alice deletable post")
+  assert !string.contains(bob_html0, ">Delete</button>")
 
   // Step 1: request delete -> shows Confirm / Cancel
-  lustre.dispatch(timeline.UserRequestedDelete(post.id))
-  |> lustre.send(to: alice_component)
-  let confirm_patch = receive_json(alice_client)
-  assert string.contains(confirm_patch, "Confirm")
-  assert string.contains(confirm_patch, "Cancel")
+  let alice_model1 = step(alice_model0, timeline.UserRequestedDelete(post.id))
+  assert alice_model1.confirming_delete == Some(post.id)
+  let alice_html1 = render_html(alice_model1)
+  assert string.contains(alice_html1, ">Confirm</button>")
+  assert string.contains(alice_html1, ">Cancel</button>")
 
   // Cancel -> returns to Delete without deleting from DB
-  lustre.dispatch(timeline.UserCanceledDelete)
-  |> lustre.send(to: alice_component)
-  let cancel_patch = receive_json(alice_client)
-  assert string.contains(cancel_patch, "Delete")
+  let alice_model2 = step(alice_model1, timeline.UserCanceledDelete)
+  assert alice_model2.confirming_delete == None
+  assert string.contains(render_html(alice_model2), ">Delete</button>")
   let assert Ok(Some(_)) = post_repo.find_by_id(tx, post.id)
 
-  // Confirm delete -> removes from DB, broadcasts Deleted(post.id), and updates both timelines
-  lustre.dispatch(timeline.UserRequestedDelete(post.id))
-  |> lustre.send(to: alice_component)
-  let _re_confirm = receive_json(alice_client)
+  // Confirm delete -> removes from DB, broadcasts Deleted(post.id), and updates models on PostDeleted
+  let alice_model3 =
+    alice_model2
+    |> step(timeline.UserRequestedDelete(post.id))
+    |> step(timeline.UserConfirmedDelete(post.id))
+  assert alice_model3.confirming_delete == None
+  assert process.receive(pubsub_sub, 100) == Ok(timeline.Deleted(post.id))
+  assert post_repo.find_by_id(tx, post.id) == Ok(None)
 
-  lustre.dispatch(timeline.UserConfirmedDelete(post.id))
-  |> lustre.send(to: alice_component)
-  let _clear_confirm = receive_json(alice_client)
-
-  assert process.receive(pubsub_sub, 500) == Ok(timeline.Deleted(post.id))
-  let alice_removed_patch = receive_json(alice_client)
-  let bob_removed_patch = receive_json(bob_client)
-  assert string.contains(alice_removed_patch, "No posts yet.")
-  assert string.contains(bob_removed_patch, "No posts yet.")
-  assert post_repo.find_by_id(tx, post.id) == Ok(option.None)
-
-  shutdown_and_wait(alice_component)
-  shutdown_and_wait(bob_component)
+  let alice_model4 = step(alice_model3, timeline.PostDeleted(post.id))
+  let bob_model1 = step(bob_model0, timeline.PostDeleted(post.id))
+  assert alice_model4.posts == []
+  assert bob_model1.posts == []
+  assert string.contains(render_html(alice_model4), "No posts yet.")
+  assert string.contains(render_html(bob_model1), "No posts yet.")
 }
 
 pub fn non_owner_cannot_delete_another_users_post_test() {
@@ -546,35 +407,23 @@ pub fn non_owner_cannot_delete_another_users_post_test() {
   let pubsub_sub = process.new_subject()
   pubsub.subscribe(post_pubsub, pubsub_sub)
 
-  let assert Ok(bob_component) =
-    lustre.start_server_component(
-      timeline.app(),
-      timeline.Flags(
-        db: tx,
-        pubsub: post_pubsub,
-        user: Some(bob),
-        csrf_token: "bob-csrf",
-      ),
-    )
-  let bob_client = process.new_subject()
-  server_component.register_subject(bob_client)
-  |> lustre.send(to: bob_component)
-  let _bob_mount = receive_json(bob_client)
+  let #(bob_model0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(bob),
+      csrf_token: "bob-csrf",
+    ))
 
   // Even if Bob directly dispatches delete messages, the post is untouched
-  lustre.dispatch(timeline.UserRequestedDelete(post.id))
-  |> lustre.send(to: bob_component)
-  let req_patch = receive_json(bob_client)
-  assert !string.contains(req_patch, "Confirm")
+  let bob_model1 = step(bob_model0, timeline.UserRequestedDelete(post.id))
+  assert bob_model1.confirming_delete == None
+  assert !string.contains(render_html(bob_model1), ">Confirm</button>")
 
-  lustre.dispatch(timeline.UserConfirmedDelete(post.id))
-  |> lustre.send(to: bob_component)
-  let _confirm_patch = receive_json(bob_client)
-
-  assert process.receive(pubsub_sub, 50) == Error(Nil)
-  let assert Ok(Some(_)) = post_repo.find_by_id(tx, post.id)
-
-  shutdown_and_wait(bob_component)
+  let _bob_model2 = step(bob_model1, timeline.UserConfirmedDelete(post.id))
+  assert process.receive(pubsub_sub, 20) == Error(Nil)
+  let assert Ok(Some(found)) = post_repo.find_by_id(tx, post.id)
+  assert found.id == post.id
 }
 
 pub fn timeline_loads_initial_page_and_appends_older_posts_on_load_more_test() {
@@ -597,47 +446,45 @@ pub fn timeline_loads_initial_page_and_appends_older_posts_on_load_more_test() {
     |> list.first
 
   let assert Ok(post_pubsub) = pubsub.start()
-  let assert Ok(component) =
-    lustre.start_server_component(
-      timeline.app(),
-      timeline.Flags(
-        db: tx,
-        pubsub: post_pubsub,
-        user: Some(alice),
-        csrf_token: "test-csrf-token",
-      ),
-    )
+  let #(model0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "test-csrf-token",
+    ))
 
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
+  assert list.length(model0.posts) == timeline.page_size
+  assert model0.has_more
+  assert !model0.loading_more
 
-  let mount_payload = receive_json(client)
-  assert string.contains(mount_payload, "paginated-post-25")
-  assert string.contains(mount_payload, "paginated-post-06")
-  assert !string.contains(mount_payload, "paginated-post-05")
-  assert string.contains(
-    mount_payload,
-    int.to_string(timeline.page_size) <> "+ posts",
-  )
-  assert string.contains(mount_payload, "\"tag\":\"lote-sentinel\"")
-  assert string.contains(mount_payload, page1_oldest.id)
-  assert string.contains(mount_payload, "Load older posts")
+  let html0 = render_html(model0)
+  assert string.contains(html0, "paginated-post-25")
+  assert string.contains(html0, "paginated-post-06")
+  assert !string.contains(html0, "paginated-post-05")
+  assert string.contains(html0, int.to_string(timeline.page_size) <> "+ posts")
+  assert string.contains(html0, "<lote-sentinel")
+  assert string.contains(html0, "cursor=\"" <> page1_oldest.id <> "\"")
+  assert string.contains(html0, "Load older posts")
 
-  // Requesting older posts transitions through Loading... and appends the remaining 5 posts
-  lustre.dispatch(timeline.UserRequestedLoadMore)
-  |> lustre.send(to: component)
+  // Intermediate loading state before effect completion renders Loading...
+  let #(loading_model, load_eff) =
+    timeline.update(model0, timeline.UserRequestedLoadMore)
+  assert loading_model.loading_more
+  assert string.contains(render_html(loading_model), "Loading...")
 
-  let loading_patch = receive_json(client)
-  assert string.contains(loading_patch, "Loading...")
+  // Running the load effect dispatches OlderPostsLoaded and appends the remaining 5 posts
+  let model1 = list.fold(run_effect(load_eff), loading_model, step)
+  assert !model1.loading_more
+  assert !model1.has_more
+  assert list.length(model1.posts) == total
 
-  let loaded_patch = receive_json(client)
-  assert string.contains(loaded_patch, "paginated-post-05")
-  assert string.contains(loaded_patch, "paginated-post-01")
-  assert string.contains(loaded_patch, int.to_string(total) <> " posts")
-  assert !string.contains(loaded_patch, "Load older posts")
-
-  shutdown_and_wait(component)
+  let html1 = render_html(model1)
+  assert string.contains(html1, "paginated-post-05")
+  assert string.contains(html1, "paginated-post-01")
+  assert string.contains(html1, int.to_string(total) <> " posts")
+  assert !string.contains(html1, "Load older posts")
+  assert !string.contains(html1, "<lote-sentinel")
 }
 
 pub fn timeline_without_older_posts_omits_sentinel_test() {
@@ -648,204 +495,26 @@ pub fn timeline_without_older_posts_omits_sentinel_test() {
   let assert Ok(_) = post_repo.create(tx, alice.id, "only post 2")
 
   let assert Ok(post_pubsub) = pubsub.start()
-  let assert Ok(component) =
-    lustre.start_server_component(
-      timeline.app(),
-      timeline.Flags(
-        db: tx,
-        pubsub: post_pubsub,
-        user: Some(alice),
-        csrf_token: "test-csrf-token",
-      ),
-    )
+  let #(model, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "test-csrf-token",
+    ))
 
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
-
-  let mount_payload = receive_json(client)
-  assert string.contains(mount_payload, "2 posts")
-  assert !string.contains(mount_payload, "lote-sentinel")
-  assert !string.contains(mount_payload, "Load older posts")
-
-  shutdown_and_wait(component)
+  assert !model.has_more
+  let html = render_html(model)
+  assert string.contains(html, "2 posts")
+  assert !string.contains(html, "<lote-sentinel")
+  assert !string.contains(html, "Load older posts")
 }
 
-type PatchChange {
-  ReplaceTextChange(content: String)
-  MoveChange(key: String, before: Int)
-  RemoveChange(index: Int)
-  ReplaceChange(index: Int, tag: String, key: String)
-  InsertChange(before: Int, keys: List(String))
-}
-
-fn patch_changes_decoder() -> decode.Decoder(List(PatchChange)) {
-  use <- decode.recursive
-
-  let child_key_decoder = {
-    use key <- decode.optional_field("key", "", decode.string)
-    decode.success(key)
-  }
-
-  let replace_with_decoder = {
-    use tag <- decode.optional_field("tag", "", decode.string)
-    use key <- decode.optional_field("key", "", decode.string)
-    decode.success(#(tag, key))
-  }
-
-  let change_decoder = {
-    use kind <- decode.optional_field("kind", 0, decode.int)
-    case kind {
-      0 -> {
-        use content <- decode.optional_field("content", "", decode.string)
-        decode.success([ReplaceTextChange(content:)])
-      }
-      3 -> {
-        use key <- decode.optional_field("key", "", decode.string)
-        use before <- decode.optional_field("before", 0, decode.int)
-        decode.success([MoveChange(key:, before:)])
-      }
-      4 -> {
-        use index <- decode.optional_field("index", 0, decode.int)
-        decode.success([RemoveChange(index:)])
-      }
-      5 -> {
-        use index <- decode.optional_field("index", 0, decode.int)
-        use #(tag, key) <- decode.field("with", replace_with_decoder)
-        decode.success([ReplaceChange(index:, tag:, key:)])
-      }
-      6 -> {
-        use before <- decode.optional_field("before", 0, decode.int)
-        use keys <- decode.optional_field(
-          "children",
-          [],
-          decode.list(child_key_decoder),
-        )
-        decode.success([InsertChange(before:, keys:)])
-      }
-      _ -> decode.success([])
-    }
-  }
-
-  use changes <- decode.optional_field(
-    "changes",
-    [],
-    decode.list(change_decoder),
-  )
-  use children <- decode.optional_field(
-    "children",
-    [],
-    decode.list(patch_changes_decoder()),
-  )
-  decode.success(list.flatten([list.flatten(changes), ..children]))
-}
-
-fn collect_patch_changes(patch_json: String) -> List(PatchChange) {
-  let msg_decoder = {
-    use patch <- decode.field("patch", patch_changes_decoder())
-    decode.success(patch)
-  }
-  let assert Ok(changes) = json.parse(patch_json, msg_decoder)
-  changes
-}
-
-pub fn keyed_feed_prepends_and_deletes_emit_minimal_keyed_patches_test() {
+pub fn feed_assigns_stable_post_id_keys_across_prepend_delete_and_pagination_test() {
   use tx <- test_helper.with_db
 
   let assert Ok(alice) = user.create(tx, "Alice")
-  let assert Ok(p1) = post_repo.create(tx, alice.id, "existing-post-alpha")
-  let assert Ok(p2) = post_repo.create(tx, alice.id, "existing-post-beta")
-  let assert Ok(post_pubsub) = pubsub.start()
-
-  let assert Ok(component) =
-    lustre.start_server_component(
-      timeline.app(),
-      timeline.Flags(
-        db: tx,
-        pubsub: post_pubsub,
-        user: Some(alice),
-        csrf_token: "test-csrf-token",
-      ),
-    )
-
-  let client = process.new_subject()
-  server_component.register_subject(client)
-  |> lustre.send(to: component)
-
-  // Initial mount carries each post.id as the VNode key
-  let mount_payload = receive_json(client)
-  assert string.contains(mount_payload, "\"key\":\"" <> p1.id <> "\"")
-  assert string.contains(mount_payload, "\"key\":\"" <> p2.id <> "\"")
-
-  // Enable Live auto-refresh so incoming posts are prepended immediately
-  lustre.dispatch(timeline.UserToggledAutoRefresh)
-  |> lustre.send(to: component)
-  let _live_on = receive_json(client)
-
-  // 1. Prepending a new post emits exactly one Insert at index 0 for p3.id
-  //    plus the header count text update, with zero rewrites of p1/p2.
-  let assert Ok(p3) = post_repo.create(tx, alice.id, "new-post-gamma")
-  pubsub.publish(
-    post_pubsub,
-    timeline.Created(timeline.Post(
-      id: p3.id,
-      user_id: alice.id,
-      author_name: alice.name,
-      body: p3.body,
-      created_at: p3.created_at,
-    )),
-  )
-  let prepend_patch = receive_json(client)
-  assert collect_patch_changes(prepend_patch)
-    == [
-      InsertChange(before: 0, keys: [p3.id]),
-      ReplaceTextChange("3 posts"),
-    ]
-
-  // 2. Deleting the middle post (p2 at index 1 in [p3, p2, p1]) emits exactly
-  //    one RemoveChange(index: 1) plus header count update, without rewriting p3 or p1.
-  pubsub.publish(post_pubsub, timeline.Deleted(p2.id))
-  let middle_delete_patch = receive_json(client)
-  assert collect_patch_changes(middle_delete_patch)
-    == [
-      RemoveChange(index: 1),
-      ReplaceTextChange("2 posts"),
-    ]
-
-  // 3. While p1 is in confirming-delete state, deleting the head post (p3 at index 0)
-  //    emits only RemoveChange(index: 0) and leaves p1's confirmation UI untouched.
-  lustre.dispatch(timeline.UserRequestedDelete(p1.id))
-  |> lustre.send(to: component)
-  let confirm_patch = receive_json(client)
-  assert string.contains(confirm_patch, "Confirm")
-  assert string.contains(confirm_patch, "Cancel")
-
-  pubsub.publish(post_pubsub, timeline.Deleted(p3.id))
-  let head_delete_patch = receive_json(client)
-  assert collect_patch_changes(head_delete_patch)
-    == [
-      RemoveChange(index: 0),
-      ReplaceTextChange("1 posts"),
-    ]
-  assert !string.contains(head_delete_patch, "existing-post-alpha")
-  assert !string.contains(head_delete_patch, "Confirm")
-
-  // Confirming delete on p1 still works cleanly after p3 was removed above it
-  lustre.dispatch(timeline.UserConfirmedDelete(p1.id))
-  |> lustre.send(to: component)
-  let _clear_confirm = receive_json(client)
-  let empty_patch = receive_json(client)
-  assert string.contains(empty_patch, "No posts yet.")
-  assert post_repo.find_by_id(tx, p1.id) == Ok(option.None)
-
-  shutdown_and_wait(component)
-}
-
-pub fn keyed_feed_refresh_and_load_more_insert_only_new_keys_test() {
-  use tx <- test_helper.with_db
-
-  let assert Ok(alice) = user.create(tx, "Alice")
-  let total = timeline.page_size + 3
+  let total = timeline.page_size + 2
   let created =
     int.range(from: 1, to: total + 1, with: [], run: fn(acc, n) {
       let body = "keyed-post-" <> string.pad_start(int.to_string(n), 2, "0")
@@ -854,73 +523,90 @@ pub fn keyed_feed_refresh_and_load_more_insert_only_new_keys_test() {
     })
     |> list.reverse
 
-  // Oldest 3 posts (not on page 1) in descending display order: #03, #02, #01
-  let older_three_ids =
+  // created is in ascending creation order (#01 .. #22); display order is descending (#22 .. #01)
+  let all_ids_desc =
     created
-    |> list.take(3)
     |> list.reverse
     |> list.map(fn(r) { r.id })
+  let page1_ids = list.take(all_ids_desc, timeline.page_size)
 
   let assert Ok(post_pubsub) = pubsub.start()
-  let assert Ok(component) =
-    lustre.start_server_component(
-      timeline.app(),
-      timeline.Flags(
-        db: tx,
-        pubsub: post_pubsub,
-        user: Some(alice),
-        csrf_token: "test-csrf-token",
-      ),
+  let #(model0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "test-csrf-token",
+    ))
+
+  // 1. Initial feed renders <li data-lustre-key="{post.id}"> for the first page in descending ID order
+  assert extract_tag_keys(render_html(model0), "li") == page1_ids
+
+  // 2. Loading older posts appends the remaining 2 older post IDs to the tail while keeping existing keys
+  let model1 = step(model0, timeline.UserRequestedLoadMore)
+  assert extract_tag_keys(render_html(model1), "li") == all_ids_desc
+
+  // 3. Enabling Live auto-refresh and prepending a new post places its key at index 0
+  let model2 = step(model1, timeline.UserToggledAutoRefresh)
+  let assert Ok(fresh) = post_repo.create(tx, alice.id, "new-post-top")
+  let model3 =
+    step(model2, timeline.PostCreated(to_timeline_post(fresh, alice)))
+  assert extract_tag_keys(render_html(model3), "li")
+    == [fresh.id, ..all_ids_desc]
+
+  // 4. Deleting a post removes only that post's key while preserving confirmation state on another post
+  let assert [_, second_id, third_id, ..] = all_ids_desc
+  let assert Ok(True) = post_repo.delete(tx, second_id, alice.id)
+  let model4 =
+    model3
+    |> step(timeline.UserRequestedDelete(third_id))
+    |> step(timeline.PostDeleted(second_id))
+  assert model4.confirming_delete == Some(third_id)
+  assert extract_tag_keys(render_html(model4), "li")
+    == list.filter([fresh.id, ..all_ids_desc], fn(id) { id != second_id })
+  assert string.contains(render_html(model4), ">Confirm</button>")
+
+  // 5. Clicking Refresh reloads the latest page_size posts from DB with their stable keys
+  let model5 = step(model4, timeline.UserClickedRefresh)
+  let expected_refreshed_keys =
+    [fresh.id, ..all_ids_desc]
+    |> list.filter(fn(id) { id != second_id })
+    |> list.take(timeline.page_size)
+  assert extract_tag_keys(render_html(model5), "li") == expected_refreshed_keys
+}
+
+pub fn server_component_runtime_delivers_pubsub_events_and_cleans_up_on_shutdown_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "RuntimeUser")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let flags =
+    timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(author),
+      csrf_token: "test-csrf-token",
     )
+  let assert Ok(component) =
+    lustre.start_server_component(timeline.app(), flags)
 
   let client = process.new_subject()
   server_component.register_subject(client)
   |> lustre.send(to: component)
-  let _mount = receive_json(client)
+  let assert Ok(_mount) = process.receive(client, 500)
 
-  // 1. Loading older posts via infinite scroll appends only the 3 older keys at the tail,
-  //    without rewriting any of the 20 already-rendered posts.
-  lustre.dispatch(timeline.UserRequestedLoadMore)
-  |> lustre.send(to: component)
-  let _loading_patch = receive_json(client)
-  let loaded_patch = receive_json(client)
+  assert pubsub.subscriber_count(post_pubsub) == 1
 
-  let loaded_changes = collect_patch_changes(loaded_patch)
-  assert list.contains(
-    loaded_changes,
-    InsertChange(before: timeline.page_size, keys: older_three_ids),
-  )
-  assert !string.contains(loaded_patch, "keyed-post-23")
-  assert !string.contains(loaded_patch, "keyed-post-04")
-
-  // 2. Refreshing after 2 new posts arrive inserts only the 2 new keys at the top
-  //    and drops the 5 excess older items from the tail without rewriting existing rows.
-  let assert Ok(new1) = post_repo.create(tx, alice.id, "keyed-fresh-1")
-  let assert Ok(new2) = post_repo.create(tx, alice.id, "keyed-fresh-2")
-  lustre.dispatch(timeline.UserClickedRefresh)
-  |> lustre.send(to: component)
-  let refresh_patch = receive_json(client)
-
-  let refresh_changes = collect_patch_changes(refresh_patch)
-  let inserted_keys =
-    list.flat_map(refresh_changes, fn(change) {
-      case change {
-        InsertChange(before: 0, keys:) -> keys
-        _ -> []
-      }
-    })
-  assert list.contains(inserted_keys, new1.id)
-  assert list.contains(inserted_keys, new2.id)
-  assert list.length(inserted_keys) == 2
-  assert !list.any(refresh_changes, fn(change) {
-    case change {
-      MoveChange(..) -> True
-      ReplaceChange(tag: "li", ..) -> True
-      _ -> False
-    }
-  })
-  assert !string.contains(refresh_patch, "keyed-post-23")
-  assert !string.contains(refresh_patch, "keyed-post-06")
+  // Publishing a PostEvent to post_pubsub is routed into the server component
+  // via server_component.select and triggers a client update message.
+  let assert Ok(row) = post_repo.create(tx, author.id, "runtime pubsub post")
+  pubsub.publish(post_pubsub, timeline.Created(to_timeline_post(row, author)))
+  let assert Ok(_patch) = process.receive(client, 500)
 
   shutdown_and_wait(component)
+
+  assert test_helper.wait_until(100, 5, fn() {
+    pubsub.subscriber_count(post_pubsub) == 0
+  })
 }
