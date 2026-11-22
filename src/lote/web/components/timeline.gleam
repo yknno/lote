@@ -132,7 +132,7 @@ fn is_newer_than_loaded(post: Post, loaded: List(Post)) -> Bool {
   }
 }
 
-fn init(flags: Flags) -> #(Model, Effect(Msg)) {
+pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
   let #(posts, has_more) = case load_recent_page(flags.db) {
     Ok(page) -> page
     Error(_) -> #([], False)
@@ -168,7 +168,7 @@ fn init(flags: Flags) -> #(Model, Effect(Msg)) {
   )
 }
 
-fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
+pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     UserSubmittedForm(fields) -> {
       case model.user {
@@ -381,7 +381,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   }
 }
 
-fn view(model: Model) -> Element(Msg) {
+pub fn view(model: Model) -> Element(Msg) {
   let sidebar =
     html.aside(
       [
