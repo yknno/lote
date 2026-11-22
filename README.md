@@ -60,6 +60,7 @@ AUTH_ADAPTERS=password mise exec -- gleam run
 | `DATABASE_URL` | PostgreSQL 接続 URL | `postgres://postgres:postgres@localhost:5432/lote` |
 | `SECRET_KEY_BASE` | Cookie 署名キー | 起動時にランダム生成 |
 | `AUTH_ADAPTERS` | 有効にするログイン方式（カンマ区切り、例: `password`） | 空（すべて無効） |
+| `PUBSUB_ADAPTER` | PubSub バックエンド（`memory` または `postgres`） | `memory` |
 
 ## Test
 

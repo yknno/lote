@@ -5,12 +5,18 @@ import gleam/result
 import gleam/string
 import wisp
 
+pub type PubSubAdapter {
+  MemoryPubSub
+  PostgresPubSub
+}
+
 pub type Config {
   Config(
     port: Int,
     secret_key_base: String,
     database_url: String,
     auth_adapters: List(String),
+    pubsub_adapter: PubSubAdapter,
   )
 }
 
@@ -35,5 +41,23 @@ pub fn load() -> Config {
     |> list.map(fn(s) { string.lowercase(string.trim(s)) })
     |> list.filter(fn(s) { s != "" })
 
-  Config(port:, secret_key_base:, database_url:, auth_adapters:)
+  let pubsub_adapter =
+    envoy.get("PUBSUB_ADAPTER")
+    |> result.unwrap("")
+    |> parse_pubsub_adapter
+
+  Config(
+    port:,
+    secret_key_base:,
+    database_url:,
+    auth_adapters:,
+    pubsub_adapter:,
+  )
+}
+
+pub fn parse_pubsub_adapter(raw: String) -> PubSubAdapter {
+  case string.lowercase(string.trim(raw)) {
+    "postgres" | "postgresql" -> PostgresPubSub
+    _ -> MemoryPubSub
+  }
 }
