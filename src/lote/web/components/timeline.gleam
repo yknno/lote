@@ -2,13 +2,14 @@ import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
 import gleam/string
-import gleam/time/calendar
 import gleam/time/timestamp.{type Timestamp}
 import lote/auth/user.{type AuthUser}
 import lote/db/post_repo
 import lote/realtime/pubsub.{type PubSub}
 import lote/web/csrf
+import lote/web/time as web_time
 import lustre
 import lustre/attribute
 import lustre/effect.{type Effect}
@@ -22,13 +23,24 @@ import pog
 const recent_posts_limit = 50
 
 pub type Post {
-  Post(id: Int, author_name: String, body: String, created_at: Timestamp)
+  Post(
+    id: String,
+    user_id: Int,
+    author_name: String,
+    body: String,
+    created_at: Timestamp,
+  )
+}
+
+pub type PostEvent {
+  Created(Post)
+  Deleted(String)
 }
 
 pub type Flags {
   Flags(
     db: pog.Connection,
-    pubsub: PubSub(Post),
+    pubsub: PubSub(PostEvent),
     user: Option(AuthUser),
     csrf_token: String,
   )
@@ -37,12 +49,13 @@ pub type Flags {
 pub type Model {
   Model(
     db: pog.Connection,
-    pubsub: PubSub(Post),
+    pubsub: PubSub(PostEvent),
     user: Option(AuthUser),
     csrf_token: String,
     posts: List(Post),
     pending_count: Int,
     auto_refresh: Bool,
+    confirming_delete: Option(String),
     form_key: Int,
   )
 }
@@ -51,8 +64,12 @@ pub type Msg {
   UserSubmittedForm(List(#(String, String)))
   UserClickedRefresh
   UserToggledAutoRefresh
+  UserRequestedDelete(String)
+  UserCanceledDelete
+  UserConfirmedDelete(String)
   PostsReloaded(List(Post))
   PostCreated(Post)
+  PostDeleted(String)
 }
 
 pub fn app() -> lustre.App(Flags, Model, Msg) {
@@ -66,6 +83,7 @@ fn load_recent_posts(db: pog.Connection) -> Result(List(Post), pog.QueryError) {
         list.map(rows, fn(row) {
           Post(
             id: row.id,
+            user_id: row.user_id,
             author_name: row.author_name,
             body: row.body,
             created_at: row.created_at,
@@ -76,10 +94,10 @@ fn load_recent_posts(db: pog.Connection) -> Result(List(Post), pog.QueryError) {
   }
 }
 
-fn latest_post_id(posts: List(Post)) -> Int {
-  case posts {
-    [first, ..] -> first.id
-    [] -> 0
+fn is_newer_than_loaded(post: Post, loaded: List(Post)) -> Bool {
+  case loaded {
+    [first, ..] -> string.compare(post.id, first.id) == order.Gt
+    [] -> True
   }
 }
 
@@ -93,7 +111,12 @@ fn init(flags: Flags) -> #(Model, Effect(Msg)) {
     server_component.select(fn(_dispatch, subject) {
       pubsub.subscribe(flags.pubsub, subject)
       process.new_selector()
-      |> process.select_map(subject, PostCreated)
+      |> process.select_map(subject, fn(ev) {
+        case ev {
+          Created(post) -> PostCreated(post)
+          Deleted(id) -> PostDeleted(id)
+        }
+      })
     })
 
   #(
@@ -105,6 +128,7 @@ fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       posts:,
       pending_count: 0,
       auto_refresh: False,
+      confirming_delete: None,
       form_key: 0,
     ),
     subscribe_effect,
@@ -132,6 +156,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                       let post =
                         Post(
                           id: row.id,
+                          user_id: auth_user.id,
                           author_name: auth_user.name,
                           body: row.body,
                           created_at: row.created_at,
@@ -140,7 +165,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                         Ok(posts) -> dispatch(PostsReloaded(posts))
                         Error(_) -> Nil
                       }
-                      pubsub.publish(model.pubsub, post)
+                      pubsub.publish(model.pubsub, Created(post))
                     }
                     Error(_) -> Nil
                   }
@@ -175,15 +200,52 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
       }
 
+    UserRequestedDelete(post_id) ->
+      case model.user {
+        Some(auth_user) ->
+          case
+            list.any(model.posts, fn(p) {
+              p.id == post_id && p.user_id == auth_user.id
+            })
+          {
+            True -> #(
+              Model(..model, confirming_delete: Some(post_id)),
+              effect.none(),
+            )
+            False -> #(model, effect.none())
+          }
+        None -> #(model, effect.none())
+      }
+
+    UserCanceledDelete -> #(
+      Model(..model, confirming_delete: None),
+      effect.none(),
+    )
+
+    UserConfirmedDelete(post_id) ->
+      case model.user {
+        None -> #(Model(..model, confirming_delete: None), effect.none())
+        Some(auth_user) -> {
+          let delete_and_publish =
+            effect.from(fn(_dispatch) {
+              case post_repo.delete(model.db, post_id, auth_user.id) {
+                Ok(True) -> pubsub.publish(model.pubsub, Deleted(post_id))
+                Ok(False) | Error(_) -> Nil
+              }
+            })
+          #(Model(..model, confirming_delete: None), delete_and_publish)
+        }
+      }
+
     PostsReloaded(posts) -> #(
       Model(..model, posts:, pending_count: 0),
       effect.none(),
     )
 
     PostCreated(post) ->
-      case post.id <= latest_post_id(model.posts) {
-        True -> #(model, effect.none())
-        False ->
+      case is_newer_than_loaded(post, model.posts) {
+        False -> #(model, effect.none())
+        True ->
           case model.auto_refresh {
             True -> #(
               Model(
@@ -199,6 +261,21 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             )
           }
       }
+
+    PostDeleted(post_id) -> {
+      let confirming_delete = case model.confirming_delete {
+        Some(id) if id == post_id -> None
+        other -> other
+      }
+      #(
+        Model(
+          ..model,
+          posts: list.filter(model.posts, fn(p) { p.id != post_id }),
+          confirming_delete:,
+        ),
+        effect.none(),
+      )
+    }
   }
 }
 
@@ -260,7 +337,7 @@ fn view(model: Model) -> Element(Msg) {
         ],
       ),
       pending_banner(model.pending_count),
-      feed(model.posts),
+      feed(model.posts, model.user, model.confirming_delete),
     ])
 
   html.div([attribute.class("flex min-h-screen flex-col md:flex-row")], [
@@ -415,7 +492,11 @@ fn composer_pane(model: Model) -> Element(Msg) {
   }
 }
 
-fn feed(posts: List(Post)) -> Element(Msg) {
+fn feed(
+  posts: List(Post),
+  current_user: Option(AuthUser),
+  confirming_delete: Option(String),
+) -> Element(Msg) {
   case posts {
     [] ->
       html.p([attribute.class("px-4 py-8 text-xs text-neutral-400")], [
@@ -425,36 +506,36 @@ fn feed(posts: List(Post)) -> Element(Msg) {
     _ ->
       html.ul(
         [attribute.class("divide-y divide-neutral-200")],
-        list.map(posts, post_row),
+        list.map(posts, post_row(_, current_user, confirming_delete)),
       )
   }
 }
 
-fn post_row(post: Post) -> Element(Msg) {
-  let created_iso = timestamp.to_rfc3339(post.created_at, calendar.utc_offset)
-
+fn post_row(
+  post: Post,
+  current_user: Option(AuthUser),
+  confirming_delete: Option(String),
+) -> Element(Msg) {
   html.li([attribute.class("px-4 py-3 hover:bg-neutral-50/70")], [
     html.div([attribute.class("flex items-baseline gap-2 text-xs")], [
       html.span([attribute.class("font-semibold text-neutral-950")], [
         html.text(post.author_name),
       ]),
-      html.span([attribute.class("font-mono text-neutral-400")], [
-        html.text("#" <> int.to_string(post.id)),
-      ]),
-      element.element(
-        "lote-time",
+      html.a(
         [
-          attribute.attribute("datetime", created_iso),
+          attribute.href("/posts/" <> post.id),
+          attribute.title(post.id),
           attribute.class(
-            "ml-auto shrink-0 font-mono text-xs text-neutral-400 tabular-nums",
+            "font-mono text-neutral-400 underline-offset-2 hover:text-neutral-950 hover:underline",
           ),
         ],
-        [
-          html.time([attribute.datetime(created_iso)], [
-            html.text(format_utc_fallback(post.created_at)),
-          ]),
-        ],
+        [html.text("#" <> short_id(post.id))],
       ),
+      web_time.lote_time(
+        post.created_at,
+        "ml-auto shrink-0 font-mono text-xs text-neutral-400 tabular-nums",
+      ),
+      delete_controls(post, current_user, confirming_delete),
     ]),
     html.p(
       [
@@ -467,23 +548,61 @@ fn post_row(post: Post) -> Element(Msg) {
   ])
 }
 
-fn format_utc_fallback(ts: Timestamp) -> String {
-  let #(date, time) = timestamp.to_calendar(ts, calendar.utc_offset)
-  int.to_string(date.year)
-  <> "-"
-  <> pad2(calendar.month_to_int(date.month))
-  <> "-"
-  <> pad2(date.day)
-  <> " "
-  <> pad2(time.hours)
-  <> ":"
-  <> pad2(time.minutes)
-  <> " UTC"
+fn delete_controls(
+  post: Post,
+  current_user: Option(AuthUser),
+  confirming_delete: Option(String),
+) -> Element(Msg) {
+  case current_user {
+    Some(u) if u.id == post.user_id ->
+      case confirming_delete {
+        Some(id) if id == post.id ->
+          html.span(
+            [attribute.class("inline-flex shrink-0 items-baseline gap-1.5")],
+            [
+              html.button(
+                [
+                  attribute.type_("button"),
+                  event.on_click(UserConfirmedDelete(post.id)),
+                  attribute.class(
+                    "cursor-pointer font-medium text-red-600 underline-offset-2 hover:underline",
+                  ),
+                ],
+                [html.text("Confirm")],
+              ),
+              html.button(
+                [
+                  attribute.type_("button"),
+                  event.on_click(UserCanceledDelete),
+                  attribute.class(
+                    "cursor-pointer text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
+                  ),
+                ],
+                [html.text("Cancel")],
+              ),
+            ],
+          )
+
+        _ ->
+          html.button(
+            [
+              attribute.type_("button"),
+              event.on_click(UserRequestedDelete(post.id)),
+              attribute.class(
+                "shrink-0 cursor-pointer text-neutral-400 underline-offset-2 hover:text-red-600 hover:underline",
+              ),
+            ],
+            [html.text("Delete")],
+          )
+      }
+
+    _ -> element.none()
+  }
 }
 
-fn pad2(n: Int) -> String {
-  case n < 10 {
-    True -> "0" <> int.to_string(n)
-    False -> int.to_string(n)
+fn short_id(id: String) -> String {
+  case string.length(id) >= 8 {
+    True -> string.slice(id, at_index: string.length(id) - 8, length: 8)
+    False -> id
   }
 }
