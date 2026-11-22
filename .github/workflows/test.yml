@@ -27,12 +27,11 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/lote
     steps:
-      - uses: actions/checkout@v7
-      - uses: erlef/setup-beam@v1
+      - uses: actions/checkout@v7.0.1
+      - uses: erlef/setup-beam@v1.24.1
         with:
-          otp-version: "29"
-          gleam-version: "1.19.2"
-          rebar3-version: "3"
+          version-file: mise.toml
+          version-type: strict
       - run: gleam deps download
       - run: gleam run -m cigogne -- all
       - run: gleam test
