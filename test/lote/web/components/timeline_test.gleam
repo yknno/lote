@@ -4,6 +4,7 @@ import gleam/json
 import gleam/list
 import gleam/option.{Some}
 import lote/auth/user
+import lote/db/post_repo
 import lote/realtime/pubsub
 import lote/test_helper
 import lote/web/components/timeline
@@ -53,6 +54,16 @@ fn collect_replace_form_changes(
   json.parse(patch_json, msg_decoder)
 }
 
+fn shutdown_and_wait(component: lustre.Runtime(timeline.Msg)) -> Nil {
+  let mon = process.monitor(server_component.pid(component))
+  lustre.send(component, lustre.shutdown())
+  let down_selector =
+    process.new_selector()
+    |> process.select_specific_monitor(mon, fn(down) { down })
+  let assert Ok(_) = process.selector_receive(down_selector, 500)
+  Nil
+}
+
 pub fn submitting_post_replaces_form_element_to_reset_input_test() {
   use tx <- test_helper.with_db
 
@@ -97,7 +108,7 @@ pub fn submitting_post_replaces_form_element_to_reset_input_test() {
   assert created.body == "hello world"
   assert created.author_name == "TimelineUser"
 
-  lustre.send(component, lustre.shutdown())
+  shutdown_and_wait(component)
 }
 
 pub fn submitting_blank_post_does_not_replace_form_test() {
@@ -133,7 +144,7 @@ pub fn submitting_blank_post_does_not_replace_form_test() {
 
   assert collect_replace_form_changes(payload) == Ok([])
 
-  lustre.send(component, lustre.shutdown())
+  shutdown_and_wait(component)
 }
 
 pub fn shutting_down_timeline_component_removes_pubsub_subscriber_test() {
@@ -159,14 +170,43 @@ pub fn shutting_down_timeline_component_removes_pubsub_subscriber_test() {
 
   assert pubsub.subscriber_count(post_pubsub) == 1
 
-  let mon = process.monitor(server_component.pid(component))
-  lustre.send(component, lustre.shutdown())
-  let down_selector =
-    process.new_selector()
-    |> process.select_specific_monitor(mon, fn(down) { down })
-  let assert Ok(_) = process.selector_receive(down_selector, 500)
+  shutdown_and_wait(component)
 
   assert test_helper.wait_until(100, 5, fn() {
     pubsub.subscriber_count(post_pubsub) == 0
   })
+}
+
+pub fn unauthenticated_user_cannot_submit_post_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(post_pubsub) = pubsub.start()
+  let pubsub_sub = process.new_subject()
+  pubsub.subscribe(post_pubsub, pubsub_sub)
+
+  let flags =
+    timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: option.None,
+      csrf_token: "anon-csrf-token",
+    )
+  let assert Ok(component) =
+    lustre.start_server_component(timeline.app(), flags)
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+  let assert Ok(_mount) = process.receive(client, 500)
+
+  lustre.dispatch(
+    timeline.UserSubmittedForm([#("body", "unauthorized attempt")]),
+  )
+  |> lustre.send(to: component)
+
+  let assert Ok(_reconcile) = process.receive(client, 500)
+  assert process.receive(pubsub_sub, 50) == Error(Nil)
+  assert post_repo.list_recent(tx, 10) == Ok([])
+
+  shutdown_and_wait(component)
 }

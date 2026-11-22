@@ -7,9 +7,11 @@ pub fn create_and_authenticate_with_valid_password_test() {
 
   let assert Ok(created) = user.create(tx, "Alice Test")
   let assert Ok(Nil) =
-    password.create(tx, created.id, "alice_test", "secretpass123")
+    password.create(tx, created.id, "  alice_test  ", "secretpass123")
 
   assert password.authenticate(tx, "alice_test", "secretpass123") == Ok(created)
+  assert password.authenticate(tx, "  alice_test  ", "secretpass123")
+    == Ok(created)
 }
 
 pub fn authenticate_fails_with_wrong_password_or_unknown_id_test() {
@@ -25,11 +27,14 @@ pub fn authenticate_fails_with_wrong_password_or_unknown_id_test() {
     == Error(password.InvalidCredentials)
 }
 
-pub fn create_rejects_short_password_and_duplicate_login_id_test() {
+pub fn create_rejects_blank_login_id_short_password_and_duplicate_login_id_test() {
   use tx <- test_helper.with_db
 
   let assert Ok(u1) = user.create(tx, "User 1")
   let assert Ok(u2) = user.create(tx, "User 2")
+
+  assert password.create(tx, u1.id, "   ", "secretpass123")
+    == Error(password.InvalidInput("Login ID is required"))
 
   assert password.create(tx, u1.id, "short_user", "short")
     == Error(password.InvalidInput("Password must be at least 8 characters"))

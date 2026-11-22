@@ -76,18 +76,27 @@ pub fn exists(db: pog.Connection, login_id: String) -> Result(Bool, Error) {
   }
 }
 
+const dummy_password_hash =
+  "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHR2YWx1ZTEy$R+o7T1S1r0W1k5n7A6p+8C9b2D3e4F5g6H7i8J9k0L0"
+
 pub fn authenticate(
   db: pog.Connection,
   login_id: String,
   password: String,
 ) -> Result(AuthUser, Error) {
   let login_id = string.trim(login_id)
-  use #(auth_user, password_hash) <- result.try(find_credential(db, login_id))
-
-  case argus.verify(password_hash, password) {
-    Ok(True) -> Ok(auth_user)
-    Ok(False) -> Error(InvalidCredentials)
-    Error(_) -> Error(InternalError)
+  case find_credential(db, login_id) {
+    Ok(#(auth_user, password_hash)) ->
+      case argus.verify(password_hash, password) {
+        Ok(True) -> Ok(auth_user)
+        Ok(False) -> Error(InvalidCredentials)
+        Error(_) -> Error(InternalError)
+      }
+    Error(InvalidCredentials) -> {
+      let _ = argus.verify(dummy_password_hash, password)
+      Error(InvalidCredentials)
+    }
+    Error(err) -> Error(err)
   }
 }
 

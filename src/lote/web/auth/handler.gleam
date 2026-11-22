@@ -19,7 +19,12 @@ pub fn handle_request(
       let #(csrf_token, should_set_cookie) =
         csrf.ensure_token(req, auth_ctx.secret_key_base)
       view.login_page(auth_ctx.methods, None, csrf_token)
-      |> csrf.attach_cookie(req, csrf_token, should_set_cookie)
+      |> csrf.attach_cookie(
+        req,
+        csrf_token,
+        auth_ctx.secret_key_base,
+        should_set_cookie,
+      )
     }
 
     http.Post, ["logout"] -> {
@@ -33,7 +38,7 @@ pub fn handle_request(
       let resp =
         wisp.redirect(to: "/")
         |> session.destroy(req, auth_ctx.db, auth_ctx.secret_key_base)
-        |> csrf.rotate_cookie(req)
+        |> csrf.rotate_cookie(req, auth_ctx.secret_key_base)
       case revoked_id {
         Some(id) -> pubsub.publish(auth_ctx.session_revocations, id)
         None -> Nil

@@ -1,7 +1,11 @@
 import gleam/bit_array
 import gleam/crypto
+import gleam/http
+import gleam/http/cookie
 import gleam/http/request.{type Request}
+import gleam/http/response
 import gleam/list
+import gleam/option.{Some}
 import gleam/result
 import wisp
 
@@ -25,16 +29,21 @@ pub fn attach_cookie(
   resp: wisp.Response,
   req: wisp.Request,
   token: String,
+  secret_key_base: String,
   should_set: Bool,
 ) -> wisp.Response {
   case should_set {
-    True -> set_cookie(resp, req, token)
+    True -> set_cookie(resp, req, token, secret_key_base)
     False -> resp
   }
 }
 
-pub fn rotate_cookie(resp: wisp.Response, req: wisp.Request) -> wisp.Response {
-  set_cookie(resp, req, wisp.random_string(32))
+pub fn rotate_cookie(
+  resp: wisp.Response,
+  req: wisp.Request,
+  secret_key_base: String,
+) -> wisp.Response {
+  set_cookie(resp, req, wisp.random_string(32), secret_key_base)
 }
 
 pub fn read_token(
@@ -85,8 +94,21 @@ fn set_cookie(
   resp: wisp.Response,
   req: wisp.Request,
   token: String,
+  secret_key_base: String,
 ) -> wisp.Response {
-  wisp.set_cookie(resp, req, cookie_name, token, wisp.Signed, max_age_seconds)
+  let scheme = case req.host {
+    "localhost" | "127.0.0.1" | "[::1]" if req.scheme == http.Http ->
+      case request.get_header(req, "x-forwarded-proto") {
+        Ok(_) -> http.Https
+        Error(_) -> http.Http
+      }
+    _ -> http.Https
+  }
+  let attributes =
+    cookie.Attributes(..cookie.defaults(scheme), max_age: Some(max_age_seconds))
+  let signed =
+    crypto.sign_message(<<token:utf8>>, <<secret_key_base:utf8>>, crypto.Sha512)
+  response.set_cookie(resp, cookie_name, signed, attributes)
 }
 
 fn constant_time_equal(a: String, b: String) -> Bool {

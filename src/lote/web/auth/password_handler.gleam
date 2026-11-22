@@ -1,9 +1,10 @@
 import gleam/http
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{None, Some}
 import lote/auth.{type Auth}
 import lote/auth/password
 import lote/auth/session
+import lote/realtime/pubsub
 import lote/web/auth/view
 import lote/web/csrf
 import wisp
@@ -33,13 +34,36 @@ fn handle_login(req: wisp.Request, auth_ctx: Auth) -> wisp.Response {
   case login_id, pass {
     Ok(login_id), Ok(pass) ->
       case password.authenticate(auth_ctx.db, login_id, pass) {
-        Ok(auth_user) ->
+        Ok(auth_user) -> {
+          let previous_session_id =
+            session.session_id(req, auth_ctx.secret_key_base)
+          let _ =
+            session.destroy(
+              wisp.ok(),
+              req,
+              auth_ctx.db,
+              auth_ctx.secret_key_base,
+            )
           case
-            session.create(wisp.redirect(to: "/"), req, auth_ctx.db, auth_user)
+            session.create(
+              wisp.redirect(to: "/"),
+              req,
+              auth_ctx.db,
+              auth_ctx.secret_key_base,
+              auth_user,
+            )
           {
-            Ok(resp) -> csrf.rotate_cookie(resp, req)
+            Ok(resp) -> {
+              case previous_session_id {
+                Some(prev_id) ->
+                  pubsub.publish(auth_ctx.session_revocations, prev_id)
+                None -> Nil
+              }
+              csrf.rotate_cookie(resp, req, auth_ctx.secret_key_base)
+            }
             Error(_) -> wisp.internal_server_error()
           }
+        }
         Error(password.InvalidCredentials) ->
           view.login_page(
             auth_ctx.methods,

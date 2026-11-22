@@ -87,7 +87,8 @@ pub fn password_login_issues_session_cookie_when_enabled_test() {
   let assert Ok(Nil) =
     password.create(tx, created.id, "router_user", "secretpass123")
 
-  let secret = simulate.default_secret_key_base
+  let secret =
+    "custom_router_secret_key_base_0123456789abcdefghijklmnopqrstuvwxyz"
   let auth_ctx =
     Auth(
       db: tx,
@@ -142,6 +143,138 @@ pub fn password_login_issues_session_cookie_when_enabled_test() {
   assert session.current_user(after_req, tx, secret) == None
 }
 
+pub fn relogin_destroys_and_revokes_previous_session_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(Nil) =
+    password.create(tx, alice.id, "alice_relogin", "secretpass123")
+  let assert Ok(bob) = user.create(tx, "Bob")
+  let assert Ok(Nil) =
+    password.create(tx, bob.id, "bob_relogin", "secretpass123")
+
+  let secret = "relogin_secret_key_base_0123456789abcdefghijklmnopqrstuvwxyz"
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: secret,
+      methods: [Password],
+      session_revocations:,
+    )
+
+  // First login as Alice
+  let page1_req = simulate.browser_request(http.Get, "/auth/login")
+  let page1_resp = router.handle_request(page1_req, auth_ctx)
+  let csrf1 = extract_form_csrf_token(simulate.read_body(page1_resp))
+
+  let login1_req =
+    simulate.browser_request(http.Post, "/auth/password/login")
+    |> simulate.session(page1_req, page1_resp)
+    |> simulate.form_body([
+      #(csrf.form_field_name, csrf1),
+      #("login_id", "alice_relogin"),
+      #("password", "secretpass123"),
+    ])
+  let login1_resp = router.handle_request(login1_req, auth_ctx)
+  assert login1_resp.status == 303
+
+  let alice_authed_req =
+    simulate.browser_request(http.Get, "/")
+    |> simulate.session(login1_req, login1_resp)
+  let assert Some(alice_session) =
+    session.current_session(alice_authed_req, tx, secret)
+  assert alice_session.user == alice
+
+  // Subscribe to session_revocations before re-logging in as Bob on the same browser session
+  let revocation_sub = process.new_subject()
+  pubsub.subscribe(session_revocations, revocation_sub)
+
+  let page2_req =
+    simulate.browser_request(http.Get, "/auth/login")
+    |> simulate.session(login1_req, login1_resp)
+  let page2_resp = router.handle_request(page2_req, auth_ctx)
+  let csrf2 = extract_form_csrf_token(simulate.read_body(page2_resp))
+
+  let login2_req =
+    simulate.browser_request(http.Post, "/auth/password/login")
+    |> simulate.session(page2_req, page2_resp)
+    |> simulate.form_body([
+      #(csrf.form_field_name, csrf2),
+      #("login_id", "bob_relogin"),
+      #("password", "secretpass123"),
+    ])
+  let login2_resp = router.handle_request(login2_req, auth_ctx)
+  assert login2_resp.status == 303
+
+  // Alice's previous session ID must be revoked via pubsub AND deleted from DB
+  assert process.receive(revocation_sub, 100) == Ok(alice_session.id)
+  assert session.current_session(alice_authed_req, tx, secret) == None
+
+  // New session belongs to Bob with a distinct session ID
+  let bob_authed_req =
+    simulate.browser_request(http.Get, "/")
+    |> simulate.session(login2_req, login2_resp)
+  let assert Some(bob_session) =
+    session.current_session(bob_authed_req, tx, secret)
+  assert bob_session.user == bob
+  assert bob_session.id != alice_session.id
+}
+
+pub fn failed_login_preserves_csrf_token_and_issues_no_session_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+
+  let assert Ok(created) = user.create(tx, "Fail Login User")
+  let assert Ok(Nil) =
+    password.create(tx, created.id, "fail_login_user", "secretpass123")
+
+  let secret = "fail_login_secret_key_base_0123456789abcdefghijklmnopqrstuv"
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: secret,
+      methods: [Password],
+      session_revocations:,
+    )
+
+  let page_req = simulate.browser_request(http.Get, "/auth/login")
+  let page_resp = router.handle_request(page_req, auth_ctx)
+  let csrf_token = extract_form_csrf_token(simulate.read_body(page_resp))
+
+  // Wrong password returns 200 with error message and keeps the same CSRF token
+  let bad_pass_req =
+    simulate.browser_request(http.Post, "/auth/password/login")
+    |> simulate.session(page_req, page_resp)
+    |> simulate.form_body([
+      #(csrf.form_field_name, csrf_token),
+      #("login_id", "fail_login_user"),
+      #("password", "wrongpass"),
+    ])
+  let bad_pass_resp = router.handle_request(bad_pass_req, auth_ctx)
+  assert bad_pass_resp.status == 200
+  let bad_pass_body = simulate.read_body(bad_pass_resp)
+  assert string.contains(bad_pass_body, "ID またはパスワードが正しくありません")
+  assert extract_form_csrf_token(bad_pass_body) == csrf_token
+
+  let after_bad_pass_req =
+    simulate.browser_request(http.Get, "/")
+    |> simulate.session(bad_pass_req, bad_pass_resp)
+  assert session.current_user(after_bad_pass_req, tx, secret) == None
+
+  // Missing password field returns 200 with validation error
+  let missing_field_req =
+    simulate.browser_request(http.Post, "/auth/password/login")
+    |> simulate.session(page_req, page_resp)
+    |> simulate.form_body([
+      #(csrf.form_field_name, csrf_token),
+      #("login_id", "fail_login_user"),
+    ])
+  let missing_field_resp = router.handle_request(missing_field_req, auth_ctx)
+  assert missing_field_resp.status == 200
+  assert string.contains(simulate.read_body(missing_field_resp), "入力が不足しています")
+}
+
 pub fn login_and_logout_reject_missing_token_or_cross_origin_test() {
   use tx <- test_helper.with_db
   let assert Ok(session_revocations) = pubsub.start()
@@ -150,7 +283,7 @@ pub fn login_and_logout_reject_missing_token_or_cross_origin_test() {
   let assert Ok(Nil) =
     password.create(tx, created.id, "csrf_user", "secretpass123")
 
-  let secret = simulate.default_secret_key_base
+  let secret = "csrf_router_secret_key_base_0123456789abcdefghijklmnopqrstuv"
   let auth_ctx =
     Auth(
       db: tx,
@@ -184,6 +317,17 @@ pub fn login_and_logout_reject_missing_token_or_cross_origin_test() {
       #("password", "secretpass123"),
     ])
   assert router.handle_request(cross_origin_login, auth_ctx).status == 400
+
+  // Missing Origin and Referer on login strips cookies -> 403 Invalid CSRF token
+  let no_origin_login =
+    simulate.request(http.Post, "/auth/password/login")
+    |> simulate.session(login_page_req, login_page_resp)
+    |> simulate.form_body([
+      #(csrf.form_field_name, login_csrf),
+      #("login_id", "csrf_user"),
+      #("password", "secretpass123"),
+    ])
+  assert router.handle_request(no_origin_login, auth_ctx).status == 403
 
   // Legitimate login succeeds
   let login_req =
