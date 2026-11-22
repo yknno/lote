@@ -670,3 +670,257 @@ pub fn timeline_without_older_posts_omits_sentinel_test() {
 
   shutdown_and_wait(component)
 }
+
+type PatchChange {
+  ReplaceTextChange(content: String)
+  MoveChange(key: String, before: Int)
+  RemoveChange(index: Int)
+  ReplaceChange(index: Int, tag: String, key: String)
+  InsertChange(before: Int, keys: List(String))
+}
+
+fn patch_changes_decoder() -> decode.Decoder(List(PatchChange)) {
+  use <- decode.recursive
+
+  let child_key_decoder = {
+    use key <- decode.optional_field("key", "", decode.string)
+    decode.success(key)
+  }
+
+  let replace_with_decoder = {
+    use tag <- decode.optional_field("tag", "", decode.string)
+    use key <- decode.optional_field("key", "", decode.string)
+    decode.success(#(tag, key))
+  }
+
+  let change_decoder = {
+    use kind <- decode.optional_field("kind", 0, decode.int)
+    case kind {
+      0 -> {
+        use content <- decode.optional_field("content", "", decode.string)
+        decode.success([ReplaceTextChange(content:)])
+      }
+      3 -> {
+        use key <- decode.optional_field("key", "", decode.string)
+        use before <- decode.optional_field("before", 0, decode.int)
+        decode.success([MoveChange(key:, before:)])
+      }
+      4 -> {
+        use index <- decode.optional_field("index", 0, decode.int)
+        decode.success([RemoveChange(index:)])
+      }
+      5 -> {
+        use index <- decode.optional_field("index", 0, decode.int)
+        use #(tag, key) <- decode.field("with", replace_with_decoder)
+        decode.success([ReplaceChange(index:, tag:, key:)])
+      }
+      6 -> {
+        use before <- decode.optional_field("before", 0, decode.int)
+        use keys <- decode.optional_field(
+          "children",
+          [],
+          decode.list(child_key_decoder),
+        )
+        decode.success([InsertChange(before:, keys:)])
+      }
+      _ -> decode.success([])
+    }
+  }
+
+  use changes <- decode.optional_field(
+    "changes",
+    [],
+    decode.list(change_decoder),
+  )
+  use children <- decode.optional_field(
+    "children",
+    [],
+    decode.list(patch_changes_decoder()),
+  )
+  decode.success(list.flatten([list.flatten(changes), ..children]))
+}
+
+fn collect_patch_changes(patch_json: String) -> List(PatchChange) {
+  let msg_decoder = {
+    use patch <- decode.field("patch", patch_changes_decoder())
+    decode.success(patch)
+  }
+  let assert Ok(changes) = json.parse(patch_json, msg_decoder)
+  changes
+}
+
+pub fn keyed_feed_prepends_and_deletes_emit_minimal_keyed_patches_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(p1) = post_repo.create(tx, alice.id, "existing-post-alpha")
+  let assert Ok(p2) = post_repo.create(tx, alice.id, "existing-post-beta")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let assert Ok(component) =
+    lustre.start_server_component(
+      timeline.app(),
+      timeline.Flags(
+        db: tx,
+        pubsub: post_pubsub,
+        user: Some(alice),
+        csrf_token: "test-csrf-token",
+      ),
+    )
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+
+  // Initial mount carries each post.id as the VNode key
+  let mount_payload = receive_json(client)
+  assert string.contains(mount_payload, "\"key\":\"" <> p1.id <> "\"")
+  assert string.contains(mount_payload, "\"key\":\"" <> p2.id <> "\"")
+
+  // Enable Live auto-refresh so incoming posts are prepended immediately
+  lustre.dispatch(timeline.UserToggledAutoRefresh)
+  |> lustre.send(to: component)
+  let _live_on = receive_json(client)
+
+  // 1. Prepending a new post emits exactly one Insert at index 0 for p3.id
+  //    plus the header count text update, with zero rewrites of p1/p2.
+  let assert Ok(p3) = post_repo.create(tx, alice.id, "new-post-gamma")
+  pubsub.publish(
+    post_pubsub,
+    timeline.Created(timeline.Post(
+      id: p3.id,
+      user_id: alice.id,
+      author_name: alice.name,
+      body: p3.body,
+      created_at: p3.created_at,
+    )),
+  )
+  let prepend_patch = receive_json(client)
+  assert collect_patch_changes(prepend_patch)
+    == [
+      InsertChange(before: 0, keys: [p3.id]),
+      ReplaceTextChange("3 posts"),
+    ]
+
+  // 2. Deleting the middle post (p2 at index 1 in [p3, p2, p1]) emits exactly
+  //    one RemoveChange(index: 1) plus header count update, without rewriting p3 or p1.
+  pubsub.publish(post_pubsub, timeline.Deleted(p2.id))
+  let middle_delete_patch = receive_json(client)
+  assert collect_patch_changes(middle_delete_patch)
+    == [
+      RemoveChange(index: 1),
+      ReplaceTextChange("2 posts"),
+    ]
+
+  // 3. While p1 is in confirming-delete state, deleting the head post (p3 at index 0)
+  //    emits only RemoveChange(index: 0) and leaves p1's confirmation UI untouched.
+  lustre.dispatch(timeline.UserRequestedDelete(p1.id))
+  |> lustre.send(to: component)
+  let confirm_patch = receive_json(client)
+  assert string.contains(confirm_patch, "Confirm")
+  assert string.contains(confirm_patch, "Cancel")
+
+  pubsub.publish(post_pubsub, timeline.Deleted(p3.id))
+  let head_delete_patch = receive_json(client)
+  assert collect_patch_changes(head_delete_patch)
+    == [
+      RemoveChange(index: 0),
+      ReplaceTextChange("1 posts"),
+    ]
+  assert !string.contains(head_delete_patch, "existing-post-alpha")
+  assert !string.contains(head_delete_patch, "Confirm")
+
+  // Confirming delete on p1 still works cleanly after p3 was removed above it
+  lustre.dispatch(timeline.UserConfirmedDelete(p1.id))
+  |> lustre.send(to: component)
+  let _clear_confirm = receive_json(client)
+  let empty_patch = receive_json(client)
+  assert string.contains(empty_patch, "No posts yet.")
+  assert post_repo.find_by_id(tx, p1.id) == Ok(option.None)
+
+  shutdown_and_wait(component)
+}
+
+pub fn keyed_feed_refresh_and_load_more_insert_only_new_keys_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let total = timeline.page_size + 3
+  let created =
+    int.range(from: 1, to: total + 1, with: [], run: fn(acc, n) {
+      let body = "keyed-post-" <> string.pad_start(int.to_string(n), 2, "0")
+      let assert Ok(row) = post_repo.create(tx, alice.id, body)
+      [row, ..acc]
+    })
+    |> list.reverse
+
+  // Oldest 3 posts (not on page 1) in descending display order: #03, #02, #01
+  let older_three_ids =
+    created
+    |> list.take(3)
+    |> list.reverse
+    |> list.map(fn(r) { r.id })
+
+  let assert Ok(post_pubsub) = pubsub.start()
+  let assert Ok(component) =
+    lustre.start_server_component(
+      timeline.app(),
+      timeline.Flags(
+        db: tx,
+        pubsub: post_pubsub,
+        user: Some(alice),
+        csrf_token: "test-csrf-token",
+      ),
+    )
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+  let _mount = receive_json(client)
+
+  // 1. Loading older posts via infinite scroll appends only the 3 older keys at the tail,
+  //    without rewriting any of the 20 already-rendered posts.
+  lustre.dispatch(timeline.UserRequestedLoadMore)
+  |> lustre.send(to: component)
+  let _loading_patch = receive_json(client)
+  let loaded_patch = receive_json(client)
+
+  let loaded_changes = collect_patch_changes(loaded_patch)
+  assert list.contains(
+    loaded_changes,
+    InsertChange(before: timeline.page_size, keys: older_three_ids),
+  )
+  assert !string.contains(loaded_patch, "keyed-post-23")
+  assert !string.contains(loaded_patch, "keyed-post-04")
+
+  // 2. Refreshing after 2 new posts arrive inserts only the 2 new keys at the top
+  //    and drops the 5 excess older items from the tail without rewriting existing rows.
+  let assert Ok(new1) = post_repo.create(tx, alice.id, "keyed-fresh-1")
+  let assert Ok(new2) = post_repo.create(tx, alice.id, "keyed-fresh-2")
+  lustre.dispatch(timeline.UserClickedRefresh)
+  |> lustre.send(to: component)
+  let refresh_patch = receive_json(client)
+
+  let refresh_changes = collect_patch_changes(refresh_patch)
+  let inserted_keys =
+    list.flat_map(refresh_changes, fn(change) {
+      case change {
+        InsertChange(before: 0, keys:) -> keys
+        _ -> []
+      }
+    })
+  assert list.contains(inserted_keys, new1.id)
+  assert list.contains(inserted_keys, new2.id)
+  assert list.length(inserted_keys) == 2
+  assert !list.any(refresh_changes, fn(change) {
+    case change {
+      MoveChange(..) -> True
+      ReplaceChange(tag: "li", ..) -> True
+      _ -> False
+    }
+  })
+  assert !string.contains(refresh_patch, "keyed-post-23")
+  assert !string.contains(refresh_patch, "keyed-post-06")
+
+  shutdown_and_wait(component)
+}
