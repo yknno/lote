@@ -8,6 +8,7 @@ import lote/auth.{Auth, Password}
 import lote/auth/password
 import lote/auth/session
 import lote/auth/user
+import lote/db/post_repo
 import lote/realtime/pubsub
 import lote/test_helper
 import lote/web/csrf
@@ -360,4 +361,53 @@ pub fn login_and_logout_reject_missing_token_or_cross_origin_test() {
     simulate.browser_request(http.Get, "/")
     |> simulate.session(login_req, login_resp)
   assert session.current_user(verify_session_req, tx, secret) == Some(created)
+}
+
+pub fn get_post_permalink_renders_post_and_handles_missing_or_invalid_id_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+
+  let assert Ok(author) = user.create(tx, "Permalink Author")
+  let assert Ok(created) =
+    post_repo.create(tx, author.id, "Hello permalink world!")
+
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: simulate.default_secret_key_base,
+      methods: [],
+      session_revocations:,
+    )
+
+  let ok_resp =
+    simulate.browser_request(http.Get, "/posts/" <> created.id)
+    |> router.handle_request(auth_ctx)
+  assert ok_resp.status == 200
+  let body = simulate.read_body(ok_resp)
+  assert string.contains(body, "Permalink Author")
+  assert string.contains(body, "Hello permalink world!")
+  assert string.contains(body, created.id)
+  assert string.contains(body, "<lote-time")
+  assert string.contains(body, "/static/lote-time.js")
+
+  // Unknown valid UUID -> 404
+  let missing_resp =
+    simulate.browser_request(
+      http.Get,
+      "/posts/00000000-0000-7000-8000-000000000000",
+    )
+    |> router.handle_request(auth_ctx)
+  assert missing_resp.status == 404
+
+  // Invalid non-UUID -> 404
+  let invalid_resp =
+    simulate.browser_request(http.Get, "/posts/not-a-uuid")
+    |> router.handle_request(auth_ctx)
+  assert invalid_resp.status == 404
+
+  // Non-GET method -> 405
+  let post_method_resp =
+    simulate.browser_request(http.Post, "/posts/" <> created.id)
+    |> router.handle_request(auth_ctx)
+  assert post_method_resp.status == 405
 }

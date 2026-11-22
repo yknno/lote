@@ -2,13 +2,14 @@ import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
 import gleam/string
-import gleam/time/calendar
 import gleam/time/timestamp.{type Timestamp}
 import lote/auth/user.{type AuthUser}
 import lote/db/post_repo
 import lote/realtime/pubsub.{type PubSub}
 import lote/web/csrf
+import lote/web/time as web_time
 import lustre
 import lustre/attribute
 import lustre/effect.{type Effect}
@@ -22,7 +23,7 @@ import pog
 const recent_posts_limit = 50
 
 pub type Post {
-  Post(id: Int, author_name: String, body: String, created_at: Timestamp)
+  Post(id: String, author_name: String, body: String, created_at: Timestamp)
 }
 
 pub type Flags {
@@ -76,10 +77,10 @@ fn load_recent_posts(db: pog.Connection) -> Result(List(Post), pog.QueryError) {
   }
 }
 
-fn latest_post_id(posts: List(Post)) -> Int {
-  case posts {
-    [first, ..] -> first.id
-    [] -> 0
+fn is_newer_than_loaded(post: Post, loaded: List(Post)) -> Bool {
+  case loaded {
+    [first, ..] -> string.compare(post.id, first.id) == order.Gt
+    [] -> True
   }
 }
 
@@ -181,9 +182,9 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     )
 
     PostCreated(post) ->
-      case post.id <= latest_post_id(model.posts) {
-        True -> #(model, effect.none())
-        False ->
+      case is_newer_than_loaded(post, model.posts) {
+        False -> #(model, effect.none())
+        True ->
           case model.auto_refresh {
             True -> #(
               Model(
@@ -431,29 +432,24 @@ fn feed(posts: List(Post)) -> Element(Msg) {
 }
 
 fn post_row(post: Post) -> Element(Msg) {
-  let created_iso = timestamp.to_rfc3339(post.created_at, calendar.utc_offset)
-
   html.li([attribute.class("px-4 py-3 hover:bg-neutral-50/70")], [
     html.div([attribute.class("flex items-baseline gap-2 text-xs")], [
       html.span([attribute.class("font-semibold text-neutral-950")], [
         html.text(post.author_name),
       ]),
-      html.span([attribute.class("font-mono text-neutral-400")], [
-        html.text("#" <> int.to_string(post.id)),
-      ]),
-      element.element(
-        "lote-time",
+      html.a(
         [
-          attribute.attribute("datetime", created_iso),
+          attribute.href("/posts/" <> post.id),
+          attribute.title(post.id),
           attribute.class(
-            "ml-auto shrink-0 font-mono text-xs text-neutral-400 tabular-nums",
+            "font-mono text-neutral-400 underline-offset-2 hover:text-neutral-950 hover:underline",
           ),
         ],
-        [
-          html.time([attribute.datetime(created_iso)], [
-            html.text(format_utc_fallback(post.created_at)),
-          ]),
-        ],
+        [html.text("#" <> short_id(post.id))],
+      ),
+      web_time.lote_time(
+        post.created_at,
+        "ml-auto shrink-0 font-mono text-xs text-neutral-400 tabular-nums",
       ),
     ]),
     html.p(
@@ -467,23 +463,9 @@ fn post_row(post: Post) -> Element(Msg) {
   ])
 }
 
-fn format_utc_fallback(ts: Timestamp) -> String {
-  let #(date, time) = timestamp.to_calendar(ts, calendar.utc_offset)
-  int.to_string(date.year)
-  <> "-"
-  <> pad2(calendar.month_to_int(date.month))
-  <> "-"
-  <> pad2(date.day)
-  <> " "
-  <> pad2(time.hours)
-  <> ":"
-  <> pad2(time.minutes)
-  <> " UTC"
-}
-
-fn pad2(n: Int) -> String {
-  case n < 10 {
-    True -> "0" <> int.to_string(n)
-    False -> int.to_string(n)
+fn short_id(id: String) -> String {
+  case string.length(id) >= 8 {
+    True -> string.slice(id, at_index: string.length(id) - 8, length: 8)
+    False -> id
   }
 }

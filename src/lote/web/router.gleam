@@ -1,6 +1,10 @@
+import gleam/http
+import gleam/option.{None, Some}
 import lote/auth.{type Auth}
+import lote/db/post_repo
 import lote/web/auth/handler as auth_handler
 import lote/web/csrf
+import lote/web/post/view as post_view
 import lustre/attribute
 import lustre/element
 import lustre/element/html
@@ -10,8 +14,8 @@ import wisp.{type Request, type Response}
 pub fn handle_request(req: Request, auth_ctx: Auth) -> Response {
   use req <- middleware(req)
 
-  case wisp.path_segments(req) {
-    [] -> {
+  case req.method, wisp.path_segments(req) {
+    _, [] -> {
       let #(csrf_token, should_set_cookie) =
         csrf.ensure_token(req, auth_ctx.secret_key_base)
       wisp.html_response(index_html(), 200)
@@ -22,9 +26,16 @@ pub fn handle_request(req: Request, auth_ctx: Auth) -> Response {
         should_set_cookie,
       )
     }
-    ["auth", ..rest] -> auth_handler.handle_request(req, rest, auth_ctx)
-    ["health"] -> wisp.response(200) |> wisp.string_body("ok")
-    _ -> wisp.not_found()
+    http.Get, ["posts", id] ->
+      case post_repo.find_by_id(auth_ctx.db, id) {
+        Ok(Some(post)) -> post_view.show_page(post)
+        Ok(None) -> wisp.not_found()
+        Error(_) -> wisp.internal_server_error()
+      }
+    _, ["posts", _] -> wisp.method_not_allowed([http.Get, http.Head])
+    _, ["auth", ..rest] -> auth_handler.handle_request(req, rest, auth_ctx)
+    _, ["health"] -> wisp.response(200) |> wisp.string_body("ok")
+    _, _ -> wisp.not_found()
   }
 }
 

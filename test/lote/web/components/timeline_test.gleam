@@ -442,6 +442,7 @@ pub fn post_renders_lote_time_with_rfc3339_datetime_test() {
 
   let expected_iso =
     timestamp.to_rfc3339(created.created_at, calendar.utc_offset)
+  assert string.contains(payload, "\"/posts/" <> created.id <> "\"")
   assert string.contains(payload, "\"tag\":\"lote-time\"")
   assert string.contains(payload, expected_iso)
   assert string.contains(payload, " UTC")
