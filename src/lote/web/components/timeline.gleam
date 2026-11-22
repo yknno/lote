@@ -11,6 +11,7 @@ import lustre/attribute
 import lustre/effect.{type Effect}
 import lustre/element.{type Element}
 import lustre/element/html
+import lustre/element/keyed
 import lustre/event
 import lustre/server_component
 import pog
@@ -211,38 +212,42 @@ fn account_bar(current_user: Option(AuthUser)) -> Element(Msg) {
 fn composer_pane(model: Model) -> Element(Msg) {
   case model.user {
     Some(_) ->
-      html.form(
-        [
-          attribute.id("post-form-" <> int.to_string(model.form_key)),
-          event.on_submit(UserSubmittedForm),
-          attribute.class("flex flex-col gap-3 p-4"),
-        ],
-        [
-          html.textarea(
+      keyed.fragment([
+        #(
+          "post-form-" <> int.to_string(model.form_key),
+          html.form(
             [
-              attribute.name("body"),
-              attribute.rows(4),
-              attribute.placeholder("What is on your mind?"),
-              attribute.required(True),
-              attribute.class(
-                "block w-full resize-none border border-neutral-300 bg-white p-2.5 text-sm leading-normal text-neutral-950 placeholder:text-neutral-400 focus:border-neutral-950 focus:outline-none",
-              ),
+              event.on_submit(UserSubmittedForm),
+              attribute.class("flex flex-col gap-3 p-4"),
             ],
-            "",
-          ),
-          html.div([attribute.class("flex justify-end")], [
-            html.button(
-              [
-                attribute.type_("submit"),
-                attribute.class(
-                  "cursor-pointer bg-neutral-950 px-4 py-1.5 text-xs font-medium text-white hover:bg-neutral-800",
+            [
+              html.textarea(
+                [
+                  attribute.name("body"),
+                  attribute.rows(4),
+                  attribute.placeholder("What is on your mind?"),
+                  attribute.required(True),
+                  attribute.class(
+                    "block w-full resize-none border border-neutral-300 bg-white p-2.5 text-sm leading-normal text-neutral-950 placeholder:text-neutral-400 focus:border-neutral-950 focus:outline-none",
+                  ),
+                ],
+                "",
+              ),
+              html.div([attribute.class("flex justify-end")], [
+                html.button(
+                  [
+                    attribute.type_("submit"),
+                    attribute.class(
+                      "cursor-pointer bg-neutral-950 px-4 py-1.5 text-xs font-medium text-white hover:bg-neutral-800",
+                    ),
+                  ],
+                  [html.text("Post")],
                 ),
-              ],
-              [html.text("Post")],
-            ),
-          ]),
-        ],
-      )
+              ]),
+            ],
+          ),
+        ),
+      ])
 
     None ->
       html.div([attribute.class("p-4 text-xs text-neutral-600")], [
