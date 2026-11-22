@@ -8,7 +8,10 @@ import cake/where as w
 import gleam/bit_array
 import gleam/crypto
 import gleam/dynamic/decode
+import gleam/http
+import gleam/http/cookie
 import gleam/http/request.{type Request}
+import gleam/http/response
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -24,6 +27,7 @@ pub fn create(
   resp: wisp.Response,
   req: wisp.Request,
   db: pog.Connection,
+  secret_key_base: String,
   auth_user: AuthUser,
 ) -> Result(wisp.Response, pog.QueryError) {
   let session_id = wisp.random_string(32)
@@ -44,14 +48,7 @@ pub fn create(
     |> i.to_query
 
   use _ <- result.map(postgres.run_write_query(query, decode.dynamic, db))
-  wisp.set_cookie(
-    resp,
-    req,
-    cookie_name,
-    session_id,
-    wisp.Signed,
-    max_age_seconds,
-  )
+  set_cookie(resp, req, session_id, secret_key_base, max_age_seconds)
 }
 
 pub fn destroy(
@@ -72,7 +69,7 @@ pub fn destroy(
     }
     Error(_) -> Nil
   }
-  wisp.set_cookie(resp, req, cookie_name, "", wisp.Signed, 0)
+  set_cookie(resp, req, "", secret_key_base, 0)
 }
 
 pub type ActiveSession {
@@ -158,5 +155,31 @@ fn read_session_id(
   use bits <- result.try(
     crypto.verify_signed_message(raw, <<secret_key_base:utf8>>),
   )
-  bit_array.to_string(bits)
+  use id <- result.try(bit_array.to_string(bits))
+  case id {
+    "" -> Error(Nil)
+    _ -> Ok(id)
+  }
+}
+
+fn set_cookie(
+  resp: wisp.Response,
+  req: wisp.Request,
+  value: String,
+  secret_key_base: String,
+  max_age: Int,
+) -> wisp.Response {
+  let scheme = case req.host {
+    "localhost" | "127.0.0.1" | "[::1]" if req.scheme == http.Http ->
+      case request.get_header(req, "x-forwarded-proto") {
+        Ok(_) -> http.Https
+        Error(_) -> http.Http
+      }
+    _ -> http.Https
+  }
+  let attributes =
+    cookie.Attributes(..cookie.defaults(scheme), max_age: Some(max_age))
+  let signed =
+    crypto.sign_message(<<value:utf8>>, <<secret_key_base:utf8>>, crypto.Sha512)
+  response.set_cookie(resp, cookie_name, signed, attributes)
 }

@@ -15,7 +15,12 @@ pub fn handle_request(req: Request, auth_ctx: Auth) -> Response {
       let #(csrf_token, should_set_cookie) =
         csrf.ensure_token(req, auth_ctx.secret_key_base)
       wisp.html_response(index_html(), 200)
-      |> csrf.attach_cookie(req, csrf_token, should_set_cookie)
+      |> csrf.attach_cookie(
+        req,
+        csrf_token,
+        auth_ctx.secret_key_base,
+        should_set_cookie,
+      )
     }
     ["auth", ..rest] -> auth_handler.handle_request(req, rest, auth_ctx)
     ["health"] -> wisp.response(200) |> wisp.string_body("ok")

@@ -82,12 +82,20 @@ pub fn authenticate(
   password: String,
 ) -> Result(AuthUser, Error) {
   let login_id = string.trim(login_id)
-  use #(auth_user, password_hash) <- result.try(find_credential(db, login_id))
-
-  case argus.verify(password_hash, password) {
-    Ok(True) -> Ok(auth_user)
-    Ok(False) -> Error(InvalidCredentials)
-    Error(_) -> Error(InternalError)
+  case find_credential(db, login_id) {
+    Ok(#(auth_user, password_hash)) ->
+      case argus.verify(password_hash, password) {
+        Ok(True) -> Ok(auth_user)
+        Ok(False) -> Error(InvalidCredentials)
+        Error(_) -> Error(InternalError)
+      }
+    Error(InvalidCredentials) -> {
+      // login_id が存在しない場合も Argon2id ハッシュ計算を実行し、
+      // レスポンス時間の差からユーザーの存在有無を推測されるのを防ぐ。
+      let _ = argus.hasher() |> argus.hash(password)
+      Error(InvalidCredentials)
+    }
+    Error(err) -> Error(err)
   }
 }
 
