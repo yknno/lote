@@ -1,6 +1,7 @@
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
-import gleam/erlang/process.{type Monitor, type Subject}
+import gleam/erlang/atom
+import gleam/erlang/process.{type Monitor, type Pid, type Subject}
 import gleam/otp/actor
 import gleam/result
 import pog
@@ -9,6 +10,7 @@ pub type Adapter(event) {
   Memory
   Postgres(
     db: pog.Connection,
+    database_url: String,
     channel: String,
     encode: fn(event) -> String,
     decode: fn(String) -> Result(event, Nil),
@@ -21,6 +23,7 @@ pub opaque type Message(event) {
   Publish(event)
   BroadcastLocal(event)
   ReceivePayload(String)
+  Ignore
   SubscriberDown(Monitor)
   Count(Subject(Int))
 }
@@ -32,6 +35,9 @@ type State(event) {
   State(subscribers: Dict(Subject(event), Monitor), adapter: Adapter(event))
 }
 
+@external(erlang, "lote_pubsub_ffi", "start_and_listen")
+fn start_pg_listener(config: pog.Config, channel: String) -> Result(Pid, String)
+
 pub fn start() -> Result(PubSub(event), actor.StartError) {
   start_with_adapter(Memory)
 }
@@ -40,11 +46,47 @@ pub fn start_with_adapter(
   adapter: Adapter(event),
 ) -> Result(PubSub(event), actor.StartError) {
   case
-    actor.new_with_initialiser(1000, fn(self) {
-      let selector =
+    actor.new_with_initialiser(5000, fn(self) {
+      use _listener <- result.try(case adapter {
+        Memory -> Ok(Nil)
+        Postgres(database_url:, channel:, ..) -> {
+          let pool_name = process.new_name("lote_pubsub_listen")
+          case pog.url_config(pool_name, database_url) {
+            Error(_) -> Error("invalid database_url for Postgres PubSub")
+            Ok(db_config) -> {
+              let db_config =
+                pog.connection_parameter(db_config, "timezone", "UTC")
+              case start_pg_listener(db_config, channel) {
+                Ok(_pid) -> Ok(Nil)
+                Error(err) -> Error(err)
+              }
+            }
+          }
+        }
+      })
+
+      let base_selector =
         process.new_selector()
         |> process.select(self)
         |> process.select_monitors(fn(down) { SubscriberDown(down.monitor) })
+
+      let selector = case adapter {
+        Memory -> base_selector
+        Postgres(channel: expected_channel, ..) ->
+          base_selector
+          |> process.select_record(atom.create("notification"), 4, fn(record) {
+            let notification_decoder = {
+              use ch <- decode.field(3, decode.string)
+              use payload <- decode.field(4, decode.string)
+              decode.success(#(ch, payload))
+            }
+            case decode.run(record, notification_decoder) {
+              Ok(#(ch, payload)) if ch == expected_channel ->
+                ReceivePayload(payload)
+              _ -> Ignore
+            }
+          })
+      }
 
       actor.initialised(State(subscribers: dict.new(), adapter:))
       |> actor.selecting(selector)
@@ -127,12 +169,14 @@ fn handle_message(
       }
 
     Publish(event) -> {
-      deliver_to_subscribers(state.subscribers, event)
       case state.adapter {
-        Memory -> Nil
+        Memory -> deliver_to_subscribers(state.subscribers, event)
         Postgres(db:, channel:, encode:, ..) -> {
-          let _ = pg_notify(db, channel, encode(event))
-          Nil
+          let payload = encode(event)
+          case pg_notify(db, channel, payload) {
+            Ok(_) -> Nil
+            Error(_) -> deliver_to_subscribers(state.subscribers, event)
+          }
         }
       }
       actor.continue(state)
@@ -154,6 +198,8 @@ fn handle_message(
       }
       actor.continue(state)
     }
+
+    Ignore -> actor.continue(state)
 
     SubscriberDown(monitor) -> {
       let subscribers =

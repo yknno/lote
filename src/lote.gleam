@@ -37,7 +37,7 @@ pub fn main() -> Nil {
     })
 
   let assert Ok(session_revocations) =
-    start_session_revocations_pubsub(cfg.pubsub_adapter, db)
+    start_session_revocations_pubsub(cfg.pubsub_adapter, db, cfg.database_url)
   let auth_ctx =
     Auth(
       db:,
@@ -46,7 +46,8 @@ pub fn main() -> Nil {
       session_revocations:,
     )
 
-  let assert Ok(post_pubsub) = start_post_pubsub(cfg.pubsub_adapter, db)
+  let assert Ok(post_pubsub) =
+    start_post_pubsub(cfg.pubsub_adapter, db, cfg.database_url)
 
   let assert Ok(_) =
     handler(db, post_pubsub, auth_ctx)
@@ -65,12 +66,14 @@ pub const post_events_channel = "lote_post_events"
 pub fn start_session_revocations_pubsub(
   adapter_kind: config.PubSubAdapter,
   db: pog.Connection,
+  database_url: String,
 ) {
   let adapter = case adapter_kind {
     config.MemoryPubSub -> pubsub.Memory
     config.PostgresPubSub ->
       pubsub.Postgres(
         db:,
+        database_url:,
         channel: session_revocations_channel,
         encode: fn(id) { id },
         decode: fn(raw) {
@@ -87,12 +90,14 @@ pub fn start_session_revocations_pubsub(
 pub fn start_post_pubsub(
   adapter_kind: config.PubSubAdapter,
   db: pog.Connection,
+  database_url: String,
 ) {
   let adapter = case adapter_kind {
     config.MemoryPubSub -> pubsub.Memory
     config.PostgresPubSub ->
       pubsub.Postgres(
         db:,
+        database_url:,
         channel: post_events_channel,
         encode: timeline.encode_post_event,
         decode: timeline.decode_post_event,
