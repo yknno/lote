@@ -27,8 +27,7 @@ pub fn create(
 
   case login_id, string.length(password) >= 8 {
     "", _ -> Error(InvalidInput("Login ID is required"))
-    _, False ->
-      Error(InvalidInput("Password must be at least 8 characters"))
+    _, False -> Error(InvalidInput("Password must be at least 8 characters"))
     _, True -> {
       use hashed <- result.try(
         argus.hasher()
@@ -44,10 +43,11 @@ pub fn create(
             i.string(hashed.encoded_hash),
           ]),
         ]
-        |> i.from_values(
-          table_name: "password_credentials",
-          columns: ["user_id", "login_id", "password_hash"],
-        )
+        |> i.from_values(table_name: "password_credentials", columns: [
+          "user_id",
+          "login_id",
+          "password_hash",
+        ])
         |> i.to_query
 
       case postgres.run_write_query(query, decode.dynamic, db) {

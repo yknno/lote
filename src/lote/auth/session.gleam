@@ -36,14 +36,22 @@ pub fn create(
         i.fragment(f.literal("NOW() + INTERVAL '7 days'")),
       ]),
     ]
-    |> i.from_values(
-      table_name: "sessions",
-      columns: ["id", "user_id", "expires_at"],
-    )
+    |> i.from_values(table_name: "sessions", columns: [
+      "id",
+      "user_id",
+      "expires_at",
+    ])
     |> i.to_query
 
   use _ <- result.map(postgres.run_write_query(query, decode.dynamic, db))
-  wisp.set_cookie(resp, req, cookie_name, session_id, wisp.Signed, max_age_seconds)
+  wisp.set_cookie(
+    resp,
+    req,
+    cookie_name,
+    session_id,
+    wisp.Signed,
+    max_age_seconds,
+  )
 }
 
 pub fn destroy(
@@ -91,10 +99,7 @@ fn find_user(db: pog.Connection, session_id: String) -> Option(AuthUser) {
     |> s.where(
       w.and([
         w.eq(w.col("sessions.id"), w.string(session_id)),
-        w.gt(
-          w.col("sessions.expires_at"),
-          w.fragment_value(f.literal("NOW()")),
-        ),
+        w.gt(w.col("sessions.expires_at"), w.fragment_value(f.literal("NOW()"))),
       ]),
     )
     |> s.limit(1)
@@ -121,9 +126,8 @@ fn read_session_id(
     |> request.get_cookies
     |> list.key_find(cookie_name),
   )
-  use bits <- result.try(crypto.verify_signed_message(
-    raw,
-    <<secret_key_base:utf8>>,
-  ))
+  use bits <- result.try(
+    crypto.verify_signed_message(raw, <<secret_key_base:utf8>>),
+  )
   bit_array.to_string(bits)
 }

@@ -155,7 +155,11 @@ fn view(model: Model) -> Element(Msg) {
         ],
         [
           html.h1(
-            [attribute.class("text-xs font-semibold uppercase tracking-wider text-neutral-600")],
+            [
+              attribute.class(
+                "text-xs font-semibold uppercase tracking-wider text-neutral-600",
+              ),
+            ],
             [html.text("Timeline")],
           ),
           html.span([attribute.class("font-mono text-xs text-neutral-400")], [
@@ -179,20 +183,17 @@ fn account_bar(current_user: Option(AuthUser)) -> Element(Msg) {
         html.span([attribute.class("font-medium text-neutral-900")], [
           html.text(u.name),
         ]),
-        html.form(
-          [attribute.method("post"), attribute.action("/auth/logout")],
-          [
-            html.button(
-              [
-                attribute.type_("submit"),
-                attribute.class(
-                  "cursor-pointer text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
-                ),
-              ],
-              [html.text("Log out")],
-            ),
-          ],
-        ),
+        html.form([attribute.method("post"), attribute.action("/auth/logout")], [
+          html.button(
+            [
+              attribute.type_("submit"),
+              attribute.class(
+                "cursor-pointer text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
+              ),
+            ],
+            [html.text("Log out")],
+          ),
+        ]),
       ])
     None ->
       html.a(

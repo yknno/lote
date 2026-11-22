@@ -39,7 +39,10 @@ fn index_html() -> String {
   |> element.to_document_string
 }
 
-fn middleware(req: Request, handle_request: fn(Request) -> Response) -> Response {
+fn middleware(
+  req: Request,
+  handle_request: fn(Request) -> Response,
+) -> Response {
   let req = wisp.method_override(req)
   use <- wisp.log_request(req)
   use <- wisp.rescue_crashes

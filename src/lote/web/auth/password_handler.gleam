@@ -35,10 +35,7 @@ fn handle_login(req: wisp.Request, auth_ctx: Auth) -> wisp.Response {
             Error(_) -> wisp.internal_server_error()
           }
         Error(password.InvalidCredentials) ->
-          view.login_page(
-            auth_ctx.methods,
-            Some("ID またはパスワードが正しくありません"),
-          )
+          view.login_page(auth_ctx.methods, Some("ID またはパスワードが正しくありません"))
         Error(_) -> wisp.internal_server_error()
       }
     _, _ -> view.login_page(auth_ctx.methods, Some("入力が不足しています"))

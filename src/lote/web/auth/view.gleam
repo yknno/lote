@@ -6,7 +6,10 @@ import lustre/element
 import lustre/element/html
 import wisp
 
-pub fn login_page(methods: List(Method), error: Option(String)) -> wisp.Response {
+pub fn login_page(
+  methods: List(Method),
+  error: Option(String),
+) -> wisp.Response {
   let error_el = case error {
     Some(msg) ->
       html.p(
