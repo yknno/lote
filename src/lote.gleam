@@ -32,7 +32,12 @@ pub fn main() -> Nil {
     list.filter_map(cfg.auth_adapters, fn(name) {
       case name {
         "password" -> Ok(Password)
-        _ -> Error(Nil)
+        other -> {
+          wisp.log_warning(
+            "Unknown AUTH_ADAPTERS entry \"" <> other <> "\", ignoring",
+          )
+          Error(Nil)
+        }
       }
     })
 

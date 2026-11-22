@@ -81,12 +81,16 @@ pub fn duplicate_subscribe_is_idempotent_test() {
   assert process.receive(sub, 50) == Error(Nil)
 }
 
-pub fn parse_pubsub_adapter_selects_memory_or_postgres_test() {
-  assert config.parse_pubsub_adapter("") == config.MemoryPubSub
-  assert config.parse_pubsub_adapter("memory") == config.MemoryPubSub
-  assert config.parse_pubsub_adapter("unknown") == config.MemoryPubSub
-  assert config.parse_pubsub_adapter("postgres") == config.PostgresPubSub
-  assert config.parse_pubsub_adapter("  PostgreSQL ") == config.PostgresPubSub
+pub fn parse_pubsub_adapter_selects_memory_or_postgres_and_rejects_typo_test() {
+  assert config.parse_pubsub_adapter("") == Ok(config.MemoryPubSub)
+  assert config.parse_pubsub_adapter("  ") == Ok(config.MemoryPubSub)
+  assert config.parse_pubsub_adapter("memory") == Ok(config.MemoryPubSub)
+  assert config.parse_pubsub_adapter("MEMORY") == Ok(config.MemoryPubSub)
+  assert config.parse_pubsub_adapter("postgres") == Ok(config.PostgresPubSub)
+  assert config.parse_pubsub_adapter("  PostgreSQL ")
+    == Ok(config.PostgresPubSub)
+  assert config.parse_pubsub_adapter("postgers") == Error("postgers")
+  assert config.parse_pubsub_adapter(" unknown ") == Error("unknown")
 }
 
 pub fn post_event_codec_roundtrips_created_and_deleted_events_test() {

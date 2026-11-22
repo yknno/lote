@@ -41,10 +41,21 @@ pub fn load() -> Config {
     |> list.map(fn(s) { string.lowercase(string.trim(s)) })
     |> list.filter(fn(s) { s != "" })
 
-  let pubsub_adapter =
+  let pubsub_adapter = case
     envoy.get("PUBSUB_ADAPTER")
     |> result.unwrap("")
     |> parse_pubsub_adapter
+  {
+    Ok(adapter) -> adapter
+    Error(invalid) -> {
+      wisp.log_warning(
+        "Unknown PUBSUB_ADAPTER \""
+        <> invalid
+        <> "\", falling back to \"memory\"",
+      )
+      MemoryPubSub
+    }
+  }
 
   Config(
     port:,
@@ -55,9 +66,11 @@ pub fn load() -> Config {
   )
 }
 
-pub fn parse_pubsub_adapter(raw: String) -> PubSubAdapter {
-  case string.lowercase(string.trim(raw)) {
-    "postgres" | "postgresql" -> PostgresPubSub
-    _ -> MemoryPubSub
+pub fn parse_pubsub_adapter(raw: String) -> Result(PubSubAdapter, String) {
+  let trimmed = string.trim(raw)
+  case string.lowercase(trimmed) {
+    "" | "memory" -> Ok(MemoryPubSub)
+    "postgres" | "postgresql" -> Ok(PostgresPubSub)
+    _ -> Error(trimmed)
   }
 }
