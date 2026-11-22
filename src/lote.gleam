@@ -5,12 +5,14 @@ import gleam/http/response.{type Response}
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import lote/auth.{type Auth, Auth, Password}
 import lote/auth/session
 import lote/config
 import lote/db/pool
 import lote/realtime/pubsub.{type PubSub}
 import lote/web/components/timeline
+import lote/web/csrf
 import lote/web/origin
 import lote/web/router
 import lustre
@@ -118,8 +120,16 @@ fn serve_timeline_ws(
             }
           }
 
+          let csrf_token =
+            csrf.read_token(req, auth_ctx.secret_key_base)
+            |> result.unwrap("")
           let flags =
-            timeline.Flags(db:, pubsub: post_pubsub, user: current_user)
+            timeline.Flags(
+              db:,
+              pubsub: post_pubsub,
+              user: current_user,
+              csrf_token:,
+            )
           let assert Ok(component) =
             lustre.start_server_component(timeline.app(), flags)
           let self = process.new_subject()
