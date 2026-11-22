@@ -1,6 +1,7 @@
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
+import gleam/http/response
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -557,4 +558,129 @@ pub fn post_delete_route_enforces_csrf_auth_and_ownership_and_broadcasts_test() 
     simulate.browser_request(http.Get, "/posts/" <> created.id)
     |> router.handle_request(auth_ctx, post_pubsub)
   assert after_delete_resp.status == 404
+}
+
+pub fn dynamic_and_error_routes_return_no_store_cache_control_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let assert Ok(author) = user.create(tx, "CacheAuthor")
+  let assert Ok(created) = post_repo.create(tx, author.id, "cache test post")
+
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: simulate.default_secret_key_base,
+      methods: [Password],
+      session_revocations:,
+    )
+
+  // GET / -> no-store
+  let index_resp =
+    simulate.browser_request(http.Get, "/")
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert index_resp.status == 200
+  assert response.get_header(index_resp, "cache-control") == Ok("no-store")
+
+  // GET /posts/:id -> no-store
+  let post_resp =
+    simulate.browser_request(http.Get, "/posts/" <> created.id)
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert post_resp.status == 200
+  assert response.get_header(post_resp, "cache-control") == Ok("no-store")
+
+  // GET /auth/login -> no-store
+  let login_resp =
+    simulate.browser_request(http.Get, "/auth/login")
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert login_resp.status == 200
+  assert response.get_header(login_resp, "cache-control") == Ok("no-store")
+
+  // GET /health -> no-store
+  let health_resp =
+    simulate.request(http.Get, "/health")
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert health_resp.status == 200
+  assert response.get_header(health_resp, "cache-control") == Ok("no-store")
+
+  // 404 Not Found -> no-store
+  let not_found_resp =
+    simulate.browser_request(http.Get, "/does-not-exist")
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert not_found_resp.status == 404
+  assert response.get_header(not_found_resp, "cache-control") == Ok("no-store")
+
+  // 405 Method Not Allowed -> no-store
+  let method_not_allowed_resp =
+    simulate.browser_request(http.Post, "/posts/" <> created.id)
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert method_not_allowed_resp.status == 405
+  assert response.get_header(method_not_allowed_resp, "cache-control")
+    == Ok("no-store")
+
+  // 400 Cross-origin CSRF rejection -> no-store
+  let csrf_400_resp =
+    simulate.browser_request(http.Post, "/auth/logout")
+    |> request.set_header("origin", "https://evil.example")
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert csrf_400_resp.status == 400
+  assert response.get_header(csrf_400_resp, "cache-control") == Ok("no-store")
+}
+
+pub fn static_assets_return_public_no_cache_with_etag_and_errors_return_no_store_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: simulate.default_secret_key_base,
+      methods: [],
+      session_revocations:,
+    )
+
+  // GET existing static file -> 200 + public, no-cache + ETag
+  let static_resp =
+    simulate.request(http.Get, "/static/lote-time.js")
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert static_resp.status == 200
+  assert response.get_header(static_resp, "cache-control")
+    == Ok("public, no-cache")
+  let assert Ok(etag) = response.get_header(static_resp, "etag")
+
+  // Conditional GET with matching If-None-Match -> 304 + public, no-cache + ETag
+  let revalidated_resp =
+    simulate.request(http.Get, "/static/lote-time.js")
+    |> request.set_header("if-none-match", etag)
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert revalidated_resp.status == 304
+  assert response.get_header(revalidated_resp, "cache-control")
+    == Ok("public, no-cache")
+  assert response.get_header(revalidated_resp, "etag") == Ok(etag)
+
+  // HEAD existing static file -> 200 + public, no-cache
+  let head_resp =
+    simulate.request(http.Head, "/static/lote-time.js")
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert head_resp.status == 200
+  assert response.get_header(head_resp, "cache-control")
+    == Ok("public, no-cache")
+
+  // Missing static file -> 404 + no-store
+  let missing_static_resp =
+    simulate.request(http.Get, "/static/does-not-exist.js")
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert missing_static_resp.status == 404
+  assert response.get_header(missing_static_resp, "cache-control")
+    == Ok("no-store")
+
+  // Invalid Range header on static file -> 400 + no-store
+  let bad_range_resp =
+    simulate.request(http.Get, "/static/lote-time.js")
+    |> request.set_header("range", "bytes=invalid")
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert bad_range_resp.status == 400
+  assert response.get_header(bad_range_resp, "cache-control") == Ok("no-store")
 }

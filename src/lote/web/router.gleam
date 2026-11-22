@@ -1,4 +1,5 @@
 import gleam/http
+import gleam/http/response
 import gleam/option.{None, Some}
 import gleam/string
 import lote/auth.{type Auth}
@@ -14,6 +15,10 @@ import lustre/element
 import lustre/element/html
 import lustre/server_component
 import wisp.{type Request, type Response}
+
+const default_cache_control = "no-store"
+
+const static_cache_control = "public, no-cache"
 
 pub fn handle_request(
   req: Request,
@@ -120,15 +125,38 @@ fn middleware(
 ) -> Response {
   let req = wisp.method_override(req)
   use <- wisp.log_request(req)
-  use <- wisp.rescue_crashes
-  use req <- wisp.handle_head(req)
-  use req <- wisp.csrf_known_header_protection(req)
+  {
+    use <- wisp.rescue_crashes
+    use req <- wisp.handle_head(req)
+    use req <- wisp.csrf_known_header_protection(req)
 
-  let static_dir = case wisp.priv_directory("lote") {
-    Ok(priv) -> priv <> "/static"
-    Error(_) -> "priv/static"
+    let static_dir = case wisp.priv_directory("lote") {
+      Ok(priv) -> priv <> "/static"
+      Error(_) -> "priv/static"
+    }
+    serve_static_with_cache(req, static_dir, fn() {
+      handle_request(req)
+      |> ensure_cache_control(default_cache_control)
+    })
   }
-  use <- wisp.serve_static(req, under: "/static", from: static_dir)
+  |> ensure_cache_control(default_cache_control)
+}
 
-  handle_request(req)
+fn serve_static_with_cache(
+  req: Request,
+  static_dir: String,
+  next: fn() -> Response,
+) -> Response {
+  let resp = wisp.serve_static(req, under: "/static", from: static_dir, next:)
+  case resp.status {
+    200 | 206 | 304 -> ensure_cache_control(resp, static_cache_control)
+    _ -> resp
+  }
+}
+
+fn ensure_cache_control(resp: Response, value: String) -> Response {
+  case response.get_header(resp, "cache-control") {
+    Ok(_) -> resp
+    Error(_) -> response.set_header(resp, "cache-control", value)
+  }
 }

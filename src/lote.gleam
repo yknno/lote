@@ -98,6 +98,7 @@ fn serve_timeline_ws(
   case origin.verify_same_origin(req) {
     False ->
       response.new(403)
+      |> response.set_header("cache-control", "no-store")
       |> response.set_body(mist.Bytes(bytes_tree.from_string("Forbidden")))
 
     True ->
