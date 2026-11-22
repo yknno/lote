@@ -38,3 +38,17 @@ pub fn create_rejects_short_password_and_duplicate_login_id_test() {
   assert password.create(tx, u2.id, "dup_id", "secretpass123")
     == Error(password.AlreadyExists)
 }
+
+pub fn exists_checks_login_id_presence_test() {
+  use tx <- test_helper.with_db
+
+  assert password.exists(tx, "check_user") == Ok(False)
+
+  let assert Ok(created) = user.create(tx, "Check User")
+  let assert Ok(Nil) =
+    password.create(tx, created.id, "check_user", "secretpass123")
+
+  assert password.exists(tx, "check_user") == Ok(True)
+  assert password.exists(tx, "  check_user  ") == Ok(True)
+  assert password.exists(tx, "other_user") == Ok(False)
+}

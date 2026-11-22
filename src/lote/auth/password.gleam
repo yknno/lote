@@ -59,6 +59,23 @@ pub fn create(
   }
 }
 
+pub fn exists(db: pog.Connection, login_id: String) -> Result(Bool, Error) {
+  let login_id = string.trim(login_id)
+  let query =
+    s.new()
+    |> s.from_table("password_credentials")
+    |> s.select(s.col("id"))
+    |> s.where(w.eq(w.col("login_id"), w.string(login_id)))
+    |> s.limit(1)
+    |> s.to_query
+
+  case postgres.run_read_query(query, decode.dynamic, db) {
+    Ok([_, ..]) -> Ok(True)
+    Ok([]) -> Ok(False)
+    Error(_) -> Error(InternalError)
+  }
+}
+
 pub fn authenticate(
   db: pog.Connection,
   login_id: String,
