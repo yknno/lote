@@ -1,0 +1,36 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended"
+  ],
+  "timezone": "Asia/Tokyo",
+  "minimumReleaseAge": "3 days",
+  "lockFileMaintenance": {
+    "enabled": true
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Update gh-actions-lock pin in verify-lockfile workflow",
+      "managerFilePatterns": ["/^\\.github/workflows/verify-lockfile\\.ya?ml$/"],
+      "matchStrings": [
+        "gh extension install (?<depName>github/gh-actions-lock) --pin (?<currentValue>v\\S+)"
+      ],
+      "datasourceTemplate": "github-releases"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Group Gleam updates across mise.toml and Dockerfile",
+      "matchManagers": ["mise", "dockerfile"],
+      "matchDepNames": ["gleam", "ghcr.io/gleam-lang/gleam"],
+      "groupName": "gleam"
+    },
+    {
+      "description": "Group Erlang/OTP updates across mise.toml and Dockerfile",
+      "matchManagers": ["mise", "dockerfile"],
+      "matchDepNames": ["erlang"],
+      "groupName": "erlang"
+    }
+  ]
+}
