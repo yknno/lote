@@ -6,6 +6,7 @@ import gleam/string
 import lote/auth/user.{type AuthUser}
 import lote/db/post_repo
 import lote/realtime/pubsub.{type PubSub}
+import lote/web/csrf
 import lustre
 import lustre/attribute
 import lustre/effect.{type Effect}
@@ -21,7 +22,12 @@ pub type Post {
 }
 
 pub type Flags {
-  Flags(db: pog.Connection, pubsub: PubSub(Post), user: Option(AuthUser))
+  Flags(
+    db: pog.Connection,
+    pubsub: PubSub(Post),
+    user: Option(AuthUser),
+    csrf_token: String,
+  )
 }
 
 pub type Model {
@@ -29,6 +35,7 @@ pub type Model {
     db: pog.Connection,
     pubsub: PubSub(Post),
     user: Option(AuthUser),
+    csrf_token: String,
     posts: List(Post),
     form_key: Int,
   )
@@ -64,6 +71,7 @@ fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       db: flags.db,
       pubsub: flags.pubsub,
       user: flags.user,
+      csrf_token: flags.csrf_token,
       posts:,
       form_key: 0,
     ),
@@ -139,7 +147,7 @@ fn view(model: Model) -> Element(Msg) {
               ],
               [html.text("lote")],
             ),
-            account_bar(model.user),
+            account_bar(model.user, model.csrf_token),
           ],
         ),
         composer_pane(model),
@@ -177,7 +185,10 @@ fn view(model: Model) -> Element(Msg) {
   ])
 }
 
-fn account_bar(current_user: Option(AuthUser)) -> Element(Msg) {
+fn account_bar(
+  current_user: Option(AuthUser),
+  csrf_token: String,
+) -> Element(Msg) {
   case current_user {
     Some(u) ->
       html.div([attribute.class("flex items-center gap-3 text-xs")], [
@@ -185,6 +196,11 @@ fn account_bar(current_user: Option(AuthUser)) -> Element(Msg) {
           html.text(u.name),
         ]),
         html.form([attribute.method("post"), attribute.action("/auth/logout")], [
+          html.input([
+            attribute.type_("hidden"),
+            attribute.name(csrf.form_field_name),
+            attribute.value(csrf_token),
+          ]),
           html.button(
             [
               attribute.type_("submit"),
