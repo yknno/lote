@@ -23,13 +23,24 @@ import pog
 const recent_posts_limit = 50
 
 pub type Post {
-  Post(id: String, author_name: String, body: String, created_at: Timestamp)
+  Post(
+    id: String,
+    user_id: Int,
+    author_name: String,
+    body: String,
+    created_at: Timestamp,
+  )
+}
+
+pub type PostEvent {
+  Created(Post)
+  Deleted(String)
 }
 
 pub type Flags {
   Flags(
     db: pog.Connection,
-    pubsub: PubSub(Post),
+    pubsub: PubSub(PostEvent),
     user: Option(AuthUser),
     csrf_token: String,
   )
@@ -38,12 +49,13 @@ pub type Flags {
 pub type Model {
   Model(
     db: pog.Connection,
-    pubsub: PubSub(Post),
+    pubsub: PubSub(PostEvent),
     user: Option(AuthUser),
     csrf_token: String,
     posts: List(Post),
     pending_count: Int,
     auto_refresh: Bool,
+    confirming_delete: Option(String),
     form_key: Int,
   )
 }
@@ -52,8 +64,12 @@ pub type Msg {
   UserSubmittedForm(List(#(String, String)))
   UserClickedRefresh
   UserToggledAutoRefresh
+  UserRequestedDelete(String)
+  UserCanceledDelete
+  UserConfirmedDelete(String)
   PostsReloaded(List(Post))
   PostCreated(Post)
+  PostDeleted(String)
 }
 
 pub fn app() -> lustre.App(Flags, Model, Msg) {
@@ -67,6 +83,7 @@ fn load_recent_posts(db: pog.Connection) -> Result(List(Post), pog.QueryError) {
         list.map(rows, fn(row) {
           Post(
             id: row.id,
+            user_id: row.user_id,
             author_name: row.author_name,
             body: row.body,
             created_at: row.created_at,
@@ -94,7 +111,12 @@ fn init(flags: Flags) -> #(Model, Effect(Msg)) {
     server_component.select(fn(_dispatch, subject) {
       pubsub.subscribe(flags.pubsub, subject)
       process.new_selector()
-      |> process.select_map(subject, PostCreated)
+      |> process.select_map(subject, fn(ev) {
+        case ev {
+          Created(post) -> PostCreated(post)
+          Deleted(id) -> PostDeleted(id)
+        }
+      })
     })
 
   #(
@@ -106,6 +128,7 @@ fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       posts:,
       pending_count: 0,
       auto_refresh: False,
+      confirming_delete: None,
       form_key: 0,
     ),
     subscribe_effect,
@@ -133,6 +156,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                       let post =
                         Post(
                           id: row.id,
+                          user_id: auth_user.id,
                           author_name: auth_user.name,
                           body: row.body,
                           created_at: row.created_at,
@@ -141,7 +165,7 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                         Ok(posts) -> dispatch(PostsReloaded(posts))
                         Error(_) -> Nil
                       }
-                      pubsub.publish(model.pubsub, post)
+                      pubsub.publish(model.pubsub, Created(post))
                     }
                     Error(_) -> Nil
                   }
@@ -176,6 +200,43 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
           }
       }
 
+    UserRequestedDelete(post_id) ->
+      case model.user {
+        Some(auth_user) ->
+          case
+            list.any(model.posts, fn(p) {
+              p.id == post_id && p.user_id == auth_user.id
+            })
+          {
+            True -> #(
+              Model(..model, confirming_delete: Some(post_id)),
+              effect.none(),
+            )
+            False -> #(model, effect.none())
+          }
+        None -> #(model, effect.none())
+      }
+
+    UserCanceledDelete -> #(
+      Model(..model, confirming_delete: None),
+      effect.none(),
+    )
+
+    UserConfirmedDelete(post_id) ->
+      case model.user {
+        None -> #(Model(..model, confirming_delete: None), effect.none())
+        Some(auth_user) -> {
+          let delete_and_publish =
+            effect.from(fn(_dispatch) {
+              case post_repo.delete(model.db, post_id, auth_user.id) {
+                Ok(True) -> pubsub.publish(model.pubsub, Deleted(post_id))
+                Ok(False) | Error(_) -> Nil
+              }
+            })
+          #(Model(..model, confirming_delete: None), delete_and_publish)
+        }
+      }
+
     PostsReloaded(posts) -> #(
       Model(..model, posts:, pending_count: 0),
       effect.none(),
@@ -200,6 +261,21 @@ fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             )
           }
       }
+
+    PostDeleted(post_id) -> {
+      let confirming_delete = case model.confirming_delete {
+        Some(id) if id == post_id -> None
+        other -> other
+      }
+      #(
+        Model(
+          ..model,
+          posts: list.filter(model.posts, fn(p) { p.id != post_id }),
+          confirming_delete:,
+        ),
+        effect.none(),
+      )
+    }
   }
 }
 
@@ -261,7 +337,7 @@ fn view(model: Model) -> Element(Msg) {
         ],
       ),
       pending_banner(model.pending_count),
-      feed(model.posts),
+      feed(model.posts, model.user, model.confirming_delete),
     ])
 
   html.div([attribute.class("flex min-h-screen flex-col md:flex-row")], [
@@ -416,7 +492,11 @@ fn composer_pane(model: Model) -> Element(Msg) {
   }
 }
 
-fn feed(posts: List(Post)) -> Element(Msg) {
+fn feed(
+  posts: List(Post),
+  current_user: Option(AuthUser),
+  confirming_delete: Option(String),
+) -> Element(Msg) {
   case posts {
     [] ->
       html.p([attribute.class("px-4 py-8 text-xs text-neutral-400")], [
@@ -426,12 +506,16 @@ fn feed(posts: List(Post)) -> Element(Msg) {
     _ ->
       html.ul(
         [attribute.class("divide-y divide-neutral-200")],
-        list.map(posts, post_row),
+        list.map(posts, post_row(_, current_user, confirming_delete)),
       )
   }
 }
 
-fn post_row(post: Post) -> Element(Msg) {
+fn post_row(
+  post: Post,
+  current_user: Option(AuthUser),
+  confirming_delete: Option(String),
+) -> Element(Msg) {
   html.li([attribute.class("px-4 py-3 hover:bg-neutral-50/70")], [
     html.div([attribute.class("flex items-baseline gap-2 text-xs")], [
       html.span([attribute.class("font-semibold text-neutral-950")], [
@@ -451,6 +535,7 @@ fn post_row(post: Post) -> Element(Msg) {
         post.created_at,
         "ml-auto shrink-0 font-mono text-xs text-neutral-400 tabular-nums",
       ),
+      delete_controls(post, current_user, confirming_delete),
     ]),
     html.p(
       [
@@ -461,6 +546,58 @@ fn post_row(post: Post) -> Element(Msg) {
       [html.text(post.body)],
     ),
   ])
+}
+
+fn delete_controls(
+  post: Post,
+  current_user: Option(AuthUser),
+  confirming_delete: Option(String),
+) -> Element(Msg) {
+  case current_user {
+    Some(u) if u.id == post.user_id ->
+      case confirming_delete {
+        Some(id) if id == post.id ->
+          html.span(
+            [attribute.class("inline-flex shrink-0 items-baseline gap-1.5")],
+            [
+              html.button(
+                [
+                  attribute.type_("button"),
+                  event.on_click(UserConfirmedDelete(post.id)),
+                  attribute.class(
+                    "cursor-pointer font-medium text-red-600 underline-offset-2 hover:underline",
+                  ),
+                ],
+                [html.text("Confirm")],
+              ),
+              html.button(
+                [
+                  attribute.type_("button"),
+                  event.on_click(UserCanceledDelete),
+                  attribute.class(
+                    "cursor-pointer text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
+                  ),
+                ],
+                [html.text("Cancel")],
+              ),
+            ],
+          )
+
+        _ ->
+          html.button(
+            [
+              attribute.type_("button"),
+              event.on_click(UserRequestedDelete(post.id)),
+              attribute.class(
+                "shrink-0 cursor-pointer text-neutral-400 underline-offset-2 hover:text-red-600 hover:underline",
+              ),
+            ],
+            [html.text("Delete")],
+          )
+      }
+
+    _ -> element.none()
+  }
 }
 
 fn short_id(id: String) -> String {

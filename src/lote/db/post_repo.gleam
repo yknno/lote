@@ -1,4 +1,5 @@
 import cake/adapter/postgres
+import cake/delete as d
 import cake/fragment as f
 import cake/insert as i
 import cake/join as j
@@ -85,6 +86,40 @@ pub fn find_by_id(
       case postgres.run_read_query(query, post_row_decoder(), db) {
         Ok([row, ..]) -> Ok(Some(row))
         Ok([]) -> Ok(None)
+        Error(err) -> Error(err)
+      }
+    }
+  }
+}
+
+pub fn delete(
+  db: pog.Connection,
+  id: String,
+  user_id: Int,
+) -> Result(Bool, pog.QueryError) {
+  case normalize_uuid(id) {
+    Error(_) -> Ok(False)
+    Ok(normalized) -> {
+      let query =
+        d.new()
+        |> d.table("posts")
+        |> d.where(
+          w.and([
+            w.eq(
+              w.col("id"),
+              w.fragment_value(
+                f.prepared(f.placeholder <> "::uuid", [f.string(normalized)]),
+              ),
+            ),
+            w.eq(w.col("user_id"), w.int(user_id)),
+          ]),
+        )
+        |> d.returning(["id"])
+        |> d.to_query
+
+      case postgres.run_write_query(query, decode.dynamic, db) {
+        Ok([_, ..]) -> Ok(True)
+        Ok([]) -> Ok(False)
         Error(err) -> Error(err)
       }
     }

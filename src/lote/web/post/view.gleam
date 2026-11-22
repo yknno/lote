@@ -1,14 +1,46 @@
+import gleam/option.{type Option, None, Some}
 import gleam/string
 import lote/db/post_repo.{type PostRow}
+import lote/web/csrf
 import lote/web/time as web_time
 import lustre/attribute
 import lustre/element
 import lustre/element/html
 import wisp
 
-pub fn show_page(post: PostRow) -> wisp.Response {
+pub fn show_page(
+  post: PostRow,
+  delete_csrf_token: Option(String),
+) -> wisp.Response {
   let page_title = post.author_name <> " - lote"
   let og_description = truncate(post.body, 160)
+
+  let delete_form = case delete_csrf_token {
+    Some(token) ->
+      html.form(
+        [
+          attribute.method("post"),
+          attribute.action("/posts/" <> post.id <> "/delete"),
+        ],
+        [
+          html.input([
+            attribute.type_("hidden"),
+            attribute.name(csrf.form_field_name),
+            attribute.value(token),
+          ]),
+          html.button(
+            [
+              attribute.type_("submit"),
+              attribute.class(
+                "cursor-pointer text-xs text-neutral-400 underline-offset-2 hover:text-red-600 hover:underline",
+              ),
+            ],
+            [html.text("Delete")],
+          ),
+        ],
+      )
+    None -> element.none()
+  }
 
   let doc =
     html.html([attribute.lang("ja"), attribute.class("bg-white")], [
@@ -97,10 +129,16 @@ pub fn show_page(post: PostRow) -> wisp.Response {
                 html.div(
                   [
                     attribute.class(
-                      "mt-6 border-t border-neutral-200 pt-3 font-mono text-xs text-neutral-400",
+                      "mt-6 flex items-center justify-between border-t border-neutral-200 pt-3",
                     ),
                   ],
-                  [html.text(post.id)],
+                  [
+                    html.span(
+                      [attribute.class("font-mono text-xs text-neutral-400")],
+                      [html.text(post.id)],
+                    ),
+                    delete_form,
+                  ],
                 ),
               ]),
             ]),
