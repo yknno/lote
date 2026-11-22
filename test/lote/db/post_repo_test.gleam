@@ -55,3 +55,28 @@ pub fn find_by_id_returns_matching_post_or_none_test() {
   // Invalid non-UUID input -> Ok(None) without DB error
   assert post_repo.find_by_id(tx, "not-a-uuid") == Ok(None)
 }
+
+pub fn delete_removes_only_owners_post_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(bob) = user.create(tx, "Bob")
+  let assert Ok(created) = post_repo.create(tx, alice.id, "ephemeral post")
+
+  // Another user cannot delete Alice's post
+  assert post_repo.delete(tx, created.id, bob.id) == Ok(False)
+  let assert Ok(Some(_)) = post_repo.find_by_id(tx, created.id)
+
+  // Invalid or unknown UUID returns Ok(False) without DB error
+  assert post_repo.delete(tx, "not-a-uuid", alice.id) == Ok(False)
+  assert post_repo.delete(tx, "00000000-0000-7000-8000-000000000000", alice.id)
+    == Ok(False)
+
+  // Owner can delete (including with uppercase UUID input)
+  assert post_repo.delete(tx, string.uppercase(created.id), alice.id)
+    == Ok(True)
+  assert post_repo.find_by_id(tx, created.id) == Ok(None)
+
+  // Deleting an already-deleted post returns Ok(False)
+  assert post_repo.delete(tx, created.id, alice.id) == Ok(False)
+}

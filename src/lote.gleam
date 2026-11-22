@@ -59,12 +59,12 @@ pub fn main() -> Nil {
 
 pub fn handler(
   db: pog.Connection,
-  post_pubsub: PubSub(timeline.Post),
+  post_pubsub: PubSub(timeline.PostEvent),
   auth_ctx: Auth,
 ) -> fn(Request(Connection)) -> Response(ResponseData) {
   let http_handler =
     wisp_mist.handler(
-      router.handle_request(_, auth_ctx),
+      router.handle_request(_, auth_ctx, post_pubsub),
       auth_ctx.secret_key_base,
     )
 
@@ -92,7 +92,7 @@ pub type WsState {
 fn serve_timeline_ws(
   req: Request(Connection),
   db: pog.Connection,
-  post_pubsub: PubSub(timeline.Post),
+  post_pubsub: PubSub(timeline.PostEvent),
   auth_ctx: Auth,
 ) -> Response(ResponseData) {
   case origin.verify_same_origin(req) {
@@ -118,7 +118,7 @@ fn serve_timeline_ws(
 pub fn ws_init(
   req: Request(body),
   db: pog.Connection,
-  post_pubsub: PubSub(timeline.Post),
+  post_pubsub: PubSub(timeline.PostEvent),
   auth_ctx: Auth,
 ) -> #(WsState, Option(process.Selector(WsMsg))) {
   let revocation_sub = process.new_subject()

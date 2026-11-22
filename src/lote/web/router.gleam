@@ -1,8 +1,12 @@
 import gleam/http
 import gleam/option.{None, Some}
+import gleam/string
 import lote/auth.{type Auth}
+import lote/auth/session
 import lote/db/post_repo
+import lote/realtime/pubsub.{type PubSub}
 import lote/web/auth/handler as auth_handler
+import lote/web/components/timeline
 import lote/web/csrf
 import lote/web/post/view as post_view
 import lustre/attribute
@@ -11,7 +15,11 @@ import lustre/element/html
 import lustre/server_component
 import wisp.{type Request, type Response}
 
-pub fn handle_request(req: Request, auth_ctx: Auth) -> Response {
+pub fn handle_request(
+  req: Request,
+  auth_ctx: Auth,
+  post_pubsub: PubSub(timeline.PostEvent),
+) -> Response {
   use req <- middleware(req)
 
   case req.method, wisp.path_segments(req) {
@@ -28,11 +36,52 @@ pub fn handle_request(req: Request, auth_ctx: Auth) -> Response {
     }
     http.Get, ["posts", id] ->
       case post_repo.find_by_id(auth_ctx.db, id) {
-        Ok(Some(post)) -> post_view.show_page(post)
+        Ok(Some(post)) -> {
+          let current_user =
+            session.current_user(req, auth_ctx.db, auth_ctx.secret_key_base)
+          case current_user {
+            Some(u) if u.id == post.user_id -> {
+              let #(csrf_token, should_set_cookie) =
+                csrf.ensure_token(req, auth_ctx.secret_key_base)
+              post_view.show_page(post, Some(csrf_token))
+              |> csrf.attach_cookie(
+                req,
+                csrf_token,
+                auth_ctx.secret_key_base,
+                should_set_cookie,
+              )
+            }
+            _ -> post_view.show_page(post, None)
+          }
+        }
         Ok(None) -> wisp.not_found()
         Error(_) -> wisp.internal_server_error()
       }
     _, ["posts", _] -> wisp.method_not_allowed([http.Get, http.Head])
+    http.Post, ["posts", id, "delete"] -> {
+      use form <- wisp.require_form(req)
+      use _token <- csrf.require_form_token(
+        req,
+        form.values,
+        auth_ctx.secret_key_base,
+      )
+      case session.current_user(req, auth_ctx.db, auth_ctx.secret_key_base) {
+        None -> wisp.response(401)
+        Some(auth_user) ->
+          case post_repo.delete(auth_ctx.db, id, auth_user.id) {
+            Ok(True) -> {
+              pubsub.publish(
+                post_pubsub,
+                timeline.Deleted(string.lowercase(id)),
+              )
+              wisp.redirect(to: "/")
+            }
+            Ok(False) -> wisp.not_found()
+            Error(_) -> wisp.internal_server_error()
+          }
+      }
+    }
+    _, ["posts", _, "delete"] -> wisp.method_not_allowed([http.Post])
     _, ["auth", ..rest] -> auth_handler.handle_request(req, rest, auth_ctx)
     _, ["health"] -> wisp.response(200) |> wisp.string_body("ok")
     _, _ -> wisp.not_found()
