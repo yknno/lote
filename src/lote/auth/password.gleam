@@ -76,9 +76,6 @@ pub fn exists(db: pog.Connection, login_id: String) -> Result(Bool, Error) {
   }
 }
 
-const dummy_password_hash =
-  "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHR2YWx1ZTEy$R+o7T1S1r0W1k5n7A6p+8C9b2D3e4F5g6H7i8J9k0L0"
-
 pub fn authenticate(
   db: pog.Connection,
   login_id: String,
@@ -93,7 +90,9 @@ pub fn authenticate(
         Error(_) -> Error(InternalError)
       }
     Error(InvalidCredentials) -> {
-      let _ = argus.verify(dummy_password_hash, password)
+      // login_id が存在しない場合も Argon2id ハッシュ計算を実行し、
+      // レスポンス時間の差からユーザーの存在有無を推測されるのを防ぐ。
+      let _ = argus.hasher() |> argus.hash(password)
       Error(InvalidCredentials)
     }
     Error(err) -> Error(err)
