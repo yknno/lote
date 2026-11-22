@@ -1,5 +1,6 @@
 import gleam/erlang/process
 import lote/realtime/pubsub
+import lote/test_helper
 
 pub fn publish_broadcasts_to_all_subscribers_test() {
   let assert Ok(bus) = pubsub.start()
@@ -56,9 +57,9 @@ pub fn dead_subscriber_process_is_automatically_removed_test() {
     |> process.select_specific_monitor(mon, fn(down) { down })
   let assert Ok(_) = process.selector_receive(down_selector, 500)
 
-  // Allow the pubsub actor to process the monitor DOWN message before counting.
-  process.sleep(10)
-  assert pubsub.subscriber_count(bus) == 0
+  assert test_helper.wait_until(100, 5, fn() {
+    pubsub.subscriber_count(bus) == 0
+  })
 }
 
 pub fn duplicate_subscribe_is_idempotent_test() {

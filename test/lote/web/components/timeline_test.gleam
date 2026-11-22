@@ -148,6 +148,7 @@ pub fn shutting_down_timeline_component_removes_pubsub_subscriber_test() {
     |> process.select_specific_monitor(mon, fn(down) { down })
   let assert Ok(_) = process.selector_receive(down_selector, 500)
 
-  process.sleep(10)
-  assert pubsub.subscriber_count(post_pubsub) == 0
+  assert test_helper.wait_until(100, 5, fn() {
+    pubsub.subscriber_count(post_pubsub) == 0
+  })
 }
