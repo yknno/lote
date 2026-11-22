@@ -80,3 +80,30 @@ pub fn delete_removes_only_owners_post_test() {
   // Deleting an already-deleted post returns Ok(False)
   assert post_repo.delete(tx, created.id, alice.id) == Ok(False)
 }
+
+pub fn list_before_paginates_older_posts_in_descending_order_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "PageAuthor")
+  let assert Ok(p1) = post_repo.create(tx, author.id, "post 1")
+  let assert Ok(p2) = post_repo.create(tx, author.id, "post 2")
+  let assert Ok(p3) = post_repo.create(tx, author.id, "post 3")
+  let assert Ok(p4) = post_repo.create(tx, author.id, "post 4")
+  let assert Ok(p5) = post_repo.create(tx, author.id, "post 5")
+
+  let assert Ok(page1) = post_repo.list_recent(tx, 2)
+  assert list.map(page1, fn(r) { r.id }) == [p5.id, p4.id]
+
+  let assert Ok(page2) = post_repo.list_before(tx, p4.id, 2)
+  assert list.map(page2, fn(r) { r.id }) == [p3.id, p2.id]
+
+  // Uppercase UUID cursor works
+  let assert Ok(page3) = post_repo.list_before(tx, string.uppercase(p2.id), 2)
+  assert list.map(page3, fn(r) { r.id }) == [p1.id]
+
+  // Before oldest post returns empty list
+  assert post_repo.list_before(tx, p1.id, 2) == Ok([])
+
+  // Invalid UUID cursor returns Ok([]) without DB error
+  assert post_repo.list_before(tx, "not-a-uuid", 2) == Ok([])
+}

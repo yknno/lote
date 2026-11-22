@@ -1,5 +1,6 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{Some}
@@ -574,4 +575,98 @@ pub fn non_owner_cannot_delete_another_users_post_test() {
   let assert Ok(Some(_)) = post_repo.find_by_id(tx, post.id)
 
   shutdown_and_wait(bob_component)
+}
+
+pub fn timeline_loads_initial_page_and_appends_older_posts_on_load_more_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let total = timeline.page_size + 5
+  let created =
+    int.range(from: 1, to: total + 1, with: [], run: fn(acc, n) {
+      let body = "paginated-post-" <> string.pad_start(int.to_string(n), 2, "0")
+      let assert Ok(row) = post_repo.create(tx, alice.id, body)
+      [row, ..acc]
+    })
+    |> list.reverse
+
+  // Oldest post shown on page 1 is index (total - page_size) = 5 (0-based), i.e. paginated-post-06
+  let assert Ok(page1_oldest) =
+    created
+    |> list.drop(5)
+    |> list.first
+
+  let assert Ok(post_pubsub) = pubsub.start()
+  let assert Ok(component) =
+    lustre.start_server_component(
+      timeline.app(),
+      timeline.Flags(
+        db: tx,
+        pubsub: post_pubsub,
+        user: Some(alice),
+        csrf_token: "test-csrf-token",
+      ),
+    )
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+
+  let mount_payload = receive_json(client)
+  assert string.contains(mount_payload, "paginated-post-25")
+  assert string.contains(mount_payload, "paginated-post-06")
+  assert !string.contains(mount_payload, "paginated-post-05")
+  assert string.contains(
+    mount_payload,
+    int.to_string(timeline.page_size) <> "+ posts",
+  )
+  assert string.contains(mount_payload, "\"tag\":\"lote-sentinel\"")
+  assert string.contains(mount_payload, page1_oldest.id)
+  assert string.contains(mount_payload, "Load older posts")
+
+  // Requesting older posts transitions through Loading... and appends the remaining 5 posts
+  lustre.dispatch(timeline.UserRequestedLoadMore)
+  |> lustre.send(to: component)
+
+  let loading_patch = receive_json(client)
+  assert string.contains(loading_patch, "Loading...")
+
+  let loaded_patch = receive_json(client)
+  assert string.contains(loaded_patch, "paginated-post-05")
+  assert string.contains(loaded_patch, "paginated-post-01")
+  assert string.contains(loaded_patch, int.to_string(total) <> " posts")
+  assert !string.contains(loaded_patch, "Load older posts")
+
+  shutdown_and_wait(component)
+}
+
+pub fn timeline_without_older_posts_omits_sentinel_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(_) = post_repo.create(tx, alice.id, "only post 1")
+  let assert Ok(_) = post_repo.create(tx, alice.id, "only post 2")
+
+  let assert Ok(post_pubsub) = pubsub.start()
+  let assert Ok(component) =
+    lustre.start_server_component(
+      timeline.app(),
+      timeline.Flags(
+        db: tx,
+        pubsub: post_pubsub,
+        user: Some(alice),
+        csrf_token: "test-csrf-token",
+      ),
+    )
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+
+  let mount_payload = receive_json(client)
+  assert string.contains(mount_payload, "2 posts")
+  assert !string.contains(mount_payload, "lote-sentinel")
+  assert !string.contains(mount_payload, "Load older posts")
+
+  shutdown_and_wait(component)
 }
