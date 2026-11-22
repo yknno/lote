@@ -3,7 +3,7 @@ import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
 import gleam/json
 import gleam/list
-import gleam/option.{Some}
+import gleam/option.{type Option, None, Some}
 import lote/auth.{type Auth, Auth, Password}
 import lote/auth/session
 import lote/config
@@ -32,7 +32,14 @@ pub fn main() -> Nil {
       }
     })
 
-  let auth_ctx = Auth(db:, secret_key_base: cfg.secret_key_base, methods:)
+  let assert Ok(session_revocations) = pubsub.start()
+  let auth_ctx =
+    Auth(
+      db:,
+      secret_key_base: cfg.secret_key_base,
+      methods:,
+      session_revocations:,
+    )
 
   let assert Ok(post_pubsub) = pubsub.start()
   let http_handler =
@@ -53,10 +60,16 @@ pub fn main() -> Nil {
   process.sleep_forever()
 }
 
+type WsMsg {
+  ComponentMessage(server_component.ClientMessage(timeline.Msg))
+  SessionRevoked(String)
+}
+
 type WsState {
   WsState(
     component: lustre.Runtime(timeline.Msg),
     self: Subject(server_component.ClientMessage(timeline.Msg)),
+    session_id: Option(String),
   )
 }
 
@@ -66,22 +79,52 @@ fn serve_timeline_ws(
   post_pubsub: PubSub(timeline.Post),
   auth_ctx: Auth,
 ) -> Response(ResponseData) {
-  let current_user =
-    session.current_user(req, auth_ctx.db, auth_ctx.secret_key_base)
-
   mist.websocket(
     request: req,
     on_init: fn(_conn) {
+      let revocation_sub = process.new_subject()
+      let candidate_session_id =
+        session.session_id(req, auth_ctx.secret_key_base)
+      case candidate_session_id {
+        Some(_) ->
+          pubsub.subscribe(auth_ctx.session_revocations, revocation_sub)
+        None -> Nil
+      }
+
+      let active_session =
+        session.current_session(req, auth_ctx.db, auth_ctx.secret_key_base)
+      let #(current_user, session_id, has_revocation_sub) = case
+        active_session
+      {
+        Some(active) -> #(Some(active.user), Some(active.id), True)
+        None -> {
+          case candidate_session_id {
+            Some(_) ->
+              pubsub.unsubscribe(auth_ctx.session_revocations, revocation_sub)
+            None -> Nil
+          }
+          #(None, None, False)
+        }
+      }
+
       let flags = timeline.Flags(db:, pubsub: post_pubsub, user: current_user)
       let assert Ok(component) =
         lustre.start_server_component(timeline.app(), flags)
       let self = process.new_subject()
-      let selector = process.new_selector() |> process.select(self)
+      let selector =
+        process.new_selector()
+        |> process.select_map(self, ComponentMessage)
+      let selector = case has_revocation_sub {
+        True ->
+          selector
+          |> process.select_map(revocation_sub, SessionRevoked)
+        False -> selector
+      }
 
       server_component.register_subject(self)
       |> lustre.send(to: component)
 
-      #(WsState(component:, self:), Some(selector))
+      #(WsState(component:, self:, session_id:), Some(selector))
     },
     handler: fn(state: WsState, msg, conn) {
       case msg {
@@ -93,7 +136,7 @@ fn serve_timeline_ws(
           mist.continue(state)
         }
 
-        mist.Custom(client_msg) -> {
+        mist.Custom(ComponentMessage(client_msg)) -> {
           let payload =
             client_msg
             |> server_component.client_message_to_json
@@ -101,6 +144,12 @@ fn serve_timeline_ws(
           let _ = mist.send_text_frame(conn, payload)
           mist.continue(state)
         }
+
+        mist.Custom(SessionRevoked(revoked_id)) ->
+          case state.session_id {
+            Some(sid) if sid == revoked_id -> mist.stop()
+            _ -> mist.continue(state)
+          }
 
         mist.Binary(_) -> mist.continue(state)
         mist.Closed | mist.Shutdown -> mist.stop()

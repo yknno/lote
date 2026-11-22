@@ -21,3 +21,18 @@ pub fn with_db(run: fn(pog.Connection) -> Nil) -> Nil {
 
   process.send_exit(started.pid)
 }
+
+pub fn wait_until(
+  attempts: Int,
+  interval_ms: Int,
+  check: fn() -> Bool,
+) -> Bool {
+  case check() {
+    True -> True
+    False if attempts > 1 -> {
+      process.sleep(interval_ms)
+      wait_until(attempts - 1, interval_ms, check)
+    }
+    False -> False
+  }
+}

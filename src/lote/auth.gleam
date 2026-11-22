@@ -1,3 +1,4 @@
+import lote/realtime/pubsub.{type PubSub}
 import pog
 
 pub type Method {
@@ -5,5 +6,10 @@ pub type Method {
 }
 
 pub type Auth {
-  Auth(db: pog.Connection, secret_key_base: String, methods: List(Method))
+  Auth(
+    db: pog.Connection,
+    secret_key_base: String,
+    methods: List(Method),
+    session_revocations: PubSub(String),
+  )
 }
