@@ -9,10 +9,23 @@ import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/result
 import gleam/string
 import gleam/time/calendar
 import gleam/time/timestamp.{type Timestamp}
 import pog
+
+pub const max_body_length = 300
+
+pub type BodyError {
+  EmptyBody
+  BodyTooLong(length: Int, max: Int)
+}
+
+pub type CreateError {
+  InvalidBody(BodyError)
+  QueryError(pog.QueryError)
+}
 
 pub type CreatedPost {
   CreatedPost(id: String, user_id: Int, body: String, created_at: Timestamp)
@@ -28,11 +41,24 @@ pub type PostRow {
   )
 }
 
+pub fn validate_body(raw: String) -> Result(String, BodyError) {
+  let body = string.trim(raw)
+  let length = string.length(body)
+  case length {
+    0 -> Error(EmptyBody)
+    n if n > max_body_length ->
+      Error(BodyTooLong(length: n, max: max_body_length))
+    _ -> Ok(body)
+  }
+}
+
 pub fn create(
   db: pog.Connection,
   user_id: Int,
   body: String,
-) -> Result(CreatedPost, pog.QueryError) {
+) -> Result(CreatedPost, CreateError) {
+  use body <- result.try(validate_body(body) |> result.map_error(InvalidBody))
+
   let query =
     [i.row([i.int(user_id), i.string(body)])]
     |> i.from_values(table_name: "posts", columns: ["user_id", "body"])
@@ -49,8 +75,8 @@ pub fn create(
 
   case postgres.run_write_query(query, decoder, db) {
     Ok([row, ..]) -> Ok(row)
-    Ok([]) -> Error(pog.ConnectionUnavailable)
-    Error(err) -> Error(err)
+    Ok([]) -> Error(QueryError(pog.ConnectionUnavailable))
+    Error(err) -> Error(QueryError(err))
   }
 }
 

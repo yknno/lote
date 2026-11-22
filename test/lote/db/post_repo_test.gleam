@@ -107,3 +107,36 @@ pub fn list_before_paginates_older_posts_in_descending_order_test() {
   // Invalid UUID cursor returns Ok([]) without DB error
   assert post_repo.list_before(tx, "not-a-uuid", 2) == Ok([])
 }
+
+pub fn validate_body_and_create_enforce_length_limit_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "LimitAuthor")
+
+  // Blank body is rejected
+  assert post_repo.validate_body("   \n\t  ") == Error(post_repo.EmptyBody)
+  assert post_repo.create(tx, author.id, "   ")
+    == Error(post_repo.InvalidBody(post_repo.EmptyBody))
+
+  // Exactly 300 graphemes (including ZWJ family emoji counted as 1 grapheme) succeeds
+  let exact_300 = string.repeat("あ", post_repo.max_body_length - 1) <> "👨‍👩‍👧‍👦"
+  assert string.length(exact_300) == post_repo.max_body_length
+  assert post_repo.validate_body("  " <> exact_300 <> "  ") == Ok(exact_300)
+  let assert Ok(created) = post_repo.create(tx, author.id, exact_300)
+  assert created.body == exact_300
+
+  // 301 graphemes is rejected without inserting
+  let over_301 = string.repeat("a", post_repo.max_body_length + 1)
+  assert post_repo.validate_body(over_301)
+    == Error(post_repo.BodyTooLong(
+      length: post_repo.max_body_length + 1,
+      max: post_repo.max_body_length,
+    ))
+  assert post_repo.create(tx, author.id, over_301)
+    == Error(
+      post_repo.InvalidBody(post_repo.BodyTooLong(
+        length: post_repo.max_body_length + 1,
+        max: post_repo.max_body_length,
+      )),
+    )
+}

@@ -610,3 +610,56 @@ pub fn server_component_runtime_delivers_pubsub_events_and_cleans_up_on_shutdown
     pubsub.subscriber_count(post_pubsub) == 0
   })
 }
+
+pub fn submitting_over_limit_post_shows_error_without_resetting_form_and_clears_on_valid_submit_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "LimitUser")
+  let assert Ok(post_pubsub) = pubsub.start()
+  let pubsub_sub = process.new_subject()
+  pubsub.subscribe(post_pubsub, pubsub_sub)
+
+  let #(model0, _init_eff) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(author),
+      csrf_token: "test-csrf-token",
+    ))
+
+  let initial_html = render_html(model0)
+  assert string.contains(initial_html, "<lote-composer")
+  assert string.contains(
+    initial_html,
+    "max=\"" <> int.to_string(post_repo.max_body_length) <> "\"",
+  )
+  assert string.contains(initial_html, "data-char-counter")
+  assert string.contains(
+    initial_html,
+    "0 / " <> int.to_string(post_repo.max_body_length),
+  )
+  assert !string.contains(initial_html, "role=\"alert\"")
+
+  // Over-limit submission sets form_error, keeps form_key intact, and does not save or publish
+  let over_301 = string.repeat("a", post_repo.max_body_length + 1)
+  let model1 = step(model0, timeline.UserSubmittedForm([#("body", over_301)]))
+
+  assert model1.form_key == 0
+  assert model1.posts == []
+  assert process.receive(pubsub_sub, 20) == Error(Nil)
+  assert post_repo.list_recent(tx, 10) == Ok([])
+  let err_html = render_html(model1)
+  assert string.contains(err_html, "role=\"alert\"")
+  assert string.contains(err_html, "301 / 300")
+
+  // Valid 300-grapheme submission succeeds, resets form_key, and clears form_error
+  let exact_300 = string.repeat("あ", post_repo.max_body_length - 1) <> "👨‍👩‍👧‍👦"
+  let model2 = step(model1, timeline.UserSubmittedForm([#("body", exact_300)]))
+
+  assert model2.form_key == 1
+  assert model2.form_error == None
+  assert !string.contains(render_html(model2), "role=\"alert\"")
+  assert list.map(model2.posts, fn(p) { p.body }) == [exact_300]
+  let assert Ok(timeline.Created(created)) = process.receive(pubsub_sub, 100)
+  assert created.body == exact_300
+}

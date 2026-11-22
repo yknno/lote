@@ -115,6 +115,10 @@ fn index_html() -> String {
         [attribute.type_("module"), attribute.src("/static/lote-sentinel.js")],
         "",
       ),
+      html.script(
+        [attribute.type_("module"), attribute.src("/static/lote-composer.js")],
+        "",
+      ),
     ]),
     html.body([attribute.class("min-h-screen bg-white text-neutral-950")], [
       server_component.element([server_component.route("/ws")], []),
