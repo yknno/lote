@@ -684,3 +684,200 @@ pub fn static_assets_return_public_no_cache_with_etag_and_errors_return_no_store
   assert bad_range_resp.status == 400
   assert response.get_header(bad_range_resp, "cache-control") == Ok("no-store")
 }
+
+pub fn sessions_routes_list_and_revoke_with_csrf_ownership_and_pubsub_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+  let assert Ok(post_pubsub) = pubsub.start()
+  let revocation_sub = process.new_subject()
+  pubsub.subscribe(session_revocations, revocation_sub)
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(Nil) =
+    password.create(tx, alice.id, "alice_sess", "secretpass123")
+  let assert Ok(bob) = user.create(tx, "Bob")
+  let assert Ok(Nil) = password.create(tx, bob.id, "bob_sess", "secretpass123")
+
+  let secret = "sessions_router_secret_key_base_0123456789abcdefghijklmnop"
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: secret,
+      methods: [Password],
+      session_revocations:,
+    )
+
+  // Unauthenticated GET /sessions -> 303 redirect to /auth/login + no-store
+  let anon_sessions_resp =
+    simulate.browser_request(http.Get, "/sessions")
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert anon_sessions_resp.status == 303
+  assert response.get_header(anon_sessions_resp, "location")
+    == Ok("/auth/login")
+  assert response.get_header(anon_sessions_resp, "cache-control")
+    == Ok("no-store")
+
+  // Method not allowed checks -> 405
+  assert router.handle_request(
+      simulate.browser_request(http.Post, "/sessions"),
+      auth_ctx,
+      post_pubsub,
+    ).status
+    == 405
+  assert router.handle_request(
+      simulate.browser_request(http.Get, "/sessions/revoke-others"),
+      auth_ctx,
+      post_pubsub,
+    ).status
+    == 405
+
+  // Helper: log in a browser session with a custom User-Agent
+  let login_as = fn(login_id: String, ua: String) {
+    let page_req = simulate.browser_request(http.Get, "/auth/login")
+    let page_resp = router.handle_request(page_req, auth_ctx, post_pubsub)
+    let token = extract_form_csrf_token(simulate.read_body(page_resp))
+    let req =
+      simulate.browser_request(http.Post, "/auth/password/login")
+      |> simulate.session(page_req, page_resp)
+      |> request.set_header("user-agent", ua)
+      |> simulate.form_body([
+        #(csrf.form_field_name, token),
+        #("login_id", login_id),
+        #("password", "secretpass123"),
+      ])
+    let resp = router.handle_request(req, auth_ctx, post_pubsub)
+    assert resp.status == 303
+    #(req, resp)
+  }
+
+  let #(a1_req, a1_resp) =
+    login_as("alice_sess", "Mozilla/5.0 (Macintosh) Chrome/130.0")
+  let #(a2_req, a2_resp) =
+    login_as("alice_sess", "Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0")
+  let #(a3_req, a3_resp) = login_as("alice_sess", "curl/8.5.0")
+  let #(bob_req, bob_resp) =
+    login_as("bob_sess", "Mozilla/5.0 (Windows NT 10.0) Edg/130.0")
+
+  let a1_check =
+    simulate.browser_request(http.Get, "/")
+    |> simulate.session(a1_req, a1_resp)
+  let assert Some(a1_sid) = session.session_id(a1_check, secret)
+  let a2_check =
+    simulate.browser_request(http.Get, "/")
+    |> simulate.session(a2_req, a2_resp)
+  let assert Some(a2_sid) = session.session_id(a2_check, secret)
+  let a3_check =
+    simulate.browser_request(http.Get, "/")
+    |> simulate.session(a3_req, a3_resp)
+  let assert Some(a3_sid) = session.session_id(a3_check, secret)
+
+  // Alice views /sessions from device 1
+  let list_req =
+    simulate.browser_request(http.Get, "/sessions")
+    |> simulate.session(a1_req, a1_resp)
+  let list_resp = router.handle_request(list_req, auth_ctx, post_pubsub)
+  assert list_resp.status == 200
+  assert response.get_header(list_resp, "cache-control") == Ok("no-store")
+  let list_body = simulate.read_body(list_resp)
+  assert string.contains(list_body, "3 active sessions")
+  assert string.contains(list_body, "Chrome on macOS")
+  assert string.contains(list_body, "Firefox on Linux")
+  assert string.contains(list_body, "curl")
+  assert string.contains(list_body, "Current")
+  assert string.contains(list_body, "/sessions/revoke-others")
+  // Raw internal session IDs must NEVER appear in the rendered HTML
+  assert !string.contains(list_body, a1_sid)
+  assert !string.contains(list_body, a2_sid)
+  assert !string.contains(list_body, a3_sid)
+
+  let assert Ok(alice_sessions) =
+    session.list_active_for_user(tx, alice.id, a1_sid)
+  let assert Ok(a2_info) =
+    list.find(alice_sessions, fn(s) {
+      string.contains(s.user_agent, "Firefox/131.0")
+    })
+  let assert Ok(a1_info) = list.find(alice_sessions, fn(s) { s.is_current })
+  let a2_revoke_path = "/sessions/" <> a2_info.public_id <> "/revoke"
+  assert string.contains(list_body, a2_revoke_path)
+
+  let alice_csrf = extract_form_csrf_token(list_body)
+
+  // Missing CSRF on revoke -> 403
+  let no_csrf_resp =
+    simulate.browser_request(http.Post, a2_revoke_path)
+    |> simulate.session(list_req, list_resp)
+    |> simulate.form_body([])
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert no_csrf_resp.status == 403
+
+  // Unauthenticated POST with valid CSRF cookie -> 401
+  let anon_page_req = simulate.browser_request(http.Get, "/auth/login")
+  let anon_page_resp =
+    router.handle_request(anon_page_req, auth_ctx, post_pubsub)
+  let anon_csrf = extract_form_csrf_token(simulate.read_body(anon_page_resp))
+  let unauth_revoke_resp =
+    simulate.browser_request(http.Post, a2_revoke_path)
+    |> simulate.session(anon_page_req, anon_page_resp)
+    |> simulate.form_body([#(csrf.form_field_name, anon_csrf)])
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert unauth_revoke_resp.status == 401
+
+  // Bob cannot revoke Alice's session -> 404
+  let bob_list_req =
+    simulate.browser_request(http.Get, "/sessions")
+    |> simulate.session(bob_req, bob_resp)
+  let bob_list_resp = router.handle_request(bob_list_req, auth_ctx, post_pubsub)
+  let bob_csrf = extract_form_csrf_token(simulate.read_body(bob_list_resp))
+  let bob_revoke_resp =
+    simulate.browser_request(http.Post, a2_revoke_path)
+    |> simulate.session(bob_list_req, bob_list_resp)
+    |> simulate.form_body([#(csrf.form_field_name, bob_csrf)])
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert bob_revoke_resp.status == 404
+  assert session.current_user(a2_check, tx, secret) == Some(alice)
+
+  // Alice revokes device 2 -> 303 to /sessions, publishes a2_sid to PubSub, invalidates a2
+  let revoke_one_resp =
+    simulate.browser_request(http.Post, a2_revoke_path)
+    |> simulate.session(list_req, list_resp)
+    |> simulate.form_body([#(csrf.form_field_name, alice_csrf)])
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert revoke_one_resp.status == 303
+  assert response.get_header(revoke_one_resp, "location") == Ok("/sessions")
+  assert process.receive(revocation_sub, 100) == Ok(a2_sid)
+  assert session.current_user(a2_check, tx, secret) == None
+  assert session.current_user(a1_check, tx, secret) == Some(alice)
+
+  // Alice revokes all other sessions -> publishes a3_sid, leaves only a1 active
+  let revoke_others_resp =
+    simulate.browser_request(http.Post, "/sessions/revoke-others")
+    |> simulate.session(list_req, list_resp)
+    |> simulate.form_body([#(csrf.form_field_name, alice_csrf)])
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert revoke_others_resp.status == 303
+  assert response.get_header(revoke_others_resp, "location") == Ok("/sessions")
+  assert process.receive(revocation_sub, 100) == Ok(a3_sid)
+  assert session.current_user(a3_check, tx, secret) == None
+  assert session.current_user(a1_check, tx, secret) == Some(alice)
+
+  // With only 1 active session left, /sessions omits the Revoke other sessions form
+  let after_others_resp = router.handle_request(list_req, auth_ctx, post_pubsub)
+  let after_others_body = simulate.read_body(after_others_resp)
+  assert string.contains(after_others_body, "1 active session")
+  assert !string.contains(after_others_body, "/sessions/revoke-others")
+
+  // Revoking own current session via endpoint clears cookie, publishes a1_sid, redirects to /
+  let revoke_self_req =
+    simulate.browser_request(
+      http.Post,
+      "/sessions/" <> a1_info.public_id <> "/revoke",
+    )
+    |> simulate.session(list_req, list_resp)
+    |> simulate.form_body([#(csrf.form_field_name, alice_csrf)])
+  let revoke_self_resp =
+    router.handle_request(revoke_self_req, auth_ctx, post_pubsub)
+  assert revoke_self_resp.status == 303
+  assert response.get_header(revoke_self_resp, "location") == Ok("/")
+  assert process.receive(revocation_sub, 100) == Ok(a1_sid)
+  assert session.current_user(a1_check, tx, secret) == None
+}

@@ -15,13 +15,33 @@ import gleam/http/response
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
+import gleam/time/calendar
+import gleam/time/timestamp.{type Timestamp}
 import lote/auth/user.{type AuthUser, AuthUser}
+import lote/db/uuid
 import pog
 import wisp
 
 const cookie_name = "lote_session_id"
 
 const max_age_seconds = 604_800
+
+const max_user_agent_length = 512
+
+pub type ActiveSession {
+  ActiveSession(id: String, user: AuthUser)
+}
+
+pub type SessionInfo {
+  SessionInfo(
+    public_id: String,
+    user_agent: String,
+    created_at: Timestamp,
+    expires_at: Timestamp,
+    is_current: Bool,
+  )
+}
 
 pub fn create(
   resp: wisp.Response,
@@ -31,18 +51,26 @@ pub fn create(
   auth_user: AuthUser,
 ) -> Result(wisp.Response, pog.QueryError) {
   let session_id = wisp.random_string(32)
+  let user_agent =
+    req
+    |> request.get_header("user-agent")
+    |> result.unwrap("")
+    |> string.trim
+    |> string.slice(at_index: 0, length: max_user_agent_length)
 
   let query =
     [
       i.row([
         i.string(session_id),
         i.int(auth_user.id),
+        i.string(user_agent),
         i.fragment(f.literal("NOW() + INTERVAL '7 days'")),
       ]),
     ]
     |> i.from_values(table_name: "sessions", columns: [
       "id",
       "user_id",
+      "user_agent",
       "expires_at",
     ])
     |> i.to_query
@@ -69,11 +97,122 @@ pub fn destroy(
     }
     Error(_) -> Nil
   }
+  clear_cookie(resp, req, secret_key_base)
+}
+
+pub fn clear_cookie(
+  resp: wisp.Response,
+  req: wisp.Request,
+  secret_key_base: String,
+) -> wisp.Response {
   set_cookie(resp, req, "", secret_key_base, 0)
 }
 
-pub type ActiveSession {
-  ActiveSession(id: String, user: AuthUser)
+pub fn list_active_for_user(
+  db: pog.Connection,
+  user_id: Int,
+  current_session_id: String,
+) -> Result(List(SessionInfo), pog.QueryError) {
+  let query =
+    s.new()
+    |> s.from_table("sessions")
+    |> s.selects([
+      s.col("id"),
+      s.col("public_id"),
+      s.col("user_agent"),
+      s.col("created_at"),
+      s.col("expires_at"),
+    ])
+    |> s.where(
+      w.and([
+        w.eq(w.col("user_id"), w.int(user_id)),
+        w.gt(w.col("expires_at"), w.fragment_value(f.literal("NOW()"))),
+      ]),
+    )
+    |> s.order_by_desc("created_at")
+    |> s.order_by_desc("id")
+    |> s.to_query
+
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    use public_id <- decode.field(1, uuid.decoder())
+    use user_agent <- decode.field(2, decode.string)
+    use created_at <- decode.field(3, timestamptz_decoder())
+    use expires_at <- decode.field(4, timestamptz_decoder())
+    decode.success(SessionInfo(
+      public_id:,
+      user_agent:,
+      created_at:,
+      expires_at:,
+      is_current: id == current_session_id,
+    ))
+  }
+
+  postgres.run_read_query(query, decoder, db)
+}
+
+pub fn revoke_by_public_id(
+  db: pog.Connection,
+  public_id: String,
+  user_id: Int,
+) -> Result(Option(String), pog.QueryError) {
+  case uuid.normalize(public_id) {
+    Error(_) -> Ok(None)
+    Ok(normalized) -> {
+      let query =
+        d.new()
+        |> d.table("sessions")
+        |> d.where(
+          w.and([
+            w.eq(
+              w.col("public_id"),
+              w.fragment_value(
+                f.prepared(f.placeholder <> "::uuid", [f.string(normalized)]),
+              ),
+            ),
+            w.eq(w.col("user_id"), w.int(user_id)),
+          ]),
+        )
+        |> d.returning(["id"])
+        |> d.to_query
+
+      let decoder = {
+        use id <- decode.field(0, decode.string)
+        decode.success(id)
+      }
+
+      case postgres.run_write_query(query, decoder, db) {
+        Ok([id, ..]) -> Ok(Some(id))
+        Ok([]) -> Ok(None)
+        Error(err) -> Error(err)
+      }
+    }
+  }
+}
+
+pub fn revoke_others(
+  db: pog.Connection,
+  user_id: Int,
+  current_session_id: String,
+) -> Result(List(String), pog.QueryError) {
+  let query =
+    d.new()
+    |> d.table("sessions")
+    |> d.where(
+      w.and([
+        w.eq(w.col("user_id"), w.int(user_id)),
+        w.neq(w.col("id"), w.string(current_session_id)),
+      ]),
+    )
+    |> d.returning(["id"])
+    |> d.to_query
+
+  let decoder = {
+    use id <- decode.field(0, decode.string)
+    decode.success(id)
+  }
+
+  postgres.run_write_query(query, decoder, db)
 }
 
 pub fn session_id(
@@ -182,4 +321,10 @@ fn set_cookie(
   let signed =
     crypto.sign_message(<<value:utf8>>, <<secret_key_base:utf8>>, crypto.Sha512)
   response.set_cookie(resp, cookie_name, signed, attributes)
+}
+
+fn timestamptz_decoder() -> decode.Decoder(Timestamp) {
+  use date <- decode.field(0, pog.calendar_date_decoder())
+  use time <- decode.field(1, pog.calendar_time_of_day_decoder())
+  decode.success(timestamp.from_calendar(date, time, calendar.utc_offset))
 }

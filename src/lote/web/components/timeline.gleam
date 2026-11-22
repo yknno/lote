@@ -588,6 +588,15 @@ fn account_bar(
         html.span([attribute.class("font-medium text-neutral-900")], [
           html.text(u.name),
         ]),
+        html.a(
+          [
+            attribute.href("/sessions"),
+            attribute.class(
+              "text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
+            ),
+          ],
+          [html.text("Sessions")],
+        ),
         html.form([attribute.method("post"), attribute.action("/auth/logout")], [
           html.input([
             attribute.type_("hidden"),

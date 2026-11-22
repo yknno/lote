@@ -10,6 +10,7 @@ import lote/web/auth/handler as auth_handler
 import lote/web/components/timeline
 import lote/web/csrf
 import lote/web/post/view as post_view
+import lote/web/sessions/handler as sessions_handler
 import lustre/attribute
 import lustre/element
 import lustre/element/html
@@ -87,6 +88,8 @@ pub fn handle_request(
       }
     }
     _, ["posts", _, "delete"] -> wisp.method_not_allowed([http.Post])
+    _, ["sessions", ..rest] ->
+      sessions_handler.handle_request(req, rest, auth_ctx)
     _, ["auth", ..rest] -> auth_handler.handle_request(req, rest, auth_ctx)
     _, ["health"] -> wisp.response(200) |> wisp.string_body("ok")
     _, _ -> wisp.not_found()
