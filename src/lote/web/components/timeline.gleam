@@ -661,9 +661,11 @@ fn feed(
       ])
 
     _ ->
-      html.ul(
+      keyed.ul(
         [attribute.class("divide-y divide-neutral-200")],
-        list.map(posts, post_row(_, current_user, confirming_delete)),
+        list.map(posts, fn(post) {
+          #(post.id, post_row(post, current_user, confirming_delete))
+        }),
       )
   }
 }

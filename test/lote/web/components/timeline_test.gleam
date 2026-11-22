@@ -670,3 +670,66 @@ pub fn timeline_without_older_posts_omits_sentinel_test() {
 
   shutdown_and_wait(component)
 }
+
+pub fn keyed_feed_prepends_and_deletes_without_rewriting_existing_posts_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(p1) = post_repo.create(tx, alice.id, "existing-post-alpha")
+  let assert Ok(p2) = post_repo.create(tx, alice.id, "existing-post-beta")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let assert Ok(component) =
+    lustre.start_server_component(
+      timeline.app(),
+      timeline.Flags(
+        db: tx,
+        pubsub: post_pubsub,
+        user: Some(alice),
+        csrf_token: "test-csrf-token",
+      ),
+    )
+
+  let client = process.new_subject()
+  server_component.register_subject(client)
+  |> lustre.send(to: component)
+
+  let mount_payload = receive_json(client)
+  assert string.contains(mount_payload, "existing-post-alpha")
+  assert string.contains(mount_payload, "existing-post-beta")
+
+  // Enable Live auto-refresh so incoming posts are prepended immediately
+  lustre.dispatch(timeline.UserToggledAutoRefresh)
+  |> lustre.send(to: component)
+  let _live_on = receive_json(client)
+
+  // Prepending a new post should emit an Insert patch for p3 only,
+  // without rewriting existing p1/p2 rows.
+  let assert Ok(p3) = post_repo.create(tx, alice.id, "new-post-gamma")
+  pubsub.publish(
+    post_pubsub,
+    timeline.Created(timeline.Post(
+      id: p3.id,
+      user_id: alice.id,
+      author_name: alice.name,
+      body: p3.body,
+      created_at: p3.created_at,
+    )),
+  )
+  let prepend_patch = receive_json(client)
+  assert string.contains(prepend_patch, "new-post-gamma")
+  assert !string.contains(prepend_patch, "existing-post-alpha")
+  assert !string.contains(prepend_patch, "existing-post-beta")
+  assert !string.contains(prepend_patch, p1.id)
+  assert !string.contains(prepend_patch, p2.id)
+
+  // Deleting the newest post should emit a Remove patch without rewriting p1/p2.
+  pubsub.publish(post_pubsub, timeline.Deleted(p3.id))
+  let delete_patch = receive_json(client)
+  assert !string.contains(delete_patch, "existing-post-alpha")
+  assert !string.contains(delete_patch, "existing-post-beta")
+  assert !string.contains(delete_patch, p1.id)
+  assert !string.contains(delete_patch, p2.id)
+
+  shutdown_and_wait(component)
+}
