@@ -1,11 +1,29 @@
 import gleam/dict.{type Dict}
-import gleam/erlang/process.{type Monitor, type Subject}
+import gleam/dynamic/decode
+import gleam/erlang/atom
+import gleam/erlang/process.{type Monitor, type Pid, type Subject}
 import gleam/otp/actor
+import gleam/result
+import pog
+
+pub type Adapter(event) {
+  Memory
+  Postgres(
+    db: pog.Connection,
+    database_url: String,
+    channel: String,
+    encode: fn(event) -> String,
+    decode: fn(String) -> Result(event, Nil),
+  )
+}
 
 pub opaque type Message(event) {
   Subscribe(Subject(event))
   Unsubscribe(Subject(event))
   Publish(event)
+  BroadcastLocal(event)
+  ReceivePayload(String)
+  Ignore
   SubscriberDown(Monitor)
   Count(Subject(Int))
 }
@@ -13,15 +31,64 @@ pub opaque type Message(event) {
 pub type PubSub(event) =
   Subject(Message(event))
 
+type State(event) {
+  State(subscribers: Dict(Subject(event), Monitor), adapter: Adapter(event))
+}
+
+@external(erlang, "lote_pubsub_ffi", "start_and_listen")
+fn start_pg_listener(config: pog.Config, channel: String) -> Result(Pid, String)
+
 pub fn start() -> Result(PubSub(event), actor.StartError) {
+  start_with_adapter(Memory)
+}
+
+pub fn start_with_adapter(
+  adapter: Adapter(event),
+) -> Result(PubSub(event), actor.StartError) {
   case
-    actor.new_with_initialiser(1000, fn(self) {
-      let selector =
+    actor.new_with_initialiser(5000, fn(self) {
+      use _listener <- result.try(case adapter {
+        Memory -> Ok(Nil)
+        Postgres(database_url:, channel:, ..) -> {
+          let pool_name = process.new_name("lote_pubsub_listen")
+          case pog.url_config(pool_name, database_url) {
+            Error(_) -> Error("invalid database_url for Postgres PubSub")
+            Ok(db_config) -> {
+              let db_config =
+                pog.connection_parameter(db_config, "timezone", "UTC")
+              case start_pg_listener(db_config, channel) {
+                Ok(_pid) -> Ok(Nil)
+                Error(err) -> Error(err)
+              }
+            }
+          }
+        }
+      })
+
+      let base_selector =
         process.new_selector()
         |> process.select(self)
         |> process.select_monitors(fn(down) { SubscriberDown(down.monitor) })
 
-      actor.initialised(dict.new())
+      let selector = case adapter {
+        Memory -> base_selector
+        Postgres(channel: expected_channel, ..) ->
+          base_selector
+          |> process.select_record(atom.create("notification"), 4, fn(record) {
+            let notification_decoder = {
+              use ch <- decode.field(3, decode.string)
+              use payload <- decode.field(4, decode.string)
+              decode.success(#(ch, payload))
+            }
+            case decode.run(record, notification_decoder) {
+              Ok(#(ch, payload)) if ch == expected_channel ->
+                ReceivePayload(payload)
+              _ -> Ignore
+            }
+          })
+      }
+
+      actor.initialised(State(subscribers: dict.new(), adapter:))
       |> actor.selecting(selector)
       |> actor.returning(self)
       |> Ok
@@ -46,56 +113,110 @@ pub fn publish(pubsub: PubSub(event), event: event) -> Nil {
   process.send(pubsub, Publish(event))
 }
 
+pub fn broadcast_local(pubsub: PubSub(event), event: event) -> Nil {
+  process.send(pubsub, BroadcastLocal(event))
+}
+
+pub fn receive_payload(pubsub: PubSub(event), payload: String) -> Nil {
+  process.send(pubsub, ReceivePayload(payload))
+}
+
 pub fn subscriber_count(pubsub: PubSub(event)) -> Int {
   actor.call(pubsub, waiting: 1000, sending: Count)
 }
 
+pub fn pg_notify(
+  db: pog.Connection,
+  channel: String,
+  payload: String,
+) -> Result(Nil, pog.QueryError) {
+  pog.query("SELECT pg_notify($1, $2)::text")
+  |> pog.parameter(pog.text(channel))
+  |> pog.parameter(pog.text(payload))
+  |> pog.returning(decode.dynamic)
+  |> pog.execute(db)
+  |> result.replace(Nil)
+}
+
 fn handle_message(
-  subscribers: Dict(Subject(event), Monitor),
+  state: State(event),
   message: Message(event),
-) -> actor.Next(Dict(Subject(event), Monitor), Message(event)) {
+) -> actor.Next(State(event), Message(event)) {
   case message {
     Subscribe(subscriber) ->
-      case dict.has_key(subscribers, subscriber) {
-        True -> actor.continue(subscribers)
+      case dict.has_key(state.subscribers, subscriber) {
+        True -> actor.continue(state)
         False ->
           case process.subject_owner(subscriber) {
-            Error(_) -> actor.continue(subscribers)
+            Error(_) -> actor.continue(state)
             Ok(pid) -> {
               let monitor = process.monitor(pid)
-              subscribers
-              |> dict.insert(subscriber, monitor)
-              |> actor.continue
+              let subscribers =
+                dict.insert(state.subscribers, subscriber, monitor)
+              actor.continue(State(..state, subscribers:))
             }
           }
       }
 
     Unsubscribe(subscriber) ->
-      case dict.get(subscribers, subscriber) {
+      case dict.get(state.subscribers, subscriber) {
         Ok(monitor) -> {
           process.demonitor_process(monitor)
-          subscribers
-          |> dict.delete(subscriber)
-          |> actor.continue
+          let subscribers = dict.delete(state.subscribers, subscriber)
+          actor.continue(State(..state, subscribers:))
         }
-        Error(_) -> actor.continue(subscribers)
+        Error(_) -> actor.continue(state)
       }
 
     Publish(event) -> {
-      dict.each(subscribers, fn(subscriber, _) {
-        process.send(subscriber, event)
-      })
-      actor.continue(subscribers)
+      case state.adapter {
+        Memory -> deliver_to_subscribers(state.subscribers, event)
+        Postgres(db:, channel:, encode:, ..) -> {
+          let payload = encode(event)
+          case pg_notify(db, channel, payload) {
+            Ok(_) -> Nil
+            Error(_) -> deliver_to_subscribers(state.subscribers, event)
+          }
+        }
+      }
+      actor.continue(state)
     }
 
-    SubscriberDown(monitor) ->
-      subscribers
-      |> dict.filter(fn(_, m) { m != monitor })
-      |> actor.continue
+    BroadcastLocal(event) -> {
+      deliver_to_subscribers(state.subscribers, event)
+      actor.continue(state)
+    }
+
+    ReceivePayload(payload) -> {
+      case state.adapter {
+        Memory -> Nil
+        Postgres(decode:, ..) ->
+          case decode(payload) {
+            Ok(event) -> deliver_to_subscribers(state.subscribers, event)
+            Error(_) -> Nil
+          }
+      }
+      actor.continue(state)
+    }
+
+    Ignore -> actor.continue(state)
+
+    SubscriberDown(monitor) -> {
+      let subscribers =
+        dict.filter(state.subscribers, fn(_, m) { m != monitor })
+      actor.continue(State(..state, subscribers:))
+    }
 
     Count(reply_to) -> {
-      process.send(reply_to, dict.size(subscribers))
-      actor.continue(subscribers)
+      process.send(reply_to, dict.size(state.subscribers))
+      actor.continue(state)
     }
   }
+}
+
+fn deliver_to_subscribers(
+  subscribers: Dict(Subject(event), Monitor),
+  event: event,
+) -> Nil {
+  dict.each(subscribers, fn(subscriber, _) { process.send(subscriber, event) })
 }

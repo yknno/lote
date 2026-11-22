@@ -32,11 +32,17 @@ pub fn main() -> Nil {
     list.filter_map(cfg.auth_adapters, fn(name) {
       case name {
         "password" -> Ok(Password)
-        _ -> Error(Nil)
+        other -> {
+          wisp.log_warning(
+            "Unknown AUTH_ADAPTERS entry \"" <> other <> "\", ignoring",
+          )
+          Error(Nil)
+        }
       }
     })
 
-  let assert Ok(session_revocations) = pubsub.start()
+  let assert Ok(session_revocations) =
+    start_session_revocations_pubsub(cfg.pubsub_adapter, db, cfg.database_url)
   let auth_ctx =
     Auth(
       db:,
@@ -45,7 +51,8 @@ pub fn main() -> Nil {
       session_revocations:,
     )
 
-  let assert Ok(post_pubsub) = pubsub.start()
+  let assert Ok(post_pubsub) =
+    start_post_pubsub(cfg.pubsub_adapter, db, cfg.database_url)
 
   let assert Ok(_) =
     handler(db, post_pubsub, auth_ctx)
@@ -55,6 +62,53 @@ pub fn main() -> Nil {
     |> mist.start
 
   process.sleep_forever()
+}
+
+pub const session_revocations_channel = "lote_session_revocations"
+
+pub const post_events_channel = "lote_post_events"
+
+pub fn start_session_revocations_pubsub(
+  adapter_kind: config.PubSubAdapter,
+  db: pog.Connection,
+  database_url: String,
+) {
+  let adapter = case adapter_kind {
+    config.MemoryPubSub -> pubsub.Memory
+    config.PostgresPubSub ->
+      pubsub.Postgres(
+        db:,
+        database_url:,
+        channel: session_revocations_channel,
+        encode: fn(id) { id },
+        decode: fn(raw) {
+          case raw {
+            "" -> Error(Nil)
+            id -> Ok(id)
+          }
+        },
+      )
+  }
+  pubsub.start_with_adapter(adapter)
+}
+
+pub fn start_post_pubsub(
+  adapter_kind: config.PubSubAdapter,
+  db: pog.Connection,
+  database_url: String,
+) {
+  let adapter = case adapter_kind {
+    config.MemoryPubSub -> pubsub.Memory
+    config.PostgresPubSub ->
+      pubsub.Postgres(
+        db:,
+        database_url:,
+        channel: post_events_channel,
+        encode: timeline.encode_post_event,
+        decode: timeline.decode_post_event,
+      )
+  }
+  pubsub.start_with_adapter(adapter)
 }
 
 pub fn handler(

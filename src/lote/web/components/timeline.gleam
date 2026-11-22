@@ -1,9 +1,11 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/int
+import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/order
+import gleam/result
 import gleam/string
 import gleam/time/timestamp.{type Timestamp}
 import lote/auth/user.{type AuthUser}
@@ -36,6 +38,60 @@ pub type Post {
 pub type PostEvent {
   Created(Post)
   Deleted(String)
+}
+
+pub fn encode_post_event(event: PostEvent) -> String {
+  case event {
+    Created(post) -> {
+      let #(seconds, nanoseconds) =
+        timestamp.to_unix_seconds_and_nanoseconds(post.created_at)
+      json.object([
+        #("type", json.string("created")),
+        #("id", json.string(post.id)),
+        #("user_id", json.int(post.user_id)),
+        #("author_name", json.string(post.author_name)),
+        #("body", json.string(post.body)),
+        #("created_at_seconds", json.int(seconds)),
+        #("created_at_nanoseconds", json.int(nanoseconds)),
+      ])
+      |> json.to_string
+    }
+    Deleted(id) ->
+      json.object([
+        #("type", json.string("deleted")),
+        #("id", json.string(id)),
+      ])
+      |> json.to_string
+  }
+}
+
+pub fn decode_post_event(payload: String) -> Result(PostEvent, Nil) {
+  let decoder = {
+    use event_type <- decode.field("type", decode.string)
+    case event_type {
+      "created" -> {
+        use id <- decode.field("id", decode.string)
+        use user_id <- decode.field("user_id", decode.int)
+        use author_name <- decode.field("author_name", decode.string)
+        use body <- decode.field("body", decode.string)
+        use seconds <- decode.field("created_at_seconds", decode.int)
+        use nanoseconds <- decode.field("created_at_nanoseconds", decode.int)
+        let created_at =
+          timestamp.from_unix_seconds_and_nanoseconds(seconds, nanoseconds)
+        decode.success(
+          Created(Post(id:, user_id:, author_name:, body:, created_at:)),
+        )
+      }
+      "deleted" -> {
+        use id <- decode.field("id", decode.string)
+        decode.success(Deleted(id))
+      }
+      _ -> decode.failure(Deleted(""), "PostEvent")
+    }
+  }
+
+  json.parse(payload, decoder)
+  |> result.replace_error(Nil)
 }
 
 pub type Flags {
