@@ -267,6 +267,18 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               effect.none(),
             )
 
+            Error(post_repo.BodyTooLarge(max_bytes:, ..)) -> #(
+              Model(
+                ..model,
+                form_error: Some(
+                  "Post is too large (max "
+                  <> int.to_string(max_bytes)
+                  <> " bytes).",
+                ),
+              ),
+              effect.none(),
+            )
+
             Error(post_repo.BodyTooLong(length:, max:)) -> #(
               Model(
                 ..model,

@@ -1,3 +1,5 @@
+import gleam/bit_array
+import gleam/dynamic/decode
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/order
@@ -5,6 +7,7 @@ import gleam/string
 import lote/auth/user
 import lote/db/post_repo
 import lote/test_helper
+import pog
 
 pub fn create_and_list_recent_returns_posts_in_descending_id_order_test() {
   use tx <- test_helper.with_db
@@ -139,4 +142,92 @@ pub fn validate_body_and_create_enforce_length_limit_test() {
         max: post_repo.max_body_length,
       )),
     )
+}
+
+pub fn validate_body_rejects_oversized_byte_payloads_before_grapheme_count_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "BytesAuthor")
+
+  // 300 ZWJ family emojis (7,500 UTF-8 bytes <= 16,384) succeeds cleanly
+  let exact_300_emojis = string.repeat("👨‍👩‍👧‍👦", post_repo.max_body_length)
+  assert string.length(exact_300_emojis) == post_repo.max_body_length
+  assert bit_array.byte_size(<<exact_300_emojis:utf8>>)
+    < post_repo.max_body_bytes
+  let assert Ok(created) = post_repo.create(tx, author.id, exact_300_emojis)
+  assert created.body == exact_300_emojis
+
+  // Combining-mark bomb: 1 grapheme, but > 16,384 UTF-8 bytes -> rejected before grapheme scan
+  let zalgo_bomb = "a" <> string.repeat("\u{0301}", 9000)
+  let zalgo_bytes = bit_array.byte_size(<<zalgo_bomb:utf8>>)
+  assert zalgo_bytes > post_repo.max_body_bytes
+  assert post_repo.validate_body(zalgo_bomb)
+    == Error(post_repo.BodyTooLarge(
+      bytes: zalgo_bytes,
+      max_bytes: post_repo.max_body_bytes,
+    ))
+  assert post_repo.create(tx, author.id, zalgo_bomb)
+    == Error(
+      post_repo.InvalidBody(post_repo.BodyTooLarge(
+        bytes: zalgo_bytes,
+        max_bytes: post_repo.max_body_bytes,
+      )),
+    )
+
+  // Huge whitespace-padded raw payload exceeds max_raw_body_bytes before trimming
+  let huge_raw = string.repeat(" ", post_repo.max_raw_body_bytes) <> "hi"
+  let huge_raw_bytes = bit_array.byte_size(<<huge_raw:utf8>>)
+  assert huge_raw_bytes > post_repo.max_raw_body_bytes
+  assert post_repo.validate_body(huge_raw)
+    == Error(post_repo.BodyTooLarge(
+      bytes: huge_raw_bytes,
+      max_bytes: post_repo.max_body_bytes,
+    ))
+}
+
+pub fn validate_body_trims_unicode_whitespace_including_fullwidth_space_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "FullwidthAuthor")
+
+  // Full-width spaces (U+3000) alone are treated as EmptyBody
+  assert post_repo.validate_body("　　\t\n ") == Error(post_repo.EmptyBody)
+  assert post_repo.create(tx, author.id, "　")
+    == Error(post_repo.InvalidBody(post_repo.EmptyBody))
+
+  // Leading/trailing full-width spaces are trimmed while inner ones are preserved
+  assert post_repo.validate_body("　こんに　ちは　") == Ok("こんに　ちは")
+
+  // Full-width space surrounding a 300-grapheme post still fits within 300 graphemes
+  let exact_300 = string.repeat("あ", post_repo.max_body_length)
+  assert post_repo.validate_body("　" <> exact_300 <> "　") == Ok(exact_300)
+}
+
+pub fn posts_body_check_constraint_enforces_non_blank_and_byte_limit_in_db_test() {
+  // Direct SQL insert of blank ASCII / tab / newline / full-width space violates posts_body_check
+  {
+    use tx <- test_helper.with_db
+    let assert Ok(author) = user.create(tx, "CheckBlankAuthor")
+    let assert Error(pog.ConstraintViolated(_, constraint: blank_constraint, ..)) =
+      pog.query("INSERT INTO posts (user_id, body) VALUES ($1, $2)")
+      |> pog.parameter(pog.int(author.id))
+      |> pog.parameter(pog.text("   \t\n　"))
+      |> pog.returning(decode.dynamic)
+      |> pog.execute(tx)
+    assert blank_constraint == "posts_body_check"
+  }
+
+  // Direct SQL insert exceeding 16,384 bytes must violate posts_body_check
+  {
+    use tx <- test_helper.with_db
+    let assert Ok(author) = user.create(tx, "CheckSizeAuthor")
+    let over_bytes = string.repeat("a", post_repo.max_body_bytes + 1)
+    let assert Error(pog.ConstraintViolated(_, constraint: size_constraint, ..)) =
+      pog.query("INSERT INTO posts (user_id, body) VALUES ($1, $2)")
+      |> pog.parameter(pog.int(author.id))
+      |> pog.parameter(pog.text(over_bytes))
+      |> pog.returning(decode.dynamic)
+      |> pog.execute(tx)
+    assert size_constraint == "posts_body_check"
+  }
 }
