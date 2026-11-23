@@ -2,11 +2,14 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http
 import gleam/option.{None, Some}
+import gleam/time/duration
+import gleam/time/timestamp
 import gleeunit
 import lote
 import lote/auth.{Auth, Password}
 import lote/auth/session
 import lote/auth/user
+import lote/db/post_repo
 import lote/realtime/pubsub
 import lote/test_helper
 import lustre/server_component
@@ -157,6 +160,87 @@ pub fn ws_handle_message_ignores_malformed_json_and_stops_on_close_test() {
     == mist.stop()
   assert lote.ws_handle_message(state, mist.Shutdown, fn(_) { Nil })
     == mist.stop()
+
+  close_and_wait(state, post_pubsub)
+}
+
+pub fn ws_stops_when_session_expires_via_timer_and_blocks_text_frames_after_expiry_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+  let assert Ok(post_pubsub) = pubsub.start()
+  let assert Ok(created) = user.create(tx, "ExpiringWsUser")
+
+  let secret = "expiring_ws_test_secret_key_base_0123456789abcdefghijkl"
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: secret,
+      methods: [Password],
+      session_revocations:,
+    )
+
+  let login_req = simulate.browser_request(http.Post, "/auth/password/login")
+  let assert Ok(login_resp) =
+    session.create(wisp.ok(), login_req, tx, secret, created)
+
+  let ws_req =
+    simulate.browser_request(http.Get, "/ws")
+    |> simulate.session(login_req, login_resp)
+  let assert Some(sid) = session.session_id(ws_req, secret)
+
+  // Shorten the session lifetime so the WS expiry timer fires quickly
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE sessions SET expires_at = NOW() + INTERVAL '150 milliseconds' WHERE id = $1",
+    )
+    |> pog.parameter(pog.text(sid))
+    |> pog.returning(decode.dynamic)
+    |> pog.execute(tx)
+
+  let assert #(state, Some(selector)) =
+    lote.ws_init(ws_req, tx, post_pubsub, auth_ctx)
+  assert state.session_id == Some(sid)
+  let assert Some(_expires_at) = state.session_expires_at
+  let assert Some(_timer) = state.expiry_timer
+
+  // Drain initial mount message
+  let assert Ok(lote.ComponentMessage(_)) =
+    process.selector_receive(selector, 500)
+
+  // Wait for the expiry timer to fire SessionExpired
+  let assert Ok(expired_msg) = process.selector_receive(selector, 1000)
+  assert expired_msg == lote.SessionExpired
+
+  // Handling SessionExpired stops the WebSocket
+  assert lote.ws_handle_message(state, mist.Custom(lote.SessionExpired), fn(_) {
+      Nil
+    })
+    == mist.stop()
+
+  // Even before SessionExpired is handled, incoming Text frames after expires_at
+  // must stop the WebSocket without forwarding to the Lustre component
+  let past = timestamp.subtract(timestamp.system_time(), duration.seconds(1))
+  let expired_state = lote.WsState(..state, session_expires_at: Some(past))
+  assert lote.ws_handle_message(
+      expired_state,
+      mist.Text(
+        "{\"kind\":4,\"path\":\"0\t0\t1\t0\",\"name\":\"submit\",\"event\":{\"body\":\"should not post\"}}",
+      ),
+      fn(_) { Nil },
+    )
+    == mist.stop()
+  assert post_repo.list_recent(tx, 10) == Ok([])
+
+  // An early SessionExpired tick before expires_at re-arms the timer and continues
+  let future = timestamp.add(timestamp.system_time(), duration.hours(2))
+  let future_state = lote.WsState(..state, session_expires_at: Some(future))
+  let next =
+    lote.ws_handle_message(
+      future_state,
+      mist.Custom(lote.SessionExpired),
+      fn(_) { Nil },
+    )
+  assert next != mist.stop()
 
   close_and_wait(state, post_pubsub)
 }

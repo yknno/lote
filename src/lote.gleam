@@ -2,11 +2,15 @@ import gleam/bytes_tree
 import gleam/erlang/process.{type Subject}
 import gleam/http/request.{type Request}
 import gleam/http/response.{type Response}
+import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/order
 import gleam/otp/static_supervisor as supervisor
 import gleam/result
+import gleam/time/duration
+import gleam/time/timestamp.{type Timestamp}
 import lote/auth.{type Auth, Auth, Password}
 import lote/auth/session
 import lote/config
@@ -163,9 +167,12 @@ pub fn handler(
   }
 }
 
+const max_expiry_timer_ms = 86_400_000
+
 pub type WsMsg {
   ComponentMessage(server_component.ClientMessage(timeline.Msg))
   SessionRevoked(String)
+  SessionExpired
 }
 
 pub type WsState {
@@ -173,6 +180,9 @@ pub type WsState {
     component: lustre.Runtime(timeline.Msg),
     self: Subject(server_component.ClientMessage(timeline.Msg)),
     session_id: Option(String),
+    session_expires_at: Option(Timestamp),
+    expiry_subject: Option(Subject(Nil)),
+    expiry_timer: Option(process.Timer),
   )
 }
 
@@ -218,16 +228,33 @@ pub fn ws_init(
 
   let active_session =
     session.current_session(req, auth_ctx.db, auth_ctx.secret_key_base)
-  let #(current_user, session_id, has_revocation_sub) = case active_session {
-    Some(active) -> #(Some(active.user), Some(active.id), True)
+  let #(current_user, session_id, session_expires_at, has_revocation_sub) = case
+    active_session
+  {
+    Some(active) -> #(
+      Some(active.user),
+      Some(active.id),
+      Some(active.expires_at),
+      True,
+    )
     None -> {
       case candidate_session_id {
         Some(_) ->
           pubsub.unsubscribe(auth_ctx.session_revocations, revocation_sub)
         None -> Nil
       }
-      #(None, None, False)
+      #(None, None, None, False)
     }
+  }
+
+  let #(expiry_subject, expiry_timer) = case session_expires_at {
+    Some(expires_at) -> {
+      let subject = process.new_subject()
+      let timer =
+        schedule_expiry_timer(subject, expires_at, timestamp.system_time())
+      #(Some(subject), Some(timer))
+    }
+    None -> #(None, None)
   }
 
   let csrf_token =
@@ -247,11 +274,27 @@ pub fn ws_init(
       |> process.select_map(revocation_sub, SessionRevoked)
     False -> selector
   }
+  let selector = case expiry_subject {
+    Some(subject) ->
+      selector
+      |> process.select_map(subject, fn(_) { SessionExpired })
+    None -> selector
+  }
 
   server_component.register_subject(self)
   |> lustre.send(to: component)
 
-  #(WsState(component:, self:, session_id:), Some(selector))
+  #(
+    WsState(
+      component:,
+      self:,
+      session_id:,
+      session_expires_at:,
+      expiry_subject:,
+      expiry_timer:,
+    ),
+    Some(selector),
+  )
 }
 
 pub fn ws_handle_message(
@@ -260,13 +303,19 @@ pub fn ws_handle_message(
   send_text: fn(String) -> Nil,
 ) -> mist.Next(WsState, WsMsg) {
   case msg {
-    mist.Text(text) -> {
-      case json.parse(text, server_component.runtime_message_decoder()) {
-        Ok(runtime_msg) -> lustre.send(state.component, runtime_msg)
-        Error(_) -> Nil
+    mist.Text(text) ->
+      case
+        is_session_expired(state.session_expires_at, timestamp.system_time())
+      {
+        True -> mist.stop()
+        False -> {
+          case json.parse(text, server_component.runtime_message_decoder()) {
+            Ok(runtime_msg) -> lustre.send(state.component, runtime_msg)
+            Error(_) -> Nil
+          }
+          mist.continue(state)
+        }
       }
-      mist.continue(state)
-    }
 
     mist.Custom(ComponentMessage(client_msg)) -> {
       let payload =
@@ -283,12 +332,64 @@ pub fn ws_handle_message(
         _ -> mist.continue(state)
       }
 
+    mist.Custom(SessionExpired) ->
+      case state.session_expires_at, state.expiry_subject {
+        Some(expires_at), Some(subject) -> {
+          let now = timestamp.system_time()
+          case is_session_expired(Some(expires_at), now) {
+            True -> mist.stop()
+            False -> {
+              let timer = schedule_expiry_timer(subject, expires_at, now)
+              mist.continue(WsState(..state, expiry_timer: Some(timer)))
+            }
+          }
+        }
+        _, _ -> mist.continue(state)
+      }
+
     mist.Binary(_) -> mist.continue(state)
     mist.Closed | mist.Shutdown -> mist.stop()
   }
 }
 
 pub fn ws_close(state: WsState) -> Nil {
+  case state.expiry_timer {
+    Some(timer) -> {
+      let _ = process.cancel_timer(timer)
+      Nil
+    }
+    None -> Nil
+  }
   lustre.send(state.component, server_component.deregister_subject(state.self))
   lustre.send(state.component, lustre.shutdown())
+}
+
+fn is_session_expired(expires_at: Option(Timestamp), now: Timestamp) -> Bool {
+  case expires_at {
+    None -> False
+    Some(exp) ->
+      case timestamp.compare(now, exp) {
+        order.Lt -> False
+        order.Eq | order.Gt -> True
+      }
+  }
+}
+
+fn schedule_expiry_timer(
+  subject: Subject(Nil),
+  expires_at: Timestamp,
+  now: Timestamp,
+) -> process.Timer {
+  let delay_ms = case timestamp.compare(now, expires_at) {
+    order.Eq | order.Gt -> 0
+    order.Lt -> {
+      let remaining_ms =
+        timestamp.difference(now, expires_at)
+        |> duration.to_milliseconds
+      // Add a small buffer so sub-millisecond truncation and Erlang timer-wheel
+      // jitter do not routinely wake just before expires_at.
+      int.clamp(remaining_ms + 5, min: 1, max: max_expiry_timer_ms)
+    }
+  }
+  process.send_after(subject, delay_ms, Nil)
 }
