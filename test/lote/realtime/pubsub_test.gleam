@@ -473,9 +473,23 @@ pub fn supervised_named_pubsub_restarts_automatically_after_crash_test() {
   let assert Ok(original_pid) = process.named(name)
   let sub1 = process.new_subject()
   pubsub.subscribe(bus, sub1)
-  assert pubsub.subscriber_count(bus) == 1
 
-  // Force-kill the PubSub actor; the supervisor must restart it under the same name
+  // Also register a subscriber owned by a short-lived process that exits right as PubSub crashes
+  let ephemeral_ready = process.new_subject()
+  let ephemeral_pid =
+    process.spawn_unlinked(fn() {
+      let ephemeral_sub = process.new_subject()
+      pubsub.subscribe(bus, ephemeral_sub)
+      process.send(ephemeral_ready, Nil)
+      process.sleep_forever()
+    })
+  let assert Ok(Nil) = process.receive(ephemeral_ready, 200)
+  assert pubsub.subscriber_count(bus) == 2
+
+  // Kill the ephemeral subscriber and force-kill the PubSub actor;
+  // the supervisor must restart PubSub under the same name, restore living
+  // subscribers (sub1) without re-subscribing, and prune dead ones.
+  process.kill(ephemeral_pid)
   process.kill(original_pid)
 
   assert test_helper.wait_until(100, 10, fn() {
@@ -485,12 +499,49 @@ pub fn supervised_named_pubsub_restarts_automatically_after_crash_test() {
     }
   })
 
-  // The same named Subject continues working with the restarted actor
+  // Existing subscriber sub1 is automatically restored and receives events without re-subscribing
+  assert pubsub.subscriber_count(bus) == 1
+  pubsub.publish(bus, "recovered-for-existing-sub")
+  assert process.receive(sub1, 200) == Ok("recovered-for-existing-sub")
+
+  // New subscribers also work alongside restored subscribers
   let sub2 = process.new_subject()
   pubsub.subscribe(bus, sub2)
+  assert pubsub.subscriber_count(bus) == 2
+  pubsub.publish(bus, "recovered-for-both")
+  assert process.receive(sub1, 200) == Ok("recovered-for-both")
+  assert process.receive(sub2, 200) == Ok("recovered-for-both")
+
+  // Unsubscribing sub1 removes it from ETS so a second crash does not resurrect it
+  pubsub.unsubscribe(bus, sub1)
   assert pubsub.subscriber_count(bus) == 1
-  pubsub.publish(bus, "recovered")
-  assert process.receive(sub2, 200) == Ok("recovered")
+  let assert Ok(second_pid) = process.named(name)
+  process.kill(second_pid)
+  assert test_helper.wait_until(100, 10, fn() {
+    case process.named(name) {
+      Ok(third_pid) -> third_pid != second_pid && process.is_alive(third_pid)
+      Error(_) -> False
+    }
+  })
+  assert pubsub.subscriber_count(bus) == 1
+  pubsub.publish(bus, "after-second-restart")
+  assert process.receive(sub2, 200) == Ok("after-second-restart")
+  assert process.receive(sub1, 30) == Error(Nil)
 
   process.send_exit(sup.pid)
+
+  // Calling publish/subscribe/unsubscribe while a named PubSub is unregistered
+  // (e.g. during the brief window between crash and supervisor restart) must not panic,
+  // and a subscriber registered during that window is restored once the actor starts.
+  let gap_name = process.new_name("lote_unregistered_gap_pubsub_test")
+  let gap_bus = process.named_subject(gap_name)
+  let gap_sub = process.new_subject()
+  pubsub.publish(gap_bus, "dropped-during-restart")
+  pubsub.subscribe(gap_bus, gap_sub)
+
+  let assert Ok(started_gap) = pubsub.start_named(gap_name, pubsub.Memory)
+  assert pubsub.subscriber_count(gap_bus) == 1
+  pubsub.publish(gap_bus, "delivered-after-start")
+  assert process.receive(gap_sub, 200) == Ok("delivered-after-start")
+  pubsub.stop(started_gap.data)
 }

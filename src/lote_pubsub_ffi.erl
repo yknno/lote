@@ -1,8 +1,98 @@
 -module(lote_pubsub_ffi).
 
--export([spawn_listener/2, start_and_listen/2]).
+-export([
+    clear_saved_subscribers/1,
+    delete_saved_subscriber/2,
+    load_saved_subscribers/1,
+    safe_send_named_subject/2,
+    save_subscriber/2,
+    spawn_listener/2,
+    start_and_listen/2
+]).
 
 -include_lib("pog/include/pog_Config.hrl").
+
+-define(SUBSCRIBER_ETS_TABLE, lote_pubsub_subscribers).
+-define(SUBSCRIBER_ETS_OWNER, lote_pubsub_subscribers_owner).
+
+ensure_subscriber_table() ->
+    case ets:whereis(?SUBSCRIBER_ETS_TABLE) of
+        undefined ->
+            start_subscriber_table_holder();
+        _Tid ->
+            ?SUBSCRIBER_ETS_TABLE
+    end.
+
+start_subscriber_table_holder() ->
+    Parent = self(),
+    Ref = make_ref(),
+    Pid = spawn(fun() -> subscriber_table_holder_init(Parent, Ref) end),
+    MonRef = erlang:monitor(process, Pid),
+    receive
+        {Ref, ok} ->
+            erlang:demonitor(MonRef, [flush]),
+            ?SUBSCRIBER_ETS_TABLE;
+        {'DOWN', MonRef, process, Pid, _Reason} ->
+            ?SUBSCRIBER_ETS_TABLE
+    after 1000 ->
+        erlang:demonitor(MonRef, [flush]),
+        ?SUBSCRIBER_ETS_TABLE
+    end.
+
+subscriber_table_holder_init(Parent, Ref) ->
+    try register(?SUBSCRIBER_ETS_OWNER, self()) of
+        true ->
+            try
+                ets:new(?SUBSCRIBER_ETS_TABLE, [
+                    named_table,
+                    public,
+                    bag,
+                    {read_concurrency, true},
+                    {write_concurrency, true}
+                ])
+            catch
+                error:badarg -> ok
+            end,
+            Parent ! {Ref, ok},
+            subscriber_table_holder_loop()
+    catch
+        error:badarg ->
+            Parent ! {Ref, ok}
+    end.
+
+subscriber_table_holder_loop() ->
+    receive
+        _ -> subscriber_table_holder_loop()
+    end.
+
+save_subscriber(Name, Subscriber) ->
+    ensure_subscriber_table(),
+    ets:delete_object(?SUBSCRIBER_ETS_TABLE, {Name, Subscriber}),
+    ets:insert(?SUBSCRIBER_ETS_TABLE, {Name, Subscriber}),
+    nil.
+
+delete_saved_subscriber(Name, Subscriber) ->
+    ensure_subscriber_table(),
+    ets:delete_object(?SUBSCRIBER_ETS_TABLE, {Name, Subscriber}),
+    nil.
+
+clear_saved_subscribers(Name) ->
+    ensure_subscriber_table(),
+    ets:delete(?SUBSCRIBER_ETS_TABLE, Name),
+    nil.
+
+load_saved_subscribers(Name) ->
+    ensure_subscriber_table(),
+    [Subscriber || {_Key, Subscriber} <- ets:lookup(?SUBSCRIBER_ETS_TABLE, Name)].
+
+safe_send_named_subject(Name, Message) ->
+    case whereis(Name) of
+        undefined ->
+            nil;
+        Pid ->
+            erlang:send(Pid, {Name, Message}),
+            nil
+    end.
 
 default_ssl_options(Host, Ssl) ->
     case Ssl of
