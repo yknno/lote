@@ -1,3 +1,5 @@
+import gleam/bit_array
+import gleam/dynamic/decode
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/order
@@ -5,6 +7,7 @@ import gleam/string
 import lote/auth/user
 import lote/db/post_repo
 import lote/test_helper
+import pog
 
 pub fn create_and_list_recent_returns_posts_in_descending_id_order_test() {
   use tx <- test_helper.with_db
@@ -139,4 +142,67 @@ pub fn validate_body_and_create_enforce_length_limit_test() {
         max: post_repo.max_body_length,
       )),
     )
+}
+
+pub fn validate_body_rejects_oversized_byte_payloads_before_grapheme_count_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "BytesAuthor")
+
+  // 200 ZWJ family emojis: <= 300 graphemes, but 5000 UTF-8 bytes (> 4096)
+  let zwj_bomb = string.repeat("👨‍👩‍👧‍👦", 200)
+  let zwj_bytes = bit_array.byte_size(<<zwj_bomb:utf8>>)
+  assert string.length(zwj_bomb) == 200
+  assert zwj_bytes > post_repo.max_body_bytes
+  assert post_repo.validate_body(zwj_bomb)
+    == Error(post_repo.BodyTooLarge(
+      bytes: zwj_bytes,
+      max_bytes: post_repo.max_body_bytes,
+    ))
+  assert post_repo.create(tx, author.id, zwj_bomb)
+    == Error(
+      post_repo.InvalidBody(post_repo.BodyTooLarge(
+        bytes: zwj_bytes,
+        max_bytes: post_repo.max_body_bytes,
+      )),
+    )
+
+  // Huge whitespace-padded raw payload exceeds max_raw_body_bytes before trimming
+  let huge_raw = string.repeat(" ", post_repo.max_raw_body_bytes) <> "hi"
+  let huge_raw_bytes = bit_array.byte_size(<<huge_raw:utf8>>)
+  assert huge_raw_bytes > post_repo.max_raw_body_bytes
+  assert post_repo.validate_body(huge_raw)
+    == Error(post_repo.BodyTooLarge(
+      bytes: huge_raw_bytes,
+      max_bytes: post_repo.max_body_bytes,
+    ))
+}
+
+pub fn posts_body_check_constraint_enforces_non_blank_and_byte_limit_in_db_test() {
+  // Direct SQL insert of blank body must violate posts_body_check
+  {
+    use tx <- test_helper.with_db
+    let assert Ok(author) = user.create(tx, "CheckBlankAuthor")
+    let assert Error(pog.ConstraintViolated(_, constraint: blank_constraint, ..)) =
+      pog.query("INSERT INTO posts (user_id, body) VALUES ($1, $2)")
+      |> pog.parameter(pog.int(author.id))
+      |> pog.parameter(pog.text("   "))
+      |> pog.returning(decode.dynamic)
+      |> pog.execute(tx)
+    assert blank_constraint == "posts_body_check"
+  }
+
+  // Direct SQL insert exceeding 4096 bytes must violate posts_body_check
+  {
+    use tx <- test_helper.with_db
+    let assert Ok(author) = user.create(tx, "CheckSizeAuthor")
+    let over_bytes = string.repeat("a", post_repo.max_body_bytes + 1)
+    let assert Error(pog.ConstraintViolated(_, constraint: size_constraint, ..)) =
+      pog.query("INSERT INTO posts (user_id, body) VALUES ($1, $2)")
+      |> pog.parameter(pog.int(author.id))
+      |> pog.parameter(pog.text(over_bytes))
+      |> pog.returning(decode.dynamic)
+      |> pog.execute(tx)
+    assert size_constraint == "posts_body_check"
+  }
 }

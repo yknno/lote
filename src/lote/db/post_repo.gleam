@@ -5,6 +5,7 @@ import cake/insert as i
 import cake/join as j
 import cake/select as s
 import cake/where as w
+import gleam/bit_array
 import gleam/dynamic/decode
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -16,9 +17,14 @@ import pog
 
 pub const max_body_length = 300
 
+pub const max_body_bytes = 4096
+
+pub const max_raw_body_bytes = 16_384
+
 pub type BodyError {
   EmptyBody
   BodyTooLong(length: Int, max: Int)
+  BodyTooLarge(bytes: Int, max_bytes: Int)
 }
 
 pub type CreateError {
@@ -41,13 +47,25 @@ pub type PostRow {
 }
 
 pub fn validate_body(raw: String) -> Result(String, BodyError) {
-  let body = string.trim(raw)
-  let length = string.length(body)
-  case length {
-    0 -> Error(EmptyBody)
-    n if n > max_body_length ->
-      Error(BodyTooLong(length: n, max: max_body_length))
-    _ -> Ok(body)
+  let raw_bytes = bit_array.byte_size(<<raw:utf8>>)
+  case raw_bytes > max_raw_body_bytes {
+    True -> Error(BodyTooLarge(bytes: raw_bytes, max_bytes: max_body_bytes))
+    False -> {
+      let body = string.trim(raw)
+      let body_bytes = bit_array.byte_size(<<body:utf8>>)
+      case body_bytes {
+        0 -> Error(EmptyBody)
+        n if n > max_body_bytes ->
+          Error(BodyTooLarge(bytes: n, max_bytes: max_body_bytes))
+        _ -> {
+          let length = string.length(body)
+          case length > max_body_length {
+            True -> Error(BodyTooLong(length:, max: max_body_length))
+            False -> Ok(body)
+          }
+        }
+      }
+    }
   }
 }
 
