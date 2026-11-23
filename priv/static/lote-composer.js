@@ -17,7 +17,7 @@ export function countGraphemes(text) {
 
 class LoteComposer extends HTMLElement {
   static get observedAttributes() {
-    return ["max"];
+    return ["max", "submitting"];
   }
 
   #onInput = () => {
@@ -27,8 +27,9 @@ class LoteComposer extends HTMLElement {
   #onSubmit = (event) => {
     const textarea = this.querySelector('textarea[name="body"]');
     if (!textarea) return;
+    const isSubmitting = this.hasAttribute("submitting");
     const count = countGraphemes(textarea.value.trim());
-    if (count === 0 || count > this.#maxLength()) {
+    if (isSubmitting || count === 0 || count > this.#maxLength()) {
       event.preventDefault();
       event.stopImmediatePropagation();
       this.#sync();
@@ -75,6 +76,7 @@ class LoteComposer extends HTMLElement {
     if (!textarea) return;
 
     const max = this.#maxLength();
+    const isSubmitting = this.hasAttribute("submitting");
     const count = countGraphemes(textarea.value.trim());
     const isOver = count > max;
     const isNear = !isOver && count >= Math.max(0, max - 30);
@@ -91,7 +93,7 @@ class LoteComposer extends HTMLElement {
     }
 
     if (submit) {
-      submit.disabled = isOver;
+      submit.disabled = isOver || isSubmitting;
     }
   }
 }

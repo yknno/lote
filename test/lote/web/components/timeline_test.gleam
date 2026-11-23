@@ -3,6 +3,7 @@ import gleam/erlang/process
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/set
 import gleam/string
 import gleam/time/calendar
 import gleam/time/timestamp
@@ -194,7 +195,7 @@ pub fn incoming_post_shows_pending_banner_until_refreshed_test() {
   // Bob publishes two posts while Alice has auto-refresh off
   let assert Ok(row1) = post_repo.create(tx, bob.id, "bob first post")
   let model1 = step(model0, timeline.PostCreated(to_timeline_post(row1, bob)))
-  assert model1.pending_count == 1
+  assert set.size(model1.pending_ids) == 1
   assert model1.posts == []
   let html1 = render_html(model1)
   assert string.contains(html1, "Show 1 new post")
@@ -202,15 +203,22 @@ pub fn incoming_post_shows_pending_banner_until_refreshed_test() {
 
   let assert Ok(row2) = post_repo.create(tx, bob.id, "bob second post")
   let model2 = step(model1, timeline.PostCreated(to_timeline_post(row2, bob)))
-  assert model2.pending_count == 2
+  assert set.size(model2.pending_ids) == 2
   assert model2.posts == []
   let html2 = render_html(model2)
   assert string.contains(html2, "Show 2 new posts")
   assert !string.contains(html2, "bob second post")
 
-  // Clicking refresh reloads both posts from DB and clears pending banner
-  let model3 = step(model2, timeline.UserClickedRefresh)
-  assert model3.pending_count == 0
+  // Clicking refresh loads both posts asynchronously via effect and clears pending banner
+  let #(loading_model, refresh_eff) =
+    timeline.update(model2, timeline.UserClickedRefresh)
+  assert loading_model.loading_newer
+  assert loading_model.posts == []
+  assert string.contains(render_html(loading_model), "Loading new posts...")
+
+  let model3 = list.fold(run_effect(refresh_eff), loading_model, step)
+  assert !model3.loading_newer
+  assert set.size(model3.pending_ids) == 0
   assert list.map(model3.posts, fn(p) { p.body })
     == ["bob second post", "bob first post"]
   let html3 = render_html(model3)
@@ -240,14 +248,14 @@ pub fn submitting_own_post_refreshes_pending_posts_without_echo_banner_test() {
   let assert Ok(bob_row) = post_repo.create(tx, bob.id, "bob pending post")
   let model1 =
     step(model0, timeline.PostCreated(to_timeline_post(bob_row, bob)))
-  assert model1.pending_count == 1
+  assert set.size(model1.pending_ids) == 1
   assert string.contains(render_html(model1), "Show 1 new post")
 
-  // Alice submits her own post: increments form_key, reloads DB (showing Alice's + Bob's posts),
-  // and clears pending_count.
+  // Alice submits her own post: increments form_key on save success, includes Bob's pending post,
+  // and clears pending_ids.
   let model2 =
     step(model1, timeline.UserSubmittedForm([#("body", "alice own post")]))
-  assert model2.pending_count == 0
+  assert set.size(model2.pending_ids) == 0
   assert list.map(model2.posts, fn(p) { p.body })
     == ["alice own post", "bob pending post"]
 
@@ -255,7 +263,7 @@ pub fn submitting_own_post_refreshes_pending_posts_without_echo_banner_test() {
   // it is ignored because its ID is not newer than the head of model.posts.
   let assert Ok(timeline.Created(alice_post)) = process.receive(pubsub_sub, 100)
   let model3 = step(model2, timeline.PostCreated(alice_post))
-  assert model3.pending_count == 0
+  assert set.size(model3.pending_ids) == 0
   assert model3.posts == model2.posts
   assert !string.contains(render_html(model3), "Show 1 new post")
 }
@@ -278,20 +286,27 @@ pub fn toggling_auto_refresh_flushes_pending_and_streams_new_posts_test() {
   // Bob posts while auto-refresh is OFF -> buffered
   let assert Ok(row1) = post_repo.create(tx, bob.id, "pending before live")
   let model1 = step(model0, timeline.PostCreated(to_timeline_post(row1, bob)))
-  assert model1.pending_count == 1
+  assert set.size(model1.pending_ids) == 1
   assert !model1.auto_refresh
 
-  // Toggle Live ON -> immediately reloads pending post from DB
-  let model2 = step(model1, timeline.UserToggledAutoRefresh)
+  // Toggle Live ON -> flushes pending post asynchronously via effect
+  let #(toggling_model, toggle_eff) =
+    timeline.update(model1, timeline.UserToggledAutoRefresh)
+  assert toggling_model.auto_refresh
+  assert toggling_model.loading_newer
+  assert toggling_model.posts == []
+
+  let model2 = list.fold(run_effect(toggle_eff), toggling_model, step)
   assert model2.auto_refresh
-  assert model2.pending_count == 0
+  assert !model2.loading_newer
+  assert set.size(model2.pending_ids) == 0
   assert list.map(model2.posts, fn(p) { p.body }) == ["pending before live"]
   assert string.contains(render_html(model2), "aria-pressed=\"true\"")
 
   // New post while Live is ON -> streamed immediately into feed
   let assert Ok(row2) = post_repo.create(tx, bob.id, "streamed live post")
   let model3 = step(model2, timeline.PostCreated(to_timeline_post(row2, bob)))
-  assert model3.pending_count == 0
+  assert set.size(model3.pending_ids) == 0
   assert list.map(model3.posts, fn(p) { p.body })
     == ["streamed live post", "pending before live"]
 
@@ -302,7 +317,7 @@ pub fn toggling_auto_refresh_flushes_pending_and_streams_new_posts_test() {
 
   let assert Ok(row3) = post_repo.create(tx, bob.id, "buffered after live off")
   let model5 = step(model4, timeline.PostCreated(to_timeline_post(row3, bob)))
-  assert model5.pending_count == 1
+  assert set.size(model5.pending_ids) == 1
   assert list.map(model5.posts, fn(p) { p.body })
     == ["streamed live post", "pending before live"]
   let html5 = render_html(model5)
@@ -566,12 +581,12 @@ pub fn feed_assigns_stable_post_id_keys_across_prepend_delete_and_pagination_tes
     == list.filter([fresh.id, ..all_ids_desc], fn(id) { id != second_id })
   assert string.contains(render_html(model4), ">Confirm</button>")
 
-  // 5. Clicking Refresh reloads the latest page_size posts from DB with their stable keys
+  // 5. Clicking Refresh fetches only newer posts via list_after without truncating older loaded posts
+  let assert Ok(newer_row) = post_repo.create(tx, alice.id, "refreshed-top")
   let model5 = step(model4, timeline.UserClickedRefresh)
   let expected_refreshed_keys =
-    [fresh.id, ..all_ids_desc]
+    [newer_row.id, fresh.id, ..all_ids_desc]
     |> list.filter(fn(id) { id != second_id })
-    |> list.take(timeline.page_size)
   assert extract_tag_keys(render_html(model5), "li") == expected_refreshed_keys
 }
 
@@ -662,4 +677,189 @@ pub fn submitting_over_limit_post_shows_error_without_resetting_form_and_clears_
   assert list.map(model2.posts, fn(p) { p.body }) == [exact_300]
   let assert Ok(timeline.Created(created)) = process.receive(pubsub_sub, 100)
   assert created.body == exact_300
+}
+
+pub fn incremental_refresh_and_own_submit_preserve_loaded_older_posts_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(bob) = user.create(tx, "Bob")
+  let total = timeline.page_size + 3
+  let _ =
+    int.range(from: 1, to: total + 1, with: Nil, run: fn(_, n) {
+      let assert Ok(_) =
+        post_repo.create(tx, bob.id, "older-" <> int.to_string(n))
+      Nil
+    })
+
+  let assert Ok(post_pubsub) = pubsub.start()
+  let #(model0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "test-csrf-token",
+    ))
+
+  // Load older posts so we have page_size + 3 (23) posts in memory
+  let model1 = step(model0, timeline.UserRequestedLoadMore)
+  assert list.length(model1.posts) == total
+
+  // Bob posts a new message while Alice has auto-refresh OFF
+  let assert Ok(bob_new) = post_repo.create(tx, bob.id, "bob newer post")
+  let model2 =
+    step(model1, timeline.PostCreated(to_timeline_post(bob_new, bob)))
+  assert set.size(model2.pending_ids) == 1
+
+  // Clicking Show 1 new post prepends bob_new while keeping all 23 older posts (24 total)
+  let model3 = step(model2, timeline.UserClickedRefresh)
+  assert set.size(model3.pending_ids) == 0
+  assert list.length(model3.posts) == total + 1
+  let assert [head3, ..] = model3.posts
+  assert head3.body == "bob newer post"
+
+  // Submitting Alice's own post also prepends without rewinding to 20 (25 total)
+  let model4 =
+    step(model3, timeline.UserSubmittedForm([#("body", "alice newer post")]))
+  assert list.length(model4.posts) == total + 2
+  let assert [head4, second4, ..] = model4.posts
+  assert head4.body == "alice newer post"
+  assert second4.body == "bob newer post"
+}
+
+pub fn pending_ids_deduplicate_and_remove_deleted_pending_posts_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "Alice")
+  let assert Ok(bob) = user.create(tx, "Bob")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let #(model0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "test-csrf-token",
+    ))
+
+  let assert Ok(row1) = post_repo.create(tx, bob.id, "pending 1")
+  let assert Ok(row2) = post_repo.create(tx, bob.id, "pending 2")
+  let post1 = to_timeline_post(row1, bob)
+  let post2 = to_timeline_post(row2, bob)
+
+  // Duplicate PostCreated for the same ID does not double-count
+  let model1 =
+    model0
+    |> step(timeline.PostCreated(post1))
+    |> step(timeline.PostCreated(post1))
+    |> step(timeline.PostCreated(post2))
+  assert set.size(model1.pending_ids) == 2
+  assert string.contains(render_html(model1), "Show 2 new posts")
+
+  // Deleting a pending post immediately decrements the banner count
+  let model2 = step(model1, timeline.PostDeleted(post1.id))
+  assert set.size(model2.pending_ids) == 1
+  assert string.contains(render_html(model2), "Show 1 new post")
+
+  // Deleting the last pending post removes the banner completely
+  let model3 = step(model2, timeline.PostDeleted(post2.id))
+  assert set.size(model3.pending_ids) == 0
+  assert !string.contains(render_html(model3), "Show ")
+}
+
+pub fn save_and_delete_failures_display_error_without_clearing_form_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(post_pubsub) = pubsub.start()
+  // Use a non-existent user ID so post_repo.create hits a FK QueryError
+  let ghost_user = user.AuthUser(id: -999_999, name: "Ghost")
+
+  let #(model0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(ghost_user),
+      csrf_token: "test-csrf-token",
+    ))
+
+  // Save failure preserves form_key (does not clear the user's draft) and renders alert
+  let model1 =
+    step(model0, timeline.UserSubmittedForm([#("body", "draft preserved")]))
+  assert model1.form_key == 0
+  let assert Some(form_err) = model1.form_error
+  assert string.contains(form_err, "Failed to publish post")
+  assert string.contains(render_html(model1), "role=\"alert\"")
+  assert string.contains(render_html(model1), "Failed to publish post")
+
+  // Delete failure renders timeline error alert with Dismiss button
+  let model2 =
+    step(
+      model1,
+      timeline.PostDeleteFailed("Failed to delete post. Please try again."),
+    )
+  assert model2.timeline_error
+    == Some("Failed to delete post. Please try again.")
+  let html2 = render_html(model2)
+  assert string.contains(html2, "Failed to delete post. Please try again.")
+  assert string.contains(html2, ">Dismiss</button>")
+
+  let model3 = step(model2, timeline.UserDismissedError)
+  assert model3.timeline_error == None
+  assert !string.contains(
+    render_html(model3),
+    "Failed to delete post. Please try again.",
+  )
+}
+
+pub fn submitting_state_disables_button_and_blocks_duplicate_submit_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "DoubleClickAlice")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let #(model0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "test-csrf-token",
+    ))
+
+  // First submit enters submitting state and disables the Post button before DB save finishes
+  let #(submitting_model, save_eff) =
+    timeline.update(
+      model0,
+      timeline.UserSubmittedForm([#("body", "only save once")]),
+    )
+  assert submitting_model.submitting
+  assert submitting_model.form_key == 0
+  let submitting_html = render_html(submitting_model)
+  assert string.contains(submitting_html, " submitting>")
+  assert string.contains(submitting_html, "disabled")
+  assert string.contains(submitting_html, ">Posting...</button>")
+
+  // A rapid second submit while submitting == True is ignored with no effect
+  let #(dup_model, dup_eff) =
+    timeline.update(
+      submitting_model,
+      timeline.UserSubmittedForm([#("body", "only save once")]),
+    )
+  assert dup_model == submitting_model
+  assert run_effect(dup_eff) == []
+
+  // Completing the first save effect persists exactly 1 post, clears submitting, and resets form_key
+  let model_done = list.fold(run_effect(save_eff), submitting_model, step)
+  assert !model_done.submitting
+  assert model_done.form_key == 1
+  assert list.map(model_done.posts, fn(p) { p.body }) == ["only save once"]
+  let assert Ok(db_rows) = post_repo.list_recent(tx, 10)
+  assert list.length(db_rows) == 1
+  assert string.contains(render_html(model_done), ">Post</button>")
+
+  // PostSaveFailed also clears submitting so the user can retry without losing their draft
+  let #(failed_model, _) =
+    timeline.update(submitting_model, timeline.PostSaveFailed("DB error"))
+  assert !failed_model.submitting
+  assert failed_model.form_key == 0
+  assert failed_model.form_error == Some("DB error")
 }
