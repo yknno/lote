@@ -207,7 +207,10 @@ dispatch_active_data(Owner, ListenRef, Binary, Conn) ->
             (_) ->
                 ok
         end),
-    case element(4, Conn1) of
+    %% In pgo 0.20.0 (pgo_internal.hrl), -record(conn, {owner, socket, socket_module, ...})
+    %% stores `socket` at tuple position 3 (1 = 'conn', 2 = owner, 3 = socket) and sets it
+    %% to `closed` when pgo_handler closes the socket on a framing/decode error.
+    case element(3, Conn1) of
         closed -> {closed, Conn1};
         _ -> {ok, Conn1}
     end.

@@ -424,14 +424,21 @@ pub fn postgres_pubsub_rejects_invalid_channel_identifier_and_starts_without_blo
   let assert Error(_) = pubsub.start_with_adapter(bad_channel_adapter)
 
   // 2. Unreachable DB host/port does NOT block actor initialisation for 4s
+  let worker_pids_subject = process.new_subject()
   let started_at = timestamp.system_time()
   let unreachable_adapter =
     pubsub.Postgres(
       db:,
       database_url: "postgres://postgres:postgres@127.0.0.1:59999/lote",
       channel: "lote_unreachable_test",
-      encode: fn(s) { s },
-      decode: fn(s) { Ok(s) },
+      encode: fn(s) {
+        process.send(worker_pids_subject, process.self())
+        s
+      },
+      decode: fn(s) {
+        process.send(worker_pids_subject, process.self())
+        Ok(s)
+      },
     )
   let assert Ok(bus) = pubsub.start_with_adapter(unreachable_adapter)
   let elapsed_ms =
@@ -440,7 +447,18 @@ pub fn postgres_pubsub_rejects_invalid_channel_identifier_and_starts_without_blo
   assert elapsed_ms < 200
   assert pubsub.subscriber_count(bus) == 0
 
+  // Capture publisher and decoder worker PIDs and verify pubsub.stop terminates both
+  pubsub.publish(bus, "probe-pub")
+  let assert Ok(publisher_pid) = process.receive(worker_pids_subject, 200)
+  pubsub.receive_payload(bus, "probe-dec")
+  let assert Ok(decoder_pid) = process.receive(worker_pids_subject, 200)
+  assert process.is_alive(publisher_pid)
+  assert process.is_alive(decoder_pid)
+
   pubsub.stop(bus)
+  assert test_helper.wait_until(50, 10, fn() {
+    !process.is_alive(publisher_pid) && !process.is_alive(decoder_pid)
+  })
 }
 
 pub fn supervised_named_pubsub_restarts_automatically_after_crash_test() {

@@ -501,14 +501,14 @@ fn handle_message(
       case state.publisher_pid {
         Some(pid) -> {
           process.unlink(pid)
-          process.send_exit(pid)
+          process.kill(pid)
         }
         None -> Nil
       }
       case state.decoder_pid {
         Some(pid) -> {
           process.unlink(pid)
-          process.send_exit(pid)
+          process.kill(pid)
         }
         None -> Nil
       }
