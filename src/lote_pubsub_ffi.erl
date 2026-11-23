@@ -1,6 +1,6 @@
 -module(lote_pubsub_ffi).
 
--export([start_and_listen/2]).
+-export([spawn_listener/2, start_and_listen/2]).
 
 -include_lib("pog/include/pog_Config.hrl").
 
@@ -21,28 +21,69 @@ default_ssl_options(Host, Ssl) ->
             ]}
     end.
 
-start_and_listen(Config, Channel) ->
-    Owner = self(),
-    Options = build_options(Config),
-    InitRef = make_ref(),
-    %% Spawn unlinked so a DB disconnect/restart never crashes the PubSub actor.
-    %% The listener monitors Owner and closes its DB socket if Owner exits.
-    Pid = spawn(fun() -> listener_init(Owner, InitRef, Options, Channel) end),
-    MonRef = erlang:monitor(process, Pid),
-    receive
-        {InitRef, ok} ->
-            erlang:demonitor(MonRef, [flush]),
+%% Asynchronously spawns a dedicated Postgres LISTEN worker for `Owner` (self()).
+%% Never blocks the calling actor: when the worker finishes connecting and
+%% executing `LISTEN <channel>`, it sends `{listener_connected, Pid, Channel}`
+%% to `Owner`; if connecting or `LISTEN` fails, it sends
+%% `{listener_connect_failed, Pid, Channel, ErrorBin}` and exits normally.
+spawn_listener(Config, Channel) ->
+    case validate_channel_identifier(Channel) of
+        ok ->
+            Owner = self(),
+            Options = build_options(Config),
+            Pid = spawn(fun() -> async_listener_init(Owner, Options, Channel) end),
             {ok, Pid};
-        {InitRef, {error, Reason}} ->
-            erlang:demonitor(MonRef, [flush]),
-            {error, format_error(Reason)};
-        {'DOWN', MonRef, process, Pid, Reason} ->
-            {error, format_error(Reason)}
-    after 4000 ->
-        erlang:demonitor(MonRef, [flush]),
-        exit(Pid, kill),
-        {error, <<"timed out starting Postgres LISTEN connection">>}
+        {error, Reason} ->
+            {error, Reason}
     end.
+
+start_and_listen(Config, Channel) ->
+    case validate_channel_identifier(Channel) of
+        ok ->
+            Owner = self(),
+            Options = build_options(Config),
+            InitRef = make_ref(),
+            Pid = spawn(fun() -> sync_listener_init(Owner, InitRef, Options, Channel) end),
+            MonRef = erlang:monitor(process, Pid),
+            receive
+                {InitRef, ok} ->
+                    erlang:demonitor(MonRef, [flush]),
+                    {ok, Pid};
+                {InitRef, {error, Reason}} ->
+                    erlang:demonitor(MonRef, [flush]),
+                    {error, format_error(Reason)};
+                {'DOWN', MonRef, process, Pid, Reason} ->
+                    {error, format_error(Reason)}
+            after 4000 ->
+                erlang:demonitor(MonRef, [flush]),
+                exit(Pid, kill),
+                {error, <<"timed out starting Postgres LISTEN connection">>}
+            end;
+        {error, Reason} ->
+            {error, Reason}
+    end.
+
+validate_channel_identifier(Channel) when is_binary(Channel), byte_size(Channel) > 0, byte_size(Channel) =< 63 ->
+    case is_valid_ident_bytes(Channel, true) of
+        true -> ok;
+        false -> {error, <<"invalid Postgres LISTEN channel identifier">>}
+    end;
+validate_channel_identifier(_) ->
+    {error, <<"invalid Postgres LISTEN channel identifier">>}.
+
+is_valid_ident_bytes(<<>>, _IsFirst) ->
+    true;
+is_valid_ident_bytes(<<C, Rest/binary>>, true)
+  when (C >= $a andalso C =< $z) orelse (C >= $A andalso C =< $Z) orelse C =:= $_ ->
+    is_valid_ident_bytes(Rest, false);
+is_valid_ident_bytes(<<C, Rest/binary>>, false)
+  when (C >= $a andalso C =< $z)
+       orelse (C >= $A andalso C =< $Z)
+       orelse (C >= $0 andalso C =< $9)
+       orelse C =:= $_ ->
+    is_valid_ident_bytes(Rest, false);
+is_valid_ident_bytes(_, _) ->
+    false.
 
 build_options(Config) ->
     #config{
@@ -77,7 +118,19 @@ build_options(Config) ->
         none -> Options1
     end.
 
-listener_init(Owner, InitRef, Options, Channel) ->
+async_listener_init(Owner, Options, Channel) ->
+    process_flag(trap_exit, true),
+    OwnerRef = erlang:monitor(process, Owner),
+    case open_and_listen(Options, Channel) of
+        {ok, Conn} ->
+            ListenRef = make_ref(),
+            Owner ! {listener_connected, self(), Channel},
+            listen_loop(Owner, OwnerRef, ListenRef, Conn);
+        {error, Reason} ->
+            Owner ! {listener_connect_failed, self(), Channel, format_error(Reason)}
+    end.
+
+sync_listener_init(Owner, InitRef, Options, Channel) ->
     process_flag(trap_exit, true),
     OwnerRef = erlang:monitor(process, Owner),
     case open_and_listen(Options, Channel) of
@@ -109,19 +162,27 @@ open_and_listen(Options, Channel) ->
 listen_loop(Owner, OwnerRef, ListenRef, Conn) ->
     receive
         {tcp, Socket, Binary} ->
-            Conn1 = dispatch_active_data(Owner, ListenRef, Binary, Conn),
-            case inet:setopts(Socket, [{active, once}]) of
-                ok ->
-                    listen_loop(Owner, OwnerRef, ListenRef, Conn1);
-                {error, _} ->
+            case dispatch_active_data(Owner, ListenRef, Binary, Conn) of
+                {ok, Conn1} ->
+                    case inet:setopts(Socket, [{active, once}]) of
+                        ok ->
+                            listen_loop(Owner, OwnerRef, ListenRef, Conn1);
+                        {error, _} ->
+                            safe_close(Conn1)
+                    end;
+                {closed, Conn1} ->
                     safe_close(Conn1)
             end;
         {ssl, Socket, Binary} ->
-            Conn1 = dispatch_active_data(Owner, ListenRef, Binary, Conn),
-            case ssl:setopts(Socket, [{active, once}]) of
-                ok ->
-                    listen_loop(Owner, OwnerRef, ListenRef, Conn1);
-                {error, _} ->
+            case dispatch_active_data(Owner, ListenRef, Binary, Conn) of
+                {ok, Conn1} ->
+                    case ssl:setopts(Socket, [{active, once}]) of
+                        ok ->
+                            listen_loop(Owner, OwnerRef, ListenRef, Conn1);
+                        {error, _} ->
+                            safe_close(Conn1)
+                    end;
+                {closed, Conn1} ->
                     safe_close(Conn1)
             end;
         {tcp_closed, _Socket} ->
@@ -139,12 +200,20 @@ listen_loop(Owner, OwnerRef, ListenRef, Conn) ->
     end.
 
 dispatch_active_data(Owner, ListenRef, Binary, Conn) ->
-    pgo_handler:process_active_data(Binary, Conn, fun
-        ({notification_response, _ProcId, Channel, Payload}) ->
-            Owner ! {notification, self(), ListenRef, Channel, Payload};
-        (_) ->
-            ok
-    end).
+    Conn1 =
+        pgo_handler:process_active_data(Binary, Conn, fun
+            ({notification_response, _ProcId, Channel, Payload}) ->
+                Owner ! {notification, self(), ListenRef, Channel, Payload};
+            (_) ->
+                ok
+        end),
+    %% In pgo 0.20.0 (pgo_internal.hrl), -record(conn, {owner, socket, socket_module, ...})
+    %% stores `socket` at tuple position 3 (1 = 'conn', 2 = owner, 3 = socket) and sets it
+    %% to `closed` when pgo_handler closes the socket on a framing/decode error.
+    case element(3, Conn1) of
+        closed -> {closed, Conn1};
+        _ -> {ok, Conn1}
+    end.
 
 safe_close(Conn) ->
     try

@@ -32,9 +32,12 @@ pub opaque type Message(event) {
   BroadcastLocal(event)
   ReceivePayload(String)
   ReconnectListener(Int)
+  ListenerConnected
+  ListenerConnectFailed(String)
   Ignore
   ProcessDown(Monitor)
   Count(Subject(Int))
+  Shutdown
 }
 
 pub type PubSub(event) =
@@ -46,13 +49,16 @@ type State(event) {
     subscribers: Dict(Subject(event), Monitor),
     adapter: Adapter(event),
     listener_monitor: Option(Monitor),
+    reconnect_attempt: Int,
     publisher: Option(Subject(event)),
+    publisher_pid: Option(Pid),
     decoder: Option(Subject(String)),
+    decoder_pid: Option(Pid),
   )
 }
 
-@external(erlang, "lote_pubsub_ffi", "start_and_listen")
-fn start_pg_listener(config: pog.Config, channel: String) -> Result(Pid, String)
+@external(erlang, "lote_pubsub_ffi", "spawn_listener")
+fn spawn_pg_listener(config: pog.Config, channel: String) -> Result(Pid, String)
 
 pub fn start() -> Result(PubSub(event), actor.StartError) {
   start_with_adapter(Memory)
@@ -85,47 +91,44 @@ fn start_actor(
 ) -> Result(actor.Started(PubSub(event)), actor.StartError) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
-      use #(listener_monitor, publisher, decoder) <- result.try(case adapter {
-        Memory -> Ok(#(None, None, None))
-        Postgres(db:, database_url:, channel:, encode:, decode:) -> {
-          use db_config <- result.try(build_listener_config(database_url))
-          let listener_monitor = case start_pg_listener(db_config, channel) {
-            Ok(pid) -> Some(process.monitor(pid))
-            Error(err) -> {
-              wisp.log_warning(
-                "Postgres PubSub initial LISTEN failed on channel \""
-                <> channel
-                <> "\": "
-                <> err
-                <> "; scheduling reconnect",
-              )
-              let _ =
-                process.send_after(
-                  self,
-                  reconnect_delay_ms(1),
-                  ReconnectListener(1),
-                )
-              None
-            }
-          }
+      use #(listener_monitor, publisher, publisher_pid, decoder, decoder_pid) <- result.try(
+        case adapter {
+          Memory -> Ok(#(None, None, None, None, None))
+          Postgres(db:, database_url:, channel:, encode:, decode:) -> {
+            use db_config <- result.try(build_listener_config(database_url))
+            // Validate channel identifier and spawn the async LISTEN worker
+            // without blocking actor startup on TCP/Postgres handshake.
+            use listener_pid <- result.try(spawn_pg_listener(db_config, channel))
+            let listener_monitor = Some(process.monitor(listener_pid))
 
-          use pub_started <- result.try(
-            start_publisher_worker(self, db, channel, encode)
-            |> result.map_error(fn(err) {
-              "failed to start Postgres PubSub publisher worker: "
-              <> string.inspect(err)
-            }),
-          )
-          use dec_started <- result.try(
-            start_decoder_worker(self, channel, decode)
-            |> result.map_error(fn(err) {
-              "failed to start Postgres PubSub decoder worker: "
-              <> string.inspect(err)
-            }),
-          )
-          Ok(#(listener_monitor, Some(pub_started.data), Some(dec_started.data)))
-        }
-      })
+            use pub_started <- result.try(
+              start_publisher_worker(self, db, channel, encode)
+              |> result.map_error(fn(err) {
+                "failed to start Postgres PubSub publisher worker: "
+                <> string.inspect(err)
+              }),
+            )
+            let _ = process.link(pub_started.pid)
+
+            use dec_started <- result.try(
+              start_decoder_worker(self, channel, decode)
+              |> result.map_error(fn(err) {
+                "failed to start Postgres PubSub decoder worker: "
+                <> string.inspect(err)
+              }),
+            )
+            let _ = process.link(dec_started.pid)
+
+            Ok(#(
+              listener_monitor,
+              Some(pub_started.data),
+              Some(pub_started.pid),
+              Some(dec_started.data),
+              Some(dec_started.pid),
+            ))
+          }
+        },
+      )
 
       let base_selector =
         process.new_selector()
@@ -148,6 +151,36 @@ fn start_actor(
               _ -> Ignore
             }
           })
+          |> process.select_record(
+            atom.create("listener_connected"),
+            2,
+            fn(record) {
+              let connected_decoder = {
+                use ch <- decode.field(2, decode.string)
+                decode.success(ch)
+              }
+              case decode.run(record, connected_decoder) {
+                Ok(ch) if ch == expected_channel -> ListenerConnected
+                _ -> Ignore
+              }
+            },
+          )
+          |> process.select_record(
+            atom.create("listener_connect_failed"),
+            3,
+            fn(record) {
+              let failed_decoder = {
+                use ch <- decode.field(2, decode.string)
+                use reason <- decode.field(3, decode.string)
+                decode.success(#(ch, reason))
+              }
+              case decode.run(record, failed_decoder) {
+                Ok(#(ch, reason)) if ch == expected_channel ->
+                  ListenerConnectFailed(reason)
+                _ -> Ignore
+              }
+            },
+          )
       }
 
       actor.initialised(State(
@@ -155,8 +188,11 @@ fn start_actor(
         subscribers: dict.new(),
         adapter:,
         listener_monitor:,
+        reconnect_attempt: 0,
         publisher:,
+        publisher_pid:,
         decoder:,
+        decoder_pid:,
       ))
       |> actor.selecting(selector)
       |> actor.returning(self)
@@ -194,6 +230,10 @@ pub fn receive_payload(pubsub: PubSub(event), payload: String) -> Nil {
 
 pub fn subscriber_count(pubsub: PubSub(event)) -> Int {
   actor.call(pubsub, waiting: 1000, sending: Count)
+}
+
+pub fn stop(pubsub: PubSub(event)) -> Nil {
+  process.send(pubsub, Shutdown)
 }
 
 pub fn pg_notify(
@@ -328,10 +368,47 @@ fn handle_message(
     }
 
     ReceivePayload(payload) -> {
-      case state.decoder {
-        Some(decoder) -> process.send(decoder, payload)
-        None -> Nil
+      case state.decoder, state.adapter {
+        Some(decoder), _ -> process.send(decoder, payload)
+        None, Postgres(channel:, decode:, ..) ->
+          case decode(payload) {
+            Ok(event) -> deliver_to_subscribers(state.subscribers, event)
+            Error(_) ->
+              wisp.log_warning(
+                "Postgres PubSub failed to decode notification payload on channel \""
+                <> channel
+                <> "\"",
+              )
+          }
+        None, Memory -> Nil
       }
+      actor.continue(state)
+    }
+
+    ListenerConnected -> {
+      case state.reconnect_attempt > 0, state.adapter {
+        True, Postgres(channel:, ..) ->
+          wisp.log_info(
+            "Postgres PubSub listener reconnected on channel \""
+            <> channel
+            <> "\"",
+          )
+        _, _ -> Nil
+      }
+      actor.continue(State(..state, reconnect_attempt: 0))
+    }
+
+    ListenerConnectFailed(err) -> {
+      let channel = case state.adapter {
+        Postgres(channel:, ..) -> channel
+        Memory -> ""
+      }
+      wisp.log_warning(
+        "Postgres PubSub LISTEN connection failed on channel \""
+        <> channel
+        <> "\": "
+        <> err,
+      )
       actor.continue(state)
     }
 
@@ -349,35 +426,24 @@ fn handle_message(
               actor.continue(state)
             }
             Ok(db_config) ->
-              case start_pg_listener(db_config, channel) {
+              case spawn_pg_listener(db_config, channel) {
                 Ok(pid) -> {
-                  wisp.log_info(
-                    "Postgres PubSub listener reconnected on channel \""
-                    <> channel
-                    <> "\"",
-                  )
                   let monitor = process.monitor(pid)
                   actor.continue(
-                    State(..state, listener_monitor: Some(monitor)),
+                    State(
+                      ..state,
+                      listener_monitor: Some(monitor),
+                      reconnect_attempt: attempt,
+                    ),
                   )
                 }
                 Error(err) -> {
-                  let delay = reconnect_delay_ms(attempt + 1)
                   wisp.log_warning(
-                    "Postgres PubSub reconnect failed on channel \""
+                    "Postgres PubSub reconnect aborted on channel \""
                     <> channel
                     <> "\": "
-                    <> err
-                    <> "; retrying in "
-                    <> int.to_string(delay)
-                    <> "ms",
+                    <> err,
                   )
-                  let _ =
-                    process.send_after(
-                      state.self,
-                      delay,
-                      ReconnectListener(attempt + 1),
-                    )
                   actor.continue(state)
                 }
               }
@@ -394,16 +460,30 @@ fn handle_message(
             Postgres(channel:, ..) -> channel
             Memory -> ""
           }
-          let delay = reconnect_delay_ms(1)
+          let next_attempt = state.reconnect_attempt + 1
+          let delay = reconnect_delay_ms(next_attempt)
           wisp.log_warning(
             "Postgres PubSub listener exited on channel \""
             <> channel
-            <> "\"; scheduling reconnect in "
+            <> "\"; scheduling reconnect attempt "
+            <> int.to_string(next_attempt)
+            <> " in "
             <> int.to_string(delay)
             <> "ms",
           )
-          let _ = process.send_after(state.self, delay, ReconnectListener(1))
-          actor.continue(State(..state, listener_monitor: None))
+          let _ =
+            process.send_after(
+              state.self,
+              delay,
+              ReconnectListener(next_attempt),
+            )
+          actor.continue(
+            State(
+              ..state,
+              listener_monitor: None,
+              reconnect_attempt: next_attempt,
+            ),
+          )
         }
         _ -> {
           let subscribers =
@@ -415,6 +495,24 @@ fn handle_message(
     Count(reply_to) -> {
       process.send(reply_to, dict.size(state.subscribers))
       actor.continue(state)
+    }
+
+    Shutdown -> {
+      case state.publisher_pid {
+        Some(pid) -> {
+          process.unlink(pid)
+          process.kill(pid)
+        }
+        None -> Nil
+      }
+      case state.decoder_pid {
+        Some(pid) -> {
+          process.unlink(pid)
+          process.kill(pid)
+        }
+        None -> Nil
+      }
+      actor.stop()
     }
   }
 }

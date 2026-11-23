@@ -134,6 +134,18 @@ pub fn post_event_codec_uses_compact_id_only_payloads_test() {
     == Error(Nil)
 }
 
+fn wait_until_listening(
+  db: pog.Connection,
+  channel: String,
+  probe: String,
+  check: fn() -> Bool,
+) -> Bool {
+  test_helper.wait_until(40, 50, fn() {
+    let _ = pubsub.pg_notify(db, channel, probe)
+    check()
+  })
+}
+
 pub fn postgres_adapter_delivers_events_across_multiple_pubsub_instances_via_listen_notify_test() {
   let cfg = config.load()
   let pool_name = process.new_name("lote_pubsub_test_db")
@@ -172,6 +184,25 @@ pub fn postgres_adapter_delivers_events_across_multiple_pubsub_instances_via_lis
   assert pubsub.subscriber_count(node_a_post_bus) == 1
   assert pubsub.subscriber_count(node_b_post_bus) == 1
 
+  // Wait for async LISTEN connections on both nodes to become active in pg_stat_activity
+  let pid_decoder = {
+    use pid <- decode.field(0, decode.int)
+    decode.success(pid)
+  }
+  assert test_helper.wait_until(40, 25, fn() {
+    case
+      pog.query(
+        "SELECT pid FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query ILIKE $1",
+      )
+      |> pog.parameter(pog.text("%" <> lote.post_events_channel <> "%"))
+      |> pog.returning(pid_decoder)
+      |> pog.execute(db)
+    {
+      Ok(r) -> list.length(r.rows) >= 2
+      Error(_) -> False
+    }
+  })
+
   // 1. Publishing on Node A sends compact ID-only pg_notify; both nodes resolve and receive it
   pubsub.publish(node_a_post_bus, timeline.Created(sample_post))
   assert process.receive(sub_a, 1000) == Ok(timeline.Created(sample_post))
@@ -205,6 +236,20 @@ pub fn postgres_adapter_delivers_events_across_multiple_pubsub_instances_via_lis
   assert pubsub.subscriber_count(node_a_revocation_bus) == 1
   assert pubsub.subscriber_count(node_b_revocation_bus) == 1
 
+  assert test_helper.wait_until(40, 25, fn() {
+    case
+      pog.query(
+        "SELECT pid FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query ILIKE $1",
+      )
+      |> pog.parameter(pog.text("%" <> lote.session_revocations_channel <> "%"))
+      |> pog.returning(pid_decoder)
+      |> pog.execute(db)
+    {
+      Ok(r) -> list.length(r.rows) >= 2
+      Error(_) -> False
+    }
+  })
+
   pubsub.publish(node_a_revocation_bus, "revoked-session-xyz")
   assert process.receive(rev_sub_a, 1000) == Ok("revoked-session-xyz")
   assert process.receive(rev_sub_b, 1000) == Ok("revoked-session-xyz")
@@ -223,6 +268,10 @@ pub fn postgres_adapter_delivers_events_across_multiple_pubsub_instances_via_lis
     |> pog.returning(decode.dynamic)
     |> pog.execute(db)
 
+  pubsub.stop(node_a_post_bus)
+  pubsub.stop(node_b_post_bus)
+  pubsub.stop(node_a_revocation_bus)
+  pubsub.stop(node_b_revocation_bus)
   process.send_exit(started_pool.pid)
 }
 
@@ -260,6 +309,10 @@ pub fn postgres_publish_is_non_blocking_and_oversized_payload_falls_back_locally
   pubsub.subscribe(bus, sub)
   assert pubsub.subscriber_count(bus) == 1
 
+  assert wait_until_listening(db, channel, "warmup", fn() {
+    process.receive(sub, 50) == Ok("warmup")
+  })
+
   // Trigger a slow publish and verify the PubSub actor itself remains responsive immediately
   let started_at = timestamp.system_time()
   pubsub.publish(bus, "slow")
@@ -281,6 +334,7 @@ pub fn postgres_publish_is_non_blocking_and_oversized_payload_falls_back_locally
   pubsub.publish(bus, "after-oversized")
   assert process.receive(sub, 1000) == Ok("after-oversized")
 
+  pubsub.stop(bus)
   process.send_exit(started_pool.pid)
 }
 
@@ -310,9 +364,9 @@ pub fn postgres_listener_reconnects_after_backend_termination_preserving_subscri
   pubsub.subscribe(bus, sub)
   assert pubsub.subscriber_count(bus) == 1
 
-  // Confirm initial delivery works
-  pubsub.publish(bus, "before-drop")
-  assert process.receive(sub, 1000) == Ok("before-drop")
+  assert wait_until_listening(db, channel, "before-drop", fn() {
+    process.receive(sub, 50) == Ok("before-drop")
+  })
 
   // Simulate DB restart / admin disconnect by terminating the LISTEN backend connection
   let pid_decoder = {
@@ -339,17 +393,72 @@ pub fn postgres_listener_reconnects_after_backend_termination_preserving_subscri
 
   // Wait for automatic reconnect and verify the existing subscriber receives new events
   // without re-subscribing and without crashing the PubSub actor
-  assert test_helper.wait_until(40, 100, fn() {
-    let probe = "after-reconnect"
-    let _ = pubsub.pg_notify(db, channel, probe)
+  assert wait_until_listening(db, channel, "after-reconnect", fn() {
     case process.receive(sub, 80) {
-      Ok(msg) if msg == probe -> True
+      Ok("after-reconnect") -> True
       _ -> False
     }
   })
   assert pubsub.subscriber_count(bus) == 1
 
+  pubsub.stop(bus)
   process.send_exit(started_pool.pid)
+}
+
+pub fn postgres_pubsub_rejects_invalid_channel_identifier_and_starts_without_blocking_when_db_down_test() {
+  let cfg = config.load()
+  let pool_name = process.new_name("lote_pubsub_nonblocking_init_db")
+  let assert Ok(db_config) = pog.url_config(pool_name, cfg.database_url)
+  let db = pog.named_connection(pool_name)
+  let _ = db_config
+
+  // 1. Invalid SQL identifier channel name is rejected immediately at startup
+  let bad_channel_adapter =
+    pubsub.Postgres(
+      db:,
+      database_url: cfg.database_url,
+      channel: "invalid-channel; DROP TABLE posts;--",
+      encode: fn(s) { s },
+      decode: fn(s) { Ok(s) },
+    )
+  let assert Error(_) = pubsub.start_with_adapter(bad_channel_adapter)
+
+  // 2. Unreachable DB host/port does NOT block actor initialisation for 4s
+  let worker_pids_subject = process.new_subject()
+  let started_at = timestamp.system_time()
+  let unreachable_adapter =
+    pubsub.Postgres(
+      db:,
+      database_url: "postgres://postgres:postgres@127.0.0.1:59999/lote",
+      channel: "lote_unreachable_test",
+      encode: fn(s) {
+        process.send(worker_pids_subject, process.self())
+        s
+      },
+      decode: fn(s) {
+        process.send(worker_pids_subject, process.self())
+        Ok(s)
+      },
+    )
+  let assert Ok(bus) = pubsub.start_with_adapter(unreachable_adapter)
+  let elapsed_ms =
+    timestamp.difference(started_at, timestamp.system_time())
+    |> duration.to_milliseconds
+  assert elapsed_ms < 200
+  assert pubsub.subscriber_count(bus) == 0
+
+  // Capture publisher and decoder worker PIDs and verify pubsub.stop terminates both
+  pubsub.publish(bus, "probe-pub")
+  let assert Ok(publisher_pid) = process.receive(worker_pids_subject, 200)
+  pubsub.receive_payload(bus, "probe-dec")
+  let assert Ok(decoder_pid) = process.receive(worker_pids_subject, 200)
+  assert process.is_alive(publisher_pid)
+  assert process.is_alive(decoder_pid)
+
+  pubsub.stop(bus)
+  assert test_helper.wait_until(50, 10, fn() {
+    !process.is_alive(publisher_pid) && !process.is_alive(decoder_pid)
+  })
 }
 
 pub fn supervised_named_pubsub_restarts_automatically_after_crash_test() {
