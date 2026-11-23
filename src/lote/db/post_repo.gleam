@@ -18,9 +18,9 @@ import pog
 
 pub const max_body_length = 300
 
-pub const max_body_bytes = 4096
+pub const max_body_bytes = 16_384
 
-pub const max_raw_body_bytes = 16_384
+pub const max_raw_body_bytes = 32_768
 
 pub type BodyError {
   EmptyBody

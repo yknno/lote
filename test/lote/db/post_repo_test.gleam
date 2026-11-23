@@ -149,20 +149,27 @@ pub fn validate_body_rejects_oversized_byte_payloads_before_grapheme_count_test(
 
   let assert Ok(author) = user.create(tx, "BytesAuthor")
 
-  // 200 ZWJ family emojis: <= 300 graphemes, but 5000 UTF-8 bytes (> 4096)
-  let zwj_bomb = string.repeat("👨‍👩‍👧‍👦", 200)
-  let zwj_bytes = bit_array.byte_size(<<zwj_bomb:utf8>>)
-  assert string.length(zwj_bomb) == 200
-  assert zwj_bytes > post_repo.max_body_bytes
-  assert post_repo.validate_body(zwj_bomb)
+  // 300 ZWJ family emojis (7,500 UTF-8 bytes <= 16,384) succeeds cleanly
+  let exact_300_emojis = string.repeat("👨‍👩‍👧‍👦", post_repo.max_body_length)
+  assert string.length(exact_300_emojis) == post_repo.max_body_length
+  assert bit_array.byte_size(<<exact_300_emojis:utf8>>)
+    < post_repo.max_body_bytes
+  let assert Ok(created) = post_repo.create(tx, author.id, exact_300_emojis)
+  assert created.body == exact_300_emojis
+
+  // Combining-mark bomb: 1 grapheme, but > 16,384 UTF-8 bytes -> rejected before grapheme scan
+  let zalgo_bomb = "a" <> string.repeat("\u{0301}", 9000)
+  let zalgo_bytes = bit_array.byte_size(<<zalgo_bomb:utf8>>)
+  assert zalgo_bytes > post_repo.max_body_bytes
+  assert post_repo.validate_body(zalgo_bomb)
     == Error(post_repo.BodyTooLarge(
-      bytes: zwj_bytes,
+      bytes: zalgo_bytes,
       max_bytes: post_repo.max_body_bytes,
     ))
-  assert post_repo.create(tx, author.id, zwj_bomb)
+  assert post_repo.create(tx, author.id, zalgo_bomb)
     == Error(
       post_repo.InvalidBody(post_repo.BodyTooLarge(
-        bytes: zwj_bytes,
+        bytes: zalgo_bytes,
         max_bytes: post_repo.max_body_bytes,
       )),
     )
@@ -210,7 +217,7 @@ pub fn posts_body_check_constraint_enforces_non_blank_and_byte_limit_in_db_test(
     assert blank_constraint == "posts_body_check"
   }
 
-  // Direct SQL insert exceeding 4096 bytes must violate posts_body_check
+  // Direct SQL insert exceeding 16,384 bytes must violate posts_body_check
   {
     use tx <- test_helper.with_db
     let assert Ok(author) = user.create(tx, "CheckSizeAuthor")
