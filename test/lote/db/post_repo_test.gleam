@@ -178,15 +178,33 @@ pub fn validate_body_rejects_oversized_byte_payloads_before_grapheme_count_test(
     ))
 }
 
+pub fn validate_body_trims_unicode_whitespace_including_fullwidth_space_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "FullwidthAuthor")
+
+  // Full-width spaces (U+3000) alone are treated as EmptyBody
+  assert post_repo.validate_body("　　\t\n ") == Error(post_repo.EmptyBody)
+  assert post_repo.create(tx, author.id, "　")
+    == Error(post_repo.InvalidBody(post_repo.EmptyBody))
+
+  // Leading/trailing full-width spaces are trimmed while inner ones are preserved
+  assert post_repo.validate_body("　こんに　ちは　") == Ok("こんに　ちは")
+
+  // Full-width space surrounding a 300-grapheme post still fits within 300 graphemes
+  let exact_300 = string.repeat("あ", post_repo.max_body_length)
+  assert post_repo.validate_body("　" <> exact_300 <> "　") == Ok(exact_300)
+}
+
 pub fn posts_body_check_constraint_enforces_non_blank_and_byte_limit_in_db_test() {
-  // Direct SQL insert of blank body must violate posts_body_check
+  // Direct SQL insert of blank ASCII / tab / newline / full-width space violates posts_body_check
   {
     use tx <- test_helper.with_db
     let assert Ok(author) = user.create(tx, "CheckBlankAuthor")
     let assert Error(pog.ConstraintViolated(_, constraint: blank_constraint, ..)) =
       pog.query("INSERT INTO posts (user_id, body) VALUES ($1, $2)")
       |> pog.parameter(pog.int(author.id))
-      |> pog.parameter(pog.text("   "))
+      |> pog.parameter(pog.text("   \t\n　"))
       |> pog.returning(decode.dynamic)
       |> pog.execute(tx)
     assert blank_constraint == "posts_body_check"

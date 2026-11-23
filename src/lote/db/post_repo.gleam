@@ -7,6 +7,7 @@ import cake/select as s
 import cake/where as w
 import gleam/bit_array
 import gleam/dynamic/decode
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
@@ -46,12 +47,43 @@ pub type PostRow {
   )
 }
 
+pub fn trim_body(raw: String) -> String {
+  raw
+  |> string.to_utf_codepoints
+  |> list.drop_while(is_whitespace_codepoint)
+  |> list.reverse
+  |> list.drop_while(is_whitespace_codepoint)
+  |> list.reverse
+  |> string.from_utf_codepoints
+}
+
+fn is_whitespace_codepoint(cp: UtfCodepoint) -> Bool {
+  case string.utf_codepoint_to_int(cp) {
+    0x0009
+    | 0x000A
+    | 0x000B
+    | 0x000C
+    | 0x000D
+    | 0x0020
+    | 0x00A0
+    | 0x1680
+    | 0x2028
+    | 0x2029
+    | 0x202F
+    | 0x205F
+    | 0x3000
+    | 0xFEFF -> True
+    n if n >= 0x2000 && n <= 0x200A -> True
+    _ -> False
+  }
+}
+
 pub fn validate_body(raw: String) -> Result(String, BodyError) {
   let raw_bytes = bit_array.byte_size(<<raw:utf8>>)
   case raw_bytes > max_raw_body_bytes {
     True -> Error(BodyTooLarge(bytes: raw_bytes, max_bytes: max_body_bytes))
     False -> {
-      let body = string.trim(raw)
+      let body = trim_body(raw)
       let body_bytes = bit_array.byte_size(<<body:utf8>>)
       case body_bytes {
         0 -> Error(EmptyBody)
