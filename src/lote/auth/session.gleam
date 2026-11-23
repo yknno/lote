@@ -215,6 +215,29 @@ pub fn revoke_others(
   postgres.run_write_query(query, decoder, db)
 }
 
+pub fn delete_expired(
+  db: pog.Connection,
+  batch_limit: Int,
+) -> Result(List(String), pog.QueryError) {
+  case batch_limit <= 0 {
+    True -> Ok([])
+    False -> {
+      let decoder = {
+        use id <- decode.field(0, decode.string)
+        decode.success(id)
+      }
+
+      pog.query(
+        "DELETE FROM sessions WHERE id IN (SELECT id FROM sessions WHERE expires_at <= NOW() LIMIT $1) RETURNING id",
+      )
+      |> pog.parameter(pog.int(batch_limit))
+      |> pog.returning(decoder)
+      |> pog.execute(db)
+      |> result.map(fn(returned) { returned.rows })
+    }
+  }
+}
+
 pub fn session_id(
   req: Request(body),
   secret_key_base: String,
