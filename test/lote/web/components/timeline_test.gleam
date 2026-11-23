@@ -810,3 +810,56 @@ pub fn save_and_delete_failures_display_error_without_clearing_form_test() {
     "Failed to delete post. Please try again.",
   )
 }
+
+pub fn submitting_state_disables_button_and_blocks_duplicate_submit_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "DoubleClickAlice")
+  let assert Ok(post_pubsub) = pubsub.start()
+
+  let #(model0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      user: Some(alice),
+      csrf_token: "test-csrf-token",
+    ))
+
+  // First submit enters submitting state and disables the Post button before DB save finishes
+  let #(submitting_model, save_eff) =
+    timeline.update(
+      model0,
+      timeline.UserSubmittedForm([#("body", "only save once")]),
+    )
+  assert submitting_model.submitting
+  assert submitting_model.form_key == 0
+  let submitting_html = render_html(submitting_model)
+  assert string.contains(submitting_html, " submitting>")
+  assert string.contains(submitting_html, "disabled")
+  assert string.contains(submitting_html, ">Posting...</button>")
+
+  // A rapid second submit while submitting == True is ignored with no effect
+  let #(dup_model, dup_eff) =
+    timeline.update(
+      submitting_model,
+      timeline.UserSubmittedForm([#("body", "only save once")]),
+    )
+  assert dup_model == submitting_model
+  assert run_effect(dup_eff) == []
+
+  // Completing the first save effect persists exactly 1 post, clears submitting, and resets form_key
+  let model_done = list.fold(run_effect(save_eff), submitting_model, step)
+  assert !model_done.submitting
+  assert model_done.form_key == 1
+  assert list.map(model_done.posts, fn(p) { p.body }) == ["only save once"]
+  let assert Ok(db_rows) = post_repo.list_recent(tx, 10)
+  assert list.length(db_rows) == 1
+  assert string.contains(render_html(model_done), ">Post</button>")
+
+  // PostSaveFailed also clears submitting so the user can retry without losing their draft
+  let #(failed_model, _) =
+    timeline.update(submitting_model, timeline.PostSaveFailed("DB error"))
+  assert !failed_model.submitting
+  assert failed_model.form_key == 0
+  assert failed_model.form_error == Some("DB error")
+}

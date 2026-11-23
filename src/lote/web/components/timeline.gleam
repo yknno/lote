@@ -144,6 +144,7 @@ pub type Model {
     auto_refresh: Bool,
     confirming_delete: Option(String),
     form_key: Int,
+    submitting: Bool,
     form_error: Option(String),
     timeline_error: Option(String),
   )
@@ -344,6 +345,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       auto_refresh: False,
       confirming_delete: None,
       form_key: 0,
+      submitting: False,
       form_error: None,
       timeline_error: None,
     ),
@@ -354,9 +356,9 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
 pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
   case msg {
     UserSubmittedForm(fields) -> {
-      case model.user {
-        None -> #(model, effect.none())
-        Some(auth_user) -> {
+      case model.user, model.submitting {
+        _, True | None, _ -> #(model, effect.none())
+        Some(auth_user), False -> {
           let raw_body = case list.key_find(fields, "body") {
             Ok(value) -> value
             Error(_) -> ""
@@ -461,7 +463,10 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                     }
                   }
                 })
-              #(Model(..model, form_error: None), save_and_publish)
+              #(
+                Model(..model, submitting: True, form_error: None),
+                save_and_publish,
+              )
             }
           }
         }
@@ -610,6 +615,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               loading_newer: False,
               pending_ids:,
               form_key: model.form_key + 1,
+              submitting: False,
               form_error: None,
             ),
             effect.none(),
@@ -630,6 +636,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
               loading_newer: False,
               pending_ids:,
               form_key: model.form_key + 1,
+              submitting: False,
               form_error: None,
             ),
             effect.none(),
@@ -638,7 +645,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
 
     PostSaveFailed(message) -> #(
-      Model(..model, form_error: Some(message)),
+      Model(..model, submitting: False, form_error: Some(message)),
       effect.none(),
     )
 
@@ -1054,6 +1061,10 @@ fn composer_pane(model: Model) -> Element(Msg) {
                 "lote-composer",
                 [
                   attribute.attribute("max", max_str),
+                  case model.submitting {
+                    True -> attribute.attribute("submitting", "")
+                    False -> attribute.none()
+                  },
                   attribute.class("flex flex-col gap-3"),
                 ],
                 [
@@ -1086,11 +1097,17 @@ fn composer_pane(model: Model) -> Element(Msg) {
                       html.button(
                         [
                           attribute.type_("submit"),
+                          attribute.disabled(model.submitting),
                           attribute.class(
                             "cursor-pointer bg-neutral-950 px-4 py-1.5 text-xs font-medium text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:bg-neutral-300 disabled:hover:bg-neutral-300",
                           ),
                         ],
-                        [html.text("Post")],
+                        [
+                          html.text(case model.submitting {
+                            True -> "Posting..."
+                            False -> "Post"
+                          }),
+                        ],
                       ),
                     ],
                   ),
