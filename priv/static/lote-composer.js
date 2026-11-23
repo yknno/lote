@@ -27,8 +27,10 @@ class LoteComposer extends HTMLElement {
   #onSubmit = (event) => {
     const textarea = this.querySelector('textarea[name="body"]');
     if (!textarea) return;
-    if (countGraphemes(textarea.value) > this.#maxLength()) {
+    const count = countGraphemes(textarea.value.trim());
+    if (count === 0 || count > this.#maxLength()) {
       event.preventDefault();
+      event.stopImmediatePropagation();
       this.#sync();
     }
   };
@@ -39,7 +41,8 @@ class LoteComposer extends HTMLElement {
     this.addEventListener("input", this.#onInput);
     this.#form = this.closest("form");
     if (this.#form) {
-      this.#form.addEventListener("submit", this.#onSubmit);
+      // Use capture phase so our guard runs before Lustre's bubble-phase submit listener.
+      this.#form.addEventListener("submit", this.#onSubmit, { capture: true });
     }
     this.#sync();
   }
@@ -47,7 +50,9 @@ class LoteComposer extends HTMLElement {
   disconnectedCallback() {
     this.removeEventListener("input", this.#onInput);
     if (this.#form) {
-      this.#form.removeEventListener("submit", this.#onSubmit);
+      this.#form.removeEventListener("submit", this.#onSubmit, {
+        capture: true,
+      });
       this.#form = null;
     }
   }
@@ -70,7 +75,7 @@ class LoteComposer extends HTMLElement {
     if (!textarea) return;
 
     const max = this.#maxLength();
-    const count = countGraphemes(textarea.value);
+    const count = countGraphemes(textarea.value.trim());
     const isOver = count > max;
     const isNear = !isOver && count >= Math.max(0, max - 30);
 
