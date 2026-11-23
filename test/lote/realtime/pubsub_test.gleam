@@ -529,4 +529,19 @@ pub fn supervised_named_pubsub_restarts_automatically_after_crash_test() {
   assert process.receive(sub1, 30) == Error(Nil)
 
   process.send_exit(sup.pid)
+
+  // Calling publish/subscribe/unsubscribe while a named PubSub is unregistered
+  // (e.g. during the brief window between crash and supervisor restart) must not panic,
+  // and a subscriber registered during that window is restored once the actor starts.
+  let gap_name = process.new_name("lote_unregistered_gap_pubsub_test")
+  let gap_bus = process.named_subject(gap_name)
+  let gap_sub = process.new_subject()
+  pubsub.publish(gap_bus, "dropped-during-restart")
+  pubsub.subscribe(gap_bus, gap_sub)
+
+  let assert Ok(started_gap) = pubsub.start_named(gap_name, pubsub.Memory)
+  assert pubsub.subscriber_count(gap_bus) == 1
+  pubsub.publish(gap_bus, "delivered-after-start")
+  assert process.receive(gap_sub, 200) == Ok("delivered-after-start")
+  pubsub.stop(started_gap.data)
 }

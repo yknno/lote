@@ -82,6 +82,12 @@ fn load_saved_subscribers_from_ets(
   name: Name(Message(event)),
 ) -> List(Subject(event))
 
+@external(erlang, "lote_pubsub_ffi", "safe_send_named_subject")
+fn safe_send_named_subject(
+  name: Name(Message(event)),
+  message: Message(event),
+) -> Nil
+
 pub fn start() -> Result(PubSub(event), actor.StartError) {
   start_with_adapter(Memory)
 }
@@ -266,24 +272,43 @@ fn start_actor(
   actor.start(builder)
 }
 
+fn safe_send(pubsub: PubSub(event), message: Message(event)) -> Nil {
+  case process.subject_name(pubsub) {
+    Ok(name) -> safe_send_named_subject(name, message)
+    Error(_) -> process.send(pubsub, message)
+  }
+}
+
 pub fn subscribe(pubsub: PubSub(event), subscriber: Subject(event)) -> Nil {
-  process.send(pubsub, Subscribe(subscriber))
+  case process.subject_name(pubsub), process.subject_owner(subscriber) {
+    Ok(pubsub_name), Ok(pid) ->
+      case process.is_alive(pid) {
+        True -> save_subscriber_in_ets(pubsub_name, subscriber)
+        False -> Nil
+      }
+    _, _ -> Nil
+  }
+  safe_send(pubsub, Subscribe(subscriber))
 }
 
 pub fn unsubscribe(pubsub: PubSub(event), subscriber: Subject(event)) -> Nil {
-  process.send(pubsub, Unsubscribe(subscriber))
+  case process.subject_name(pubsub) {
+    Ok(pubsub_name) -> delete_saved_subscriber_in_ets(pubsub_name, subscriber)
+    Error(_) -> Nil
+  }
+  safe_send(pubsub, Unsubscribe(subscriber))
 }
 
 pub fn publish(pubsub: PubSub(event), event: event) -> Nil {
-  process.send(pubsub, Publish(event))
+  safe_send(pubsub, Publish(event))
 }
 
 pub fn broadcast_local(pubsub: PubSub(event), event: event) -> Nil {
-  process.send(pubsub, BroadcastLocal(event))
+  safe_send(pubsub, BroadcastLocal(event))
 }
 
 pub fn receive_payload(pubsub: PubSub(event), payload: String) -> Nil {
-  process.send(pubsub, ReceivePayload(payload))
+  safe_send(pubsub, ReceivePayload(payload))
 }
 
 pub fn subscriber_count(pubsub: PubSub(event)) -> Int {
@@ -291,7 +316,11 @@ pub fn subscriber_count(pubsub: PubSub(event)) -> Int {
 }
 
 pub fn stop(pubsub: PubSub(event)) -> Nil {
-  process.send(pubsub, Shutdown)
+  case process.subject_name(pubsub) {
+    Ok(pubsub_name) -> clear_saved_subscribers_in_ets(pubsub_name)
+    Error(_) -> Nil
+  }
+  safe_send(pubsub, Shutdown)
 }
 
 pub fn pg_notify(
@@ -336,7 +365,7 @@ fn start_publisher_worker(
           <> channel
           <> "\"; falling back to local delivery",
         )
-        process.send(pubsub, BroadcastLocal(event))
+        safe_send(pubsub, BroadcastLocal(event))
       }
       False ->
         case pg_notify(db, channel, payload) {
@@ -351,7 +380,7 @@ fn start_publisher_worker(
               <> string.inspect(err)
               <> "; falling back to local delivery",
             )
-            process.send(pubsub, BroadcastLocal(event))
+            safe_send(pubsub, BroadcastLocal(event))
           }
         }
     }
@@ -368,7 +397,7 @@ fn start_decoder_worker(
   actor.new(Nil)
   |> actor.on_message(fn(state, payload) {
     case decode_payload(payload) {
-      Ok(event) -> process.send(pubsub, BroadcastLocal(event))
+      Ok(event) -> safe_send(pubsub, BroadcastLocal(event))
       Error(_) ->
         wisp.log_warning(
           "Postgres PubSub failed to decode notification payload on channel \""
