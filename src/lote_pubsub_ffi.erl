@@ -1,8 +1,61 @@
 -module(lote_pubsub_ffi).
 
--export([spawn_listener/2, start_and_listen/2]).
+-export([
+    clear_saved_subscribers/1,
+    delete_saved_subscriber/2,
+    load_saved_subscribers/1,
+    save_subscriber/2,
+    spawn_listener/2,
+    start_and_listen/2
+]).
 
 -include_lib("pog/include/pog_Config.hrl").
+
+-define(SUBSCRIBER_ETS_TABLE, lote_pubsub_subscribers).
+
+ensure_subscriber_table() ->
+    case ets:whereis(?SUBSCRIBER_ETS_TABLE) of
+        undefined ->
+            Owner =
+                case whereis(init) of
+                    undefined -> self();
+                    InitPid -> InitPid
+                end,
+            try
+                ets:new(?SUBSCRIBER_ETS_TABLE, [
+                    named_table,
+                    public,
+                    bag,
+                    {heir, Owner, none},
+                    {read_concurrency, true},
+                    {write_concurrency, true}
+                ])
+            catch
+                error:badarg ->
+                    ?SUBSCRIBER_ETS_TABLE
+            end;
+        _Tid ->
+            ?SUBSCRIBER_ETS_TABLE
+    end.
+
+save_subscriber(Name, Subscriber) ->
+    ensure_subscriber_table(),
+    ets:insert(?SUBSCRIBER_ETS_TABLE, {Name, Subscriber}),
+    nil.
+
+delete_saved_subscriber(Name, Subscriber) ->
+    ensure_subscriber_table(),
+    ets:delete_object(?SUBSCRIBER_ETS_TABLE, {Name, Subscriber}),
+    nil.
+
+clear_saved_subscribers(Name) ->
+    ensure_subscriber_table(),
+    ets:delete(?SUBSCRIBER_ETS_TABLE, Name),
+    nil.
+
+load_saved_subscribers(Name) ->
+    ensure_subscriber_table(),
+    [Subscriber || {_Key, Subscriber} <- ets:lookup(?SUBSCRIBER_ETS_TABLE, Name)].
 
 default_ssl_options(Host, Ssl) ->
     case Ssl of

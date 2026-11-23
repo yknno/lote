@@ -4,6 +4,7 @@ import gleam/dynamic/decode
 import gleam/erlang/atom
 import gleam/erlang/process.{type Monitor, type Name, type Pid, type Subject}
 import gleam/int
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
 import gleam/otp/supervision.{type ChildSpecification}
@@ -46,6 +47,7 @@ pub type PubSub(event) =
 type State(event) {
   State(
     self: Subject(Message(event)),
+    name: Option(Name(Message(event))),
     subscribers: Dict(Subject(event), Monitor),
     adapter: Adapter(event),
     listener_monitor: Option(Monitor),
@@ -59,6 +61,26 @@ type State(event) {
 
 @external(erlang, "lote_pubsub_ffi", "spawn_listener")
 fn spawn_pg_listener(config: pog.Config, channel: String) -> Result(Pid, String)
+
+@external(erlang, "lote_pubsub_ffi", "save_subscriber")
+fn save_subscriber_in_ets(
+  name: Name(Message(event)),
+  subscriber: Subject(event),
+) -> Nil
+
+@external(erlang, "lote_pubsub_ffi", "delete_saved_subscriber")
+fn delete_saved_subscriber_in_ets(
+  name: Name(Message(event)),
+  subscriber: Subject(event),
+) -> Nil
+
+@external(erlang, "lote_pubsub_ffi", "clear_saved_subscribers")
+fn clear_saved_subscribers_in_ets(name: Name(Message(event))) -> Nil
+
+@external(erlang, "lote_pubsub_ffi", "load_saved_subscribers")
+fn load_saved_subscribers_from_ets(
+  name: Name(Message(event)),
+) -> List(Subject(event))
 
 pub fn start() -> Result(PubSub(event), actor.StartError) {
   start_with_adapter(Memory)
@@ -83,6 +105,39 @@ pub fn supervised(
   adapter: Adapter(event),
 ) -> ChildSpecification(PubSub(event)) {
   supervision.worker(fn() { start_named(name, adapter) })
+}
+
+fn restore_named_subscribers(
+  name: Option(Name(Message(event))),
+) -> Dict(Subject(event), Monitor) {
+  case name {
+    None -> dict.new()
+    Some(pubsub_name) ->
+      load_saved_subscribers_from_ets(pubsub_name)
+      |> list.fold(dict.new(), fn(acc, subscriber) {
+        case dict.has_key(acc, subscriber) {
+          True -> acc
+          False ->
+            case process.subject_owner(subscriber) {
+              Ok(pid) ->
+                case process.is_alive(pid) {
+                  True -> {
+                    let monitor = process.monitor(pid)
+                    dict.insert(acc, subscriber, monitor)
+                  }
+                  False -> {
+                    delete_saved_subscriber_in_ets(pubsub_name, subscriber)
+                    acc
+                  }
+                }
+              Error(_) -> {
+                delete_saved_subscriber_in_ets(pubsub_name, subscriber)
+                acc
+              }
+            }
+        }
+      })
+  }
 }
 
 fn start_actor(
@@ -183,9 +238,12 @@ fn start_actor(
           )
       }
 
+      let subscribers = restore_named_subscribers(name)
+
       actor.initialised(State(
         self:,
-        subscribers: dict.new(),
+        name:,
+        subscribers:,
         adapter:,
         listener_monitor:,
         reconnect_attempt: 0,
@@ -334,12 +392,21 @@ fn handle_message(
         False ->
           case process.subject_owner(subscriber) {
             Error(_) -> actor.continue(state)
-            Ok(pid) -> {
-              let monitor = process.monitor(pid)
-              let subscribers =
-                dict.insert(state.subscribers, subscriber, monitor)
-              actor.continue(State(..state, subscribers:))
-            }
+            Ok(pid) ->
+              case process.is_alive(pid) {
+                False -> actor.continue(state)
+                True -> {
+                  let monitor = process.monitor(pid)
+                  case state.name {
+                    Some(pubsub_name) ->
+                      save_subscriber_in_ets(pubsub_name, subscriber)
+                    None -> Nil
+                  }
+                  let subscribers =
+                    dict.insert(state.subscribers, subscriber, monitor)
+                  actor.continue(State(..state, subscribers:))
+                }
+              }
           }
       }
 
@@ -347,6 +414,11 @@ fn handle_message(
       case dict.get(state.subscribers, subscriber) {
         Ok(monitor) -> {
           process.demonitor_process(monitor)
+          case state.name {
+            Some(pubsub_name) ->
+              delete_saved_subscriber_in_ets(pubsub_name, subscriber)
+            None -> Nil
+          }
           let subscribers = dict.delete(state.subscribers, subscriber)
           actor.continue(State(..state, subscribers:))
         }
@@ -486,6 +558,17 @@ fn handle_message(
           )
         }
         _ -> {
+          case state.name {
+            Some(pubsub_name) ->
+              dict.each(state.subscribers, fn(subscriber, m) {
+                case m == monitor {
+                  True ->
+                    delete_saved_subscriber_in_ets(pubsub_name, subscriber)
+                  False -> Nil
+                }
+              })
+            None -> Nil
+          }
           let subscribers =
             dict.filter(state.subscribers, fn(_, m) { m != monitor })
           actor.continue(State(..state, subscribers:))
@@ -498,6 +581,10 @@ fn handle_message(
     }
 
     Shutdown -> {
+      case state.name {
+        Some(pubsub_name) -> clear_saved_subscribers_in_ets(pubsub_name)
+        None -> Nil
+      }
       case state.publisher_pid {
         Some(pid) -> {
           process.unlink(pid)
