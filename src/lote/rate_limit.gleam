@@ -1,3 +1,5 @@
+import gleam/bit_array
+import gleam/crypto
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Name, type Subject}
@@ -35,8 +37,13 @@ pub type Decision {
 }
 
 pub opaque type Message {
-  Check(key: String, policy: Policy, now_ms: Int, reply_to: Subject(Decision))
-  Reset(key: String)
+  Check(
+    hashed_key: String,
+    policy: Policy,
+    now_ms: Int,
+    reply_to: Subject(Decision),
+  )
+  Reset(hashed_key: String)
   Sweep
   Stop
 }
@@ -48,8 +55,8 @@ pub opaque type CleanupMessage {
 
 pub opaque type Limiter {
   DisabledLimiter
-  MemoryLimiter(subject: Subject(Message))
-  PostgresLimiter(db: pog.Connection)
+  MemoryLimiter(subject: Subject(Message), key_secret: String)
+  PostgresLimiter(db: pog.Connection, key_secret: String)
 }
 
 type MemoryState {
@@ -74,34 +81,38 @@ pub fn disabled() -> Limiter {
   DisabledLimiter
 }
 
-pub fn postgres(db: pog.Connection) -> Limiter {
-  PostgresLimiter(db:)
+pub fn postgres(db: pog.Connection, key_secret: String) -> Limiter {
+  PostgresLimiter(db:, key_secret:)
 }
 
-pub fn memory_named(name: Name(Message)) -> Limiter {
-  MemoryLimiter(subject: process.named_subject(name))
+pub fn memory_named(name: Name(Message), key_secret: String) -> Limiter {
+  MemoryLimiter(subject: process.named_subject(name), key_secret:)
 }
 
-pub fn start_memory() -> Result(Limiter, actor.StartError) {
-  start_memory_with_options(
-    None,
+pub fn start_memory(key_secret: String) -> Result(Limiter, actor.StartError) {
+  start_memory_with_cap(
+    key_secret,
     default_max_memory_entries,
     default_sweep_interval_ms,
   )
-  |> result.map(fn(started) { started.data })
 }
 
 pub fn start_memory_with_cap(
+  key_secret: String,
   max_entries: Int,
   sweep_interval_ms: Int,
 ) -> Result(Limiter, actor.StartError) {
-  start_memory_with_options(None, max_entries, sweep_interval_ms)
-  |> result.map(fn(started) { started.data })
+  start_memory_actor(None, max_entries, sweep_interval_ms)
+  |> result.map(fn(started) {
+    MemoryLimiter(subject: started.data, key_secret:)
+  })
 }
 
-pub fn supervised_memory(name: Name(Message)) -> ChildSpecification(Limiter) {
+pub fn supervised_memory(
+  name: Name(Message),
+) -> ChildSpecification(Subject(Message)) {
   supervision.worker(fn() {
-    start_memory_with_options(
+    start_memory_actor(
       Some(name),
       default_max_memory_entries,
       default_sweep_interval_ms,
@@ -109,11 +120,11 @@ pub fn supervised_memory(name: Name(Message)) -> ChildSpecification(Limiter) {
   })
 }
 
-fn start_memory_with_options(
+fn start_memory_actor(
   name: Option(Name(Message)),
   max_entries: Int,
   sweep_interval_ms: Int,
-) -> Result(actor.Started(Limiter), actor.StartError) {
+) -> Result(actor.Started(Subject(Message)), actor.StartError) {
   let effective_max = int.max(max_entries, 1)
   let effective_sweep = int.max(sweep_interval_ms, 1)
 
@@ -126,7 +137,7 @@ fn start_memory_with_options(
         max_entries: effective_max,
         sweep_interval_ms: effective_sweep,
       ))
-      |> actor.returning(MemoryLimiter(subject: self))
+      |> actor.returning(self)
       |> Ok
     })
     |> actor.on_message(handle_memory_message)
@@ -141,7 +152,7 @@ fn start_memory_with_options(
 
 pub fn stop_memory(limiter: Limiter) -> Nil {
   case limiter {
-    MemoryLimiter(subject:) -> process.send(subject, Stop)
+    MemoryLimiter(subject:, ..) -> process.send(subject, Stop)
     DisabledLimiter | PostgresLimiter(..) -> Nil
   }
 }
@@ -181,6 +192,16 @@ pub fn stop_postgres_cleanup(cleaner: Subject(CleanupMessage)) -> Nil {
   process.send(cleaner, CleanupStop)
 }
 
+/// Derive a fixed-length opaque storage key via HMAC-SHA256 so raw IPs,
+/// login IDs, and user IDs are never stored in memory, PostgreSQL, or logs.
+pub fn hash_key(key_secret: String, raw_key: String) -> String {
+  crypto.hmac(<<"rate_limit:":utf8, raw_key:utf8>>, crypto.Sha256, <<
+    key_secret:utf8,
+  >>)
+  |> bit_array.base16_encode
+  |> string.lowercase
+}
+
 pub fn now_ms() -> Int {
   let #(seconds, nanoseconds) =
     timestamp.system_time()
@@ -200,32 +221,36 @@ pub fn check_at(
 ) -> Decision {
   case limiter {
     DisabledLimiter -> Allowed(remaining: int.max(policy.burst - 1, 0))
-    MemoryLimiter(subject:) ->
+    MemoryLimiter(subject:, key_secret:) -> {
+      let hashed_key = hash_key(key_secret, key)
       actor.call(subject, waiting: 1000, sending: fn(reply_to) {
-        Check(key:, policy:, now_ms: current_ms, reply_to:)
+        Check(hashed_key:, policy:, now_ms: current_ms, reply_to:)
       })
-    PostgresLimiter(db:) -> check_postgres(db, key, policy, current_ms)
+    }
+    PostgresLimiter(db:, key_secret:) -> {
+      let hashed_key = hash_key(key_secret, key)
+      check_postgres(db, hashed_key, policy, current_ms)
+    }
   }
 }
 
 pub fn reset(limiter: Limiter, key: String) -> Nil {
   case limiter {
     DisabledLimiter -> Nil
-    MemoryLimiter(subject:) -> process.send(subject, Reset(key))
-    PostgresLimiter(db:) -> {
+    MemoryLimiter(subject:, key_secret:) ->
+      process.send(subject, Reset(hash_key(key_secret, key)))
+    PostgresLimiter(db:, key_secret:) -> {
+      let hashed_key = hash_key(key_secret, key)
       case
         pog.query("DELETE FROM rate_limits WHERE key = $1")
-        |> pog.parameter(pog.text(key))
+        |> pog.parameter(pog.text(hashed_key))
         |> pog.returning(decode.dynamic)
         |> pog.execute(db)
       {
         Ok(_) -> Nil
         Error(err) ->
           wisp.log_warning(
-            "Failed to reset rate limit key \""
-            <> key
-            <> "\": "
-            <> string.inspect(err),
+            "Failed to reset rate limit entry: " <> string.inspect(err),
           )
       }
     }
@@ -307,7 +332,7 @@ fn ceil_seconds(wait_ms: Int) -> Int {
 
 fn check_postgres(
   db: pog.Connection,
-  key: String,
+  hashed_key: String,
   policy: Policy,
   current_ms: Int,
 ) -> Decision {
@@ -335,7 +360,7 @@ fn check_postgres(
 
   case
     pog.query(sql)
-    |> pog.parameter(pog.text(key))
+    |> pog.parameter(pog.text(hashed_key))
     |> pog.parameter(pog.int(current_ms))
     |> pog.parameter(pog.int(emission_ms))
     |> pog.parameter(pog.int(tolerance_ms))
@@ -356,9 +381,7 @@ fn check_postgres(
       Allowed(remaining: int.max(policy.burst - 1, 0))
     Error(err) -> {
       wisp.log_warning(
-        "Postgres rate limit query failed for key \""
-        <> key
-        <> "\" (failing open): "
+        "Postgres rate limit query failed (failing open): "
         <> string.inspect(err),
       )
       Allowed(remaining: int.max(policy.burst - 1, 0))
@@ -371,8 +394,8 @@ fn handle_memory_message(
   message: Message,
 ) -> actor.Next(MemoryState, Message) {
   case message {
-    Check(key:, policy:, now_ms: current_ms, reply_to:) -> {
-      let existing_tat = case dict.get(state.entries, key) {
+    Check(hashed_key:, policy:, now_ms: current_ms, reply_to:) -> {
+      let existing_tat = case dict.get(state.entries, hashed_key) {
         Ok(tat) -> tat
         Error(_) -> current_ms
       }
@@ -380,13 +403,13 @@ fn handle_memory_message(
       let entries = case decision {
         Allowed(_) -> {
           let bounded = case
-            !dict.has_key(state.entries, key)
+            !dict.has_key(state.entries, hashed_key)
             && dict.size(state.entries) >= state.max_entries
           {
             True -> evict_entries(state.entries, current_ms, state.max_entries)
             False -> state.entries
           }
-          dict.insert(bounded, key, new_tat)
+          dict.insert(bounded, hashed_key, new_tat)
         }
         Limited(_) -> state.entries
       }
@@ -394,9 +417,9 @@ fn handle_memory_message(
       actor.continue(MemoryState(..state, entries:))
     }
 
-    Reset(key) ->
+    Reset(hashed_key) ->
       actor.continue(
-        MemoryState(..state, entries: dict.delete(state.entries, key)),
+        MemoryState(..state, entries: dict.delete(state.entries, hashed_key)),
       )
 
     Sweep -> {

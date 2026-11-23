@@ -1,10 +1,15 @@
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/option.{None, Some}
 import gleam/otp/static_supervisor as supervisor
+import gleam/string
 import lote/config
 import lote/rate_limit
 import lote/test_helper
 import lote/web/client_ip
+import pog
+
+const test_secret = "rate_limit_test_secret_key_base_0123456789abcdef"
 
 pub fn gcra_burst_refill_and_retry_after_test() {
   // 10 req / 60s (emission = 6000ms), burst = 3
@@ -39,8 +44,23 @@ pub fn gcra_burst_refill_and_retry_after_test() {
   assert d7 == rate_limit.Allowed(remaining: 2)
 }
 
+pub fn hash_key_produces_opaque_secret_keyed_digest_test() {
+  let raw = "login:ip_id:203.0.113.10:alice"
+  let h1 = rate_limit.hash_key(test_secret, raw)
+  let h2 = rate_limit.hash_key("different_secret_key_base", raw)
+
+  // 64 lowercase hex characters (HMAC-SHA256)
+  assert string.length(h1) == 64
+  assert h1 == string.lowercase(h1)
+  assert h1 != h2
+  assert !string.contains(h1, "203.0.113.10")
+  assert !string.contains(h1, "alice")
+  assert !string.contains(h1, "login")
+}
+
 pub fn memory_limiter_enforces_limit_resets_and_bounds_entries_test() {
-  let assert Ok(limiter) = rate_limit.start_memory_with_cap(5, 60_000)
+  let assert Ok(limiter) =
+    rate_limit.start_memory_with_cap(test_secret, 5, 60_000)
   let policy = rate_limit.Policy(limit: 5, window_ms: 50_000, burst: 2)
   let t0 = 2_000_000
 
@@ -73,7 +93,7 @@ pub fn memory_limiter_enforces_limit_resets_and_bounds_entries_test() {
 
 pub fn supervised_memory_limiter_recovers_after_crash_test() {
   let name = process.new_name("lote_rate_limit_sup_test")
-  let limiter = rate_limit.memory_named(name)
+  let limiter = rate_limit.memory_named(name, test_secret)
   let policy = rate_limit.Policy(limit: 5, window_ms: 50_000, burst: 2)
 
   let assert Ok(sup) =
@@ -100,33 +120,48 @@ pub fn supervised_memory_limiter_recovers_after_crash_test() {
   process.send_exit(sup.pid)
 }
 
-pub fn postgres_limiter_enforces_atomic_gcra_reset_and_expired_cleanup_test() {
+pub fn postgres_limiter_enforces_atomic_gcra_hashes_keys_and_cleans_expired_test() {
   use tx <- test_helper.with_db
 
-  let limiter = rate_limit.postgres(tx)
+  let limiter = rate_limit.postgres(tx, test_secret)
   let policy = rate_limit.Policy(limit: 10, window_ms: 60_000, burst: 3)
   let t0 = 5_000_000
+  let raw_key = "login:ip_id:203.0.113.10:alice"
 
-  assert rate_limit.check_at(limiter, "pg:login:1", policy, t0)
+  assert rate_limit.check_at(limiter, raw_key, policy, t0)
     == rate_limit.Allowed(remaining: 2)
-  assert rate_limit.check_at(limiter, "pg:login:1", policy, t0)
+  assert rate_limit.check_at(limiter, raw_key, policy, t0)
     == rate_limit.Allowed(remaining: 1)
-  assert rate_limit.check_at(limiter, "pg:login:1", policy, t0)
+  assert rate_limit.check_at(limiter, raw_key, policy, t0)
     == rate_limit.Allowed(remaining: 0)
 
+  // Verify PostgreSQL stores only the HMAC-SHA256 digest and never raw IP or login_id
+  let key_decoder = {
+    use k <- decode.field(0, decode.string)
+    decode.success(k)
+  }
+  let assert Ok(pog.Returned(rows: [stored_key], ..)) =
+    pog.query("SELECT key FROM rate_limits")
+    |> pog.returning(key_decoder)
+    |> pog.execute(tx)
+  assert stored_key == rate_limit.hash_key(test_secret, raw_key)
+  assert string.length(stored_key) == 64
+  assert !string.contains(stored_key, "203.0.113.10")
+  assert !string.contains(stored_key, "alice")
+
   // 4th attempt is limited with exact 6s retry-after and does not mutate tat
-  assert rate_limit.check_at(limiter, "pg:login:1", policy, t0)
+  assert rate_limit.check_at(limiter, raw_key, policy, t0)
     == rate_limit.Limited(retry_after_seconds: 6)
-  assert rate_limit.check_at(limiter, "pg:login:1", policy, t0 + 3500)
+  assert rate_limit.check_at(limiter, raw_key, policy, t0 + 3500)
     == rate_limit.Limited(retry_after_seconds: 3)
 
   // After 1 emission interval (6000ms), allowed again
-  assert rate_limit.check_at(limiter, "pg:login:1", policy, t0 + 6000)
+  assert rate_limit.check_at(limiter, raw_key, policy, t0 + 6000)
     == rate_limit.Allowed(remaining: 0)
 
-  // Reset clears the key
-  rate_limit.reset(limiter, "pg:login:1")
-  assert rate_limit.check_at(limiter, "pg:login:1", policy, t0)
+  // Reset clears the hashed key
+  rate_limit.reset(limiter, raw_key)
+  assert rate_limit.check_at(limiter, raw_key, policy, t0)
     == rate_limit.Allowed(remaining: 2)
 
   // Expired cleanup deletes only entries whose tat_ms <= current_ms
