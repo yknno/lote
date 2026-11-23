@@ -7,6 +7,7 @@ import lote/realtime/pubsub
 import lote/web/auth/password_handler
 import lote/web/auth/view
 import lote/web/csrf
+import lote/web/http_rate_limit
 import wisp
 
 pub fn handle_request(
@@ -35,6 +36,7 @@ pub fn handle_request(
         form.values,
         auth_ctx.secret_key_base,
       )
+      use <- http_rate_limit.require_ip_write(auth_ctx.rate_limiter, client_ip)
       let revoked_id = session.session_id(req, auth_ctx.secret_key_base)
       let resp =
         wisp.redirect(to: "/")

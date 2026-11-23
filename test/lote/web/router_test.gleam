@@ -18,7 +18,9 @@ import lote/web/auth/password_handler
 import lote/web/client_ip
 import lote/web/components/timeline
 import lote/web/csrf
+import lote/web/http_rate_limit
 import lote/web/router
+import wisp
 import wisp/simulate
 
 fn extract_between(body: String, before: String, after: String) -> String {
@@ -997,6 +999,146 @@ pub fn password_login_rate_limits_by_ip_and_account_and_resets_on_success_test()
   let v6_other_prefix_ok =
     submit_login("2001:db8:aaaa:bbbc::1", "rate_alice", "correctpass123")
   assert v6_other_prefix_ok.status == 303
+
+  rate_limit.stop_memory(rate_limiter)
+}
+
+pub fn http_write_endpoints_enforce_user_and_ip_rate_limits_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+  let assert Ok(post_pubsub) = pubsub.start()
+  let secret = "write_rl_secret_key_base_0123456789abcdefghijklmnopqrstuvwxyz"
+  let assert Ok(rate_limiter) = rate_limit.start_memory(secret)
+
+  let assert Ok(alice) = user.create(tx, "WriteAlice")
+  let assert Ok(bob) = user.create(tx, "WriteBob")
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: secret,
+      methods: [Password],
+      session_revocations:,
+      rate_limiter:,
+    )
+
+  let login_req = simulate.browser_request(http.Post, "/auth/password/login")
+  let assert Ok(alice_login) =
+    session.create(wisp.ok(), login_req, tx, secret, alice)
+  let alice_sessions_req =
+    simulate.browser_request(http.Get, "/sessions")
+    |> simulate.session(login_req, alice_login)
+  let alice_sessions_resp =
+    router.handle_request(alice_sessions_req, auth_ctx, post_pubsub)
+  let alice_csrf =
+    extract_form_csrf_token(simulate.read_body(alice_sessions_resp))
+
+  // Exhaust Alice's user write burst (10) via revoke-others
+  let _ =
+    int.range(
+      from: 1,
+      to: http_rate_limit.write_policy.burst + 1,
+      with: Nil,
+      run: fn(_, _) {
+        let resp =
+          simulate.browser_request(http.Post, "/sessions/revoke-others")
+          |> simulate.session(alice_sessions_req, alice_sessions_resp)
+          |> simulate.form_body([#(csrf.form_field_name, alice_csrf)])
+          |> router.handle_request(auth_ctx, post_pubsub)
+        assert resp.status == 303
+        Nil
+      },
+    )
+
+  // Next write by Alice (e.g. POST /posts/:id/delete) is rate-limited with 429 + Retry-After + no-store
+  let assert Ok(alice_post) = post_repo.create(tx, alice.id, "protected by rl")
+  let delete_limited =
+    simulate.browser_request(http.Post, "/posts/" <> alice_post.id <> "/delete")
+    |> simulate.session(alice_sessions_req, alice_sessions_resp)
+    |> simulate.form_body([#(csrf.form_field_name, alice_csrf)])
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert delete_limited.status == 429
+  assert response.get_header(delete_limited, "cache-control") == Ok("no-store")
+  let assert Ok(retry_after) =
+    response.get_header(delete_limited, "retry-after")
+  let assert Ok(retry_sec) = int.parse(retry_after)
+  assert retry_sec >= 1
+  // Post was NOT deleted while rate-limited
+  let assert Ok(Some(_)) = post_repo.find_by_id(tx, alice_post.id)
+
+  // Bob's user write bucket is independent and succeeds
+  let assert Ok(bob_login) =
+    session.create(wisp.ok(), login_req, tx, secret, bob)
+  let bob_sessions_req =
+    simulate.browser_request(http.Get, "/sessions")
+    |> simulate.session(login_req, bob_login)
+  let bob_sessions_resp =
+    router.handle_request(bob_sessions_req, auth_ctx, post_pubsub)
+  let bob_csrf = extract_form_csrf_token(simulate.read_body(bob_sessions_resp))
+  let bob_revoke =
+    simulate.browser_request(http.Post, "/sessions/revoke-others")
+    |> simulate.session(bob_sessions_req, bob_sessions_resp)
+    |> simulate.form_body([#(csrf.form_field_name, bob_csrf)])
+    |> router.handle_request(auth_ctx, post_pubsub)
+  assert bob_revoke.status == 303
+
+  // POST /auth/logout enforces per-IP write rate limit
+  let logout_ip = "203.0.113.88"
+  let page_req = simulate.browser_request(http.Get, "/auth/login")
+  let page_resp = router.handle_request(page_req, auth_ctx, post_pubsub)
+  let logout_csrf = extract_form_csrf_token(simulate.read_body(page_resp))
+  let _ =
+    int.range(
+      from: 1,
+      to: http_rate_limit.write_policy.burst + 1,
+      with: Nil,
+      run: fn(_, _) {
+        let resp =
+          simulate.browser_request(http.Post, "/auth/logout")
+          |> simulate.session(page_req, page_resp)
+          |> simulate.form_body([#(csrf.form_field_name, logout_csrf)])
+          |> router.handle_request_with_ip(auth_ctx, post_pubsub, logout_ip)
+        assert resp.status == 303
+        Nil
+      },
+    )
+  let logout_limited =
+    simulate.browser_request(http.Post, "/auth/logout")
+    |> simulate.session(page_req, page_resp)
+    |> simulate.form_body([#(csrf.form_field_name, logout_csrf)])
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, logout_ip)
+  assert logout_limited.status == 429
+  assert response.get_header(logout_limited, "cache-control") == Ok("no-store")
+
+  // IPv6 logout writes rotating within the same /64 share a bucket
+  let _ =
+    int.range(
+      from: 1,
+      to: http_rate_limit.write_policy.burst + 1,
+      with: Nil,
+      run: fn(_, n) {
+        let resp =
+          simulate.browser_request(http.Post, "/auth/logout")
+          |> simulate.session(page_req, page_resp)
+          |> simulate.form_body([#(csrf.form_field_name, logout_csrf)])
+          |> router.handle_request_with_ip(
+            auth_ctx,
+            post_pubsub,
+            "2001:db8:feed:1::" <> int.to_string(n),
+          )
+        assert resp.status == 303
+        Nil
+      },
+    )
+  let logout_v6_limited =
+    simulate.browser_request(http.Post, "/auth/logout")
+    |> simulate.session(page_req, page_resp)
+    |> simulate.form_body([#(csrf.form_field_name, logout_csrf)])
+    |> router.handle_request_with_ip(
+      auth_ctx,
+      post_pubsub,
+      "2001:db8:feed:1:ffff::99",
+    )
+  assert logout_v6_limited.status == 429
 
   rate_limit.stop_memory(rate_limiter)
 }

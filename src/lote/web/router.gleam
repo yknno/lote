@@ -9,6 +9,7 @@ import lote/realtime/pubsub.{type PubSub}
 import lote/web/auth/handler as auth_handler
 import lote/web/components/timeline
 import lote/web/csrf
+import lote/web/http_rate_limit
 import lote/web/post/view as post_view
 import lote/web/sessions/handler as sessions_handler
 import lustre/attribute
@@ -82,7 +83,11 @@ pub fn handle_request_with_ip(
       )
       case session.current_user(req, auth_ctx.db, auth_ctx.secret_key_base) {
         None -> wisp.response(401)
-        Some(auth_user) ->
+        Some(auth_user) -> {
+          use <- http_rate_limit.require_user_write(
+            auth_ctx.rate_limiter,
+            auth_user.id,
+          )
           case post_repo.delete(auth_ctx.db, id, auth_user.id) {
             Ok(True) -> {
               pubsub.publish(
@@ -94,6 +99,7 @@ pub fn handle_request_with_ip(
             Ok(False) -> wisp.not_found()
             Error(_) -> wisp.internal_server_error()
           }
+        }
       }
     }
     _, ["posts", _, "delete"] -> wisp.method_not_allowed([http.Post])
