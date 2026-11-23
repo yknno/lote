@@ -30,7 +30,7 @@ const max_age_seconds = 604_800
 const max_user_agent_length = 512
 
 pub type ActiveSession {
-  ActiveSession(id: String, user: AuthUser)
+  ActiveSession(id: String, user: AuthUser, expires_at: Timestamp)
 }
 
 pub type SessionInfo {
@@ -255,8 +255,9 @@ pub fn current_session(
 ) -> Option(ActiveSession) {
   case read_session_id(req, secret_key_base) {
     Ok(id) ->
-      case find_user(db, id) {
-        Some(user) -> Some(ActiveSession(id:, user:))
+      case find_active_session(db, id) {
+        Some(#(user, expires_at)) ->
+          Some(ActiveSession(id:, user:, expires_at:))
         None -> None
       }
     Error(_) -> None
@@ -274,7 +275,10 @@ pub fn current_user(
   }
 }
 
-fn find_user(db: pog.Connection, session_id: String) -> Option(AuthUser) {
+fn find_active_session(
+  db: pog.Connection,
+  session_id: String,
+) -> Option(#(AuthUser, Timestamp)) {
   let query =
     s.new()
     |> s.from_table("sessions")
@@ -283,7 +287,11 @@ fn find_user(db: pog.Connection, session_id: String) -> Option(AuthUser) {
       on: w.eq(w.col("users.id"), w.col("sessions.user_id")),
       alias: "users",
     ))
-    |> s.selects([s.col("users.id"), s.col("users.name")])
+    |> s.selects([
+      s.col("users.id"),
+      s.col("users.name"),
+      s.col("sessions.expires_at"),
+    ])
     |> s.where(
       w.and([
         w.eq(w.col("sessions.id"), w.string(session_id)),
@@ -296,11 +304,12 @@ fn find_user(db: pog.Connection, session_id: String) -> Option(AuthUser) {
   let decoder = {
     use id <- decode.field(0, decode.int)
     use name <- decode.field(1, decode.string)
-    decode.success(AuthUser(id:, name:))
+    use expires_at <- decode.field(2, timestamptz_decoder())
+    decode.success(#(AuthUser(id:, name:), expires_at))
   }
 
   case postgres.run_read_query(query, decoder, db) {
-    Ok([auth_user, ..]) -> Some(auth_user)
+    Ok([active, ..]) -> Some(active)
     _ -> None
   }
 }
