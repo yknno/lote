@@ -199,7 +199,7 @@ pub fn handler_with_proxy_hops(
   fn(req: Request(Connection)) -> Response(ResponseData) {
     let ip = client_ip.from_mist_request(req, trusted_proxy_hops)
     case request.path_segments(req) {
-      ["ws"] -> serve_timeline_ws(req, db, post_pubsub, auth_ctx)
+      ["ws"] -> serve_timeline_ws(req, db, post_pubsub, auth_ctx, ip)
       _ ->
         wisp_mist.handler(
           router.handle_request_with_ip(_, auth_ctx, post_pubsub, ip),
@@ -210,6 +210,12 @@ pub fn handler_with_proxy_hops(
 }
 
 const max_expiry_timer_ms = 86_400_000
+
+pub const ws_connect_policy =
+  rate_limit.Policy(limit: 30, window_ms: 60_000, burst: 10)
+
+pub const ws_frame_policy =
+  rate_limit.Policy(limit: 30, window_ms: 10_000, burst: 30)
 
 pub type WsMsg {
   ComponentMessage(server_component.ClientMessage(timeline.Msg))
@@ -225,6 +231,18 @@ pub type WsState {
     session_expires_at: Option(Timestamp),
     expiry_subject: Option(Subject(Nil)),
     expiry_timer: Option(process.Timer),
+    frame_tat_ms: Int,
+  )
+}
+
+pub fn check_ws_connect_limit(
+  limiter: rate_limit.Limiter,
+  ip: String,
+) -> rate_limit.Decision {
+  rate_limit.check(
+    limiter,
+    "ws:connect:ip:" <> client_ip.rate_limit_bucket(ip),
+    ws_connect_policy,
   )
 }
 
@@ -233,6 +251,7 @@ fn serve_timeline_ws(
   db: pog.Connection,
   post_pubsub: PubSub(timeline.PostEvent),
   auth_ctx: Auth,
+  ip: String,
 ) -> Response(ResponseData) {
   case origin.verify_same_origin(req) {
     False ->
@@ -241,17 +260,31 @@ fn serve_timeline_ws(
       |> response.set_body(mist.Bytes(bytes_tree.from_string("Forbidden")))
 
     True ->
-      mist.websocket(
-        request: req,
-        on_init: fn(_conn) { ws_init(req, db, post_pubsub, auth_ctx) },
-        handler: fn(state: WsState, msg, conn) {
-          ws_handle_message(state, msg, fn(payload) {
-            let _ = mist.send_text_frame(conn, payload)
-            Nil
-          })
-        },
-        on_close: ws_close,
-      )
+      case check_ws_connect_limit(auth_ctx.rate_limiter, ip) {
+        rate_limit.Limited(retry_after_seconds:) ->
+          response.new(429)
+          |> response.set_header("cache-control", "no-store")
+          |> response.set_header(
+            "retry-after",
+            int.to_string(retry_after_seconds),
+          )
+          |> response.set_body(
+            mist.Bytes(bytes_tree.from_string("Too Many Requests")),
+          )
+
+        rate_limit.Allowed(_) ->
+          mist.websocket(
+            request: req,
+            on_init: fn(_conn) { ws_init(req, db, post_pubsub, auth_ctx) },
+            handler: fn(state: WsState, msg, conn) {
+              ws_handle_message(state, msg, fn(payload) {
+                let _ = mist.send_text_frame(conn, payload)
+                Nil
+              })
+            },
+            on_close: ws_close,
+          )
+      }
   }
 }
 
@@ -303,7 +336,13 @@ pub fn ws_init(
     csrf.read_token(req, auth_ctx.secret_key_base)
     |> result.unwrap("")
   let flags =
-    timeline.Flags(db:, pubsub: post_pubsub, user: current_user, csrf_token:)
+    timeline.Flags(
+      db:,
+      pubsub: post_pubsub,
+      rate_limiter: auth_ctx.rate_limiter,
+      user: current_user,
+      csrf_token:,
+    )
   let assert Ok(component) =
     lustre.start_server_component(timeline.app(), flags)
   let self = process.new_subject()
@@ -334,6 +373,7 @@ pub fn ws_init(
       session_expires_at:,
       expiry_subject:,
       expiry_timer:,
+      frame_tat_ms: rate_limit.now_ms(),
     ),
     Some(selector),
   )
@@ -350,13 +390,30 @@ pub fn ws_handle_message(
         is_session_expired(state.session_expires_at, timestamp.system_time())
       {
         True -> mist.stop()
-        False -> {
-          case json.parse(text, server_component.runtime_message_decoder()) {
-            Ok(runtime_msg) -> lustre.send(state.component, runtime_msg)
-            Error(_) -> Nil
+        False ->
+          case
+            rate_limit.check_gcra(
+              state.frame_tat_ms,
+              rate_limit.now_ms(),
+              ws_frame_policy,
+            )
+          {
+            #(rate_limit.Limited(_), _) -> {
+              wisp.log_warning(
+                "WebSocket frame rate limit exceeded; closing connection",
+              )
+              mist.stop()
+            }
+            #(rate_limit.Allowed(_), new_tat_ms) -> {
+              case
+                json.parse(text, server_component.runtime_message_decoder())
+              {
+                Ok(runtime_msg) -> lustre.send(state.component, runtime_msg)
+                Error(_) -> Nil
+              }
+              mist.continue(WsState(..state, frame_tat_ms: new_tat_ms))
+            }
           }
-          mist.continue(state)
-        }
       }
 
     mist.Custom(ComponentMessage(client_msg)) -> {
@@ -389,7 +446,24 @@ pub fn ws_handle_message(
         _, _ -> mist.continue(state)
       }
 
-    mist.Binary(_) -> mist.continue(state)
+    mist.Binary(_) ->
+      case
+        rate_limit.check_gcra(
+          state.frame_tat_ms,
+          rate_limit.now_ms(),
+          ws_frame_policy,
+        )
+      {
+        #(rate_limit.Limited(_), _) -> {
+          wisp.log_warning(
+            "WebSocket binary frame rate limit exceeded; closing connection",
+          )
+          mist.stop()
+        }
+        #(rate_limit.Allowed(_), new_tat_ms) ->
+          mist.continue(WsState(..state, frame_tat_ms: new_tat_ms))
+      }
+
     mist.Closed | mist.Shutdown -> mist.stop()
   }
 }

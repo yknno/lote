@@ -11,6 +11,7 @@ import gleam/string
 import gleam/time/timestamp.{type Timestamp}
 import lote/auth/user.{type AuthUser}
 import lote/db/post_repo
+import lote/rate_limit.{type Limiter}
 import lote/realtime/pubsub.{type PubSub}
 import lote/web/csrf
 import lote/web/time as web_time
@@ -119,10 +120,14 @@ pub fn decode_post_event(
   }
 }
 
+pub const post_create_policy =
+  rate_limit.Policy(limit: 10, window_ms: 60_000, burst: 5)
+
 pub type Flags {
   Flags(
     db: pog.Connection,
     pubsub: PubSub(PostEvent),
+    rate_limiter: Limiter,
     user: Option(AuthUser),
     csrf_token: String,
   )
@@ -134,6 +139,7 @@ pub type Model {
   Model(
     db: pog.Connection,
     pubsub: PubSub(PostEvent),
+    rate_limiter: Limiter,
     user: Option(AuthUser),
     csrf_token: String,
     posts: List(Post),
@@ -335,6 +341,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
     Model(
       db: flags.db,
       pubsub: flags.pubsub,
+      rate_limiter: flags.rate_limiter,
       user: flags.user,
       csrf_token: flags.csrf_token,
       posts:,
@@ -401,66 +408,84 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             Ok(body) -> {
               let head_id = first_post_id(model.posts)
               let pending_snapshot = model.pending_ids
+              let rate_key = "post:create:user:" <> int.to_string(auth_user.id)
               let save_and_publish =
                 effect.from(fn(dispatch) {
-                  case post_repo.create(model.db, auth_user.id, body) {
-                    Ok(row) -> {
-                      let post =
-                        Post(
-                          id: row.id,
-                          user_id: auth_user.id,
-                          author_name: auth_user.name,
-                          body: row.body,
-                          created_at: row.created_at,
-                        )
-                      let #(newer, reloaded) = case head_id {
-                        Some(after_id) ->
-                          case
-                            post_repo.list_after(
-                              model.db,
-                              after_id,
-                              max_incremental_fetch + 1,
-                            )
-                          {
-                            Ok(rows) ->
-                              case list.length(rows) > max_incremental_fetch {
-                                True ->
-                                  case load_recent_page(model.db) {
-                                    Ok(page) -> #(None, Some(page))
-                                    Error(_) -> #(Some([post]), None)
-                                  }
-                                False -> #(
-                                  Some(merge_posts_desc(
-                                    [post],
-                                    list.map(rows, row_to_post),
-                                  )),
-                                  None,
-                                )
-                              }
-                            Error(_) -> #(Some([post]), None)
-                          }
-                        None ->
-                          case load_recent_page(model.db) {
-                            Ok(page) -> #(None, Some(page))
-                            Error(_) -> #(Some([post]), None)
-                          }
-                      }
-                      dispatch(PostSaveSucceeded(
-                        post:,
-                        newer:,
-                        reloaded:,
-                        cleared_pending: pending_snapshot,
-                      ))
-                      pubsub.publish(model.pubsub, Created(post))
-                    }
-                    Error(err) -> {
-                      wisp.log_warning(
-                        "Failed to create post: " <> string.inspect(err),
-                      )
+                  case
+                    rate_limit.check(
+                      model.rate_limiter,
+                      rate_key,
+                      post_create_policy,
+                    )
+                  {
+                    rate_limit.Limited(retry_after_seconds:) ->
                       dispatch(PostSaveFailed(
-                        "Failed to publish post. Please try again.",
+                        "You're posting too fast. Please wait "
+                        <> int.to_string(retry_after_seconds)
+                        <> "s and try again.",
                       ))
-                    }
+                    rate_limit.Allowed(_) ->
+                      case post_repo.create(model.db, auth_user.id, body) {
+                        Ok(row) -> {
+                          let post =
+                            Post(
+                              id: row.id,
+                              user_id: auth_user.id,
+                              author_name: auth_user.name,
+                              body: row.body,
+                              created_at: row.created_at,
+                            )
+                          let #(newer, reloaded) = case head_id {
+                            Some(after_id) ->
+                              case
+                                post_repo.list_after(
+                                  model.db,
+                                  after_id,
+                                  max_incremental_fetch + 1,
+                                )
+                              {
+                                Ok(rows) ->
+                                  case
+                                    list.length(rows) > max_incremental_fetch
+                                  {
+                                    True ->
+                                      case load_recent_page(model.db) {
+                                        Ok(page) -> #(None, Some(page))
+                                        Error(_) -> #(Some([post]), None)
+                                      }
+                                    False -> #(
+                                      Some(merge_posts_desc(
+                                        [post],
+                                        list.map(rows, row_to_post),
+                                      )),
+                                      None,
+                                    )
+                                  }
+                                Error(_) -> #(Some([post]), None)
+                              }
+                            None ->
+                              case load_recent_page(model.db) {
+                                Ok(page) -> #(None, Some(page))
+                                Error(_) -> #(Some([post]), None)
+                              }
+                          }
+                          dispatch(PostSaveSucceeded(
+                            post:,
+                            newer:,
+                            reloaded:,
+                            cleared_pending: pending_snapshot,
+                          ))
+                          pubsub.publish(model.pubsub, Created(post))
+                        }
+                        Error(err) -> {
+                          wisp.log_warning(
+                            "Failed to create post: " <> string.inspect(err),
+                          )
+                          dispatch(PostSaveFailed(
+                            "Failed to publish post. Please try again.",
+                          ))
+                        }
+                      }
                   }
                 })
               #(
