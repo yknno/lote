@@ -12,6 +12,15 @@ pub fn login_page(
   error: Option(String),
   csrf_token: String,
 ) -> wisp.Response {
+  login_page_with_status(methods, error, csrf_token, 200)
+}
+
+pub fn login_page_with_status(
+  methods: List(Method),
+  error: Option(String),
+  csrf_token: String,
+  status: Int,
+) -> wisp.Response {
   let error_el = case error {
     Some(msg) ->
       html.p(
@@ -88,7 +97,7 @@ pub fn login_page(
     ])
     |> element.to_document_string
 
-  wisp.html_response(doc, 200)
+  wisp.html_response(doc, status)
 }
 
 fn method_section(method: Method, csrf_token: String) -> element.Element(Nil) {

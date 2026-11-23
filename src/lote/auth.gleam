@@ -1,3 +1,4 @@
+import lote/rate_limit.{type Limiter}
 import lote/realtime/pubsub.{type PubSub}
 import pog
 
@@ -11,5 +12,6 @@ pub type Auth {
     secret_key_base: String,
     methods: List(Method),
     session_revocations: PubSub(String),
+    rate_limiter: Limiter,
   )
 }
