@@ -1,12 +1,15 @@
 import gleam/crypto
 import gleam/dynamic/decode
+import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import lote/auth/session
+import lote/auth/session_cleanup
 import lote/auth/user
+import lote/realtime/pubsub
 import lote/test_helper
 import pog
 import wisp
@@ -201,4 +204,117 @@ pub fn list_and_revoke_sessions_uses_uuidv4_public_id_and_enforces_ownership_tes
   assert list.contains(revoked_others, expired_sid)
   assert session.current_session(authed3, tx, secret) == None
   assert session.current_user(authed1, tx, secret) == Some(alice)
+}
+
+pub fn delete_expired_respects_batch_limit_and_keeps_active_sessions_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "CleanupAlice")
+  let secret = "cleanup_batch_secret_key_base_0123456789abcdefghijklmn"
+
+  // Create 1 active session and 3 expired sessions
+  let active_req = simulate.browser_request(http.Post, "/auth/password/login")
+  let assert Ok(active_resp) =
+    session.create(wisp.ok(), active_req, tx, secret, alice)
+  let active_authed =
+    simulate.browser_request(http.Get, "/")
+    |> simulate.session(active_req, active_resp)
+
+  let expired_ids =
+    list.map([1, 2, 3], fn(_) {
+      let req = simulate.browser_request(http.Post, "/auth/password/login")
+      let assert Ok(resp) = session.create(wisp.ok(), req, tx, secret, alice)
+      let authed =
+        simulate.browser_request(http.Get, "/")
+        |> simulate.session(req, resp)
+      let assert Some(sid) = session.session_id(authed, secret)
+      let assert Ok(_) =
+        pog.query(
+          "UPDATE sessions SET expires_at = NOW() - INTERVAL '1 minute' WHERE id = $1",
+        )
+        |> pog.parameter(pog.text(sid))
+        |> pog.returning(decode.dynamic)
+        |> pog.execute(tx)
+      sid
+    })
+
+  // Zero or negative limit deletes nothing
+  assert session.delete_expired(tx, 0) == Ok([])
+
+  // Batch limit 2 deletes 2 of the 3 expired rows
+  let assert Ok(first_batch) = session.delete_expired(tx, 2)
+  assert list.length(first_batch) == 2
+
+  // Second call deletes the remaining 1 expired row
+  let assert Ok(second_batch) = session.delete_expired(tx, 2)
+  assert list.length(second_batch) == 1
+
+  let deleted_all = list.append(first_batch, second_batch)
+  list.each(expired_ids, fn(id) {
+    assert list.contains(deleted_all, id)
+  })
+
+  // Third call finds nothing left, while the active session remains valid
+  assert session.delete_expired(tx, 10) == Ok([])
+  assert session.current_user(active_authed, tx, secret) == Some(alice)
+}
+
+pub fn session_cleanup_runs_periodically_and_publishes_revocations_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "PeriodicCleanupAlice")
+  let secret = "periodic_cleanup_secret_key_base_0123456789abcdefghijk"
+  let assert Ok(revocations) = pubsub.start()
+  let rev_sub = process.new_subject()
+  pubsub.subscribe(revocations, rev_sub)
+
+  // Create 3 expired sessions and 1 active session
+  let active_req = simulate.browser_request(http.Post, "/auth/password/login")
+  let assert Ok(active_resp) =
+    session.create(wisp.ok(), active_req, tx, secret, alice)
+  let active_authed =
+    simulate.browser_request(http.Get, "/")
+    |> simulate.session(active_req, active_resp)
+
+  let expired_ids =
+    list.map([1, 2, 3], fn(_) {
+      let req = simulate.browser_request(http.Post, "/auth/password/login")
+      let assert Ok(resp) = session.create(wisp.ok(), req, tx, secret, alice)
+      let authed =
+        simulate.browser_request(http.Get, "/")
+        |> simulate.session(req, resp)
+      let assert Some(sid) = session.session_id(authed, secret)
+      let assert Ok(_) =
+        pog.query(
+          "UPDATE sessions SET expires_at = NOW() - INTERVAL '5 minutes' WHERE id = $1",
+        )
+        |> pog.parameter(pog.text(sid))
+        |> pog.returning(decode.dynamic)
+        |> pog.execute(tx)
+      sid
+    })
+
+  // Start periodic cleanup with a small batch size (2) and short interval (30ms)
+  let assert Ok(started) = session_cleanup.start(tx, revocations, 30, 2)
+
+  // All 3 expired session IDs are deleted across 2 batches and published to revocations
+  let assert Ok(r1) = process.receive(rev_sub, 500)
+  let assert Ok(r2) = process.receive(rev_sub, 500)
+  let assert Ok(r3) = process.receive(rev_sub, 500)
+  let notified = [r1, r2, r3]
+  list.each(expired_ids, fn(id) {
+    assert list.contains(notified, id)
+  })
+
+  // Stop the actor cleanly before transaction rollback
+  let mon = process.monitor(started.pid)
+  session_cleanup.stop(started.data)
+  let down_selector =
+    process.new_selector()
+    |> process.select_specific_monitor(mon, fn(down) { down })
+  let assert Ok(_) = process.selector_receive(down_selector, 500)
+
+  // DB has no expired rows remaining and active session is untouched
+  assert session.delete_expired(tx, 10) == Ok([])
+  assert session.current_user(active_authed, tx, secret) == Some(alice)
 }

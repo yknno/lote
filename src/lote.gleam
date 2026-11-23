@@ -9,6 +9,7 @@ import gleam/otp/static_supervisor as supervisor
 import gleam/result
 import lote/auth.{type Auth, Auth, Password}
 import lote/auth/session
+import lote/auth/session_cleanup
 import lote/config
 import lote/db/pool
 import lote/realtime/pubsub.{type PubSub}
@@ -74,6 +75,12 @@ pub fn main() -> Nil {
     |> supervisor.add(pubsub.supervised(
       post_pubsub_name,
       post_pubsub_adapter(cfg.pubsub_adapter, db, cfg.database_url),
+    ))
+    |> supervisor.add(session_cleanup.supervised(
+      db,
+      session_revocations,
+      session_cleanup.default_interval_ms,
+      session_cleanup.default_batch_limit,
     ))
     |> supervisor.add(http_server)
     |> supervisor.start
