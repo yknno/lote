@@ -22,6 +22,7 @@ import lustre/element/keyed
 import lustre/event
 import lustre/server_component
 import pog
+import wisp
 
 pub const page_size = 20
 
@@ -40,22 +41,19 @@ pub type PostEvent {
   Deleted(String)
 }
 
+pub type PostNotification {
+  PostCreatedNotification(id: String)
+  PostDeletedNotification(id: String)
+}
+
 pub fn encode_post_event(event: PostEvent) -> String {
   case event {
-    Created(post) -> {
-      let #(seconds, nanoseconds) =
-        timestamp.to_unix_seconds_and_nanoseconds(post.created_at)
+    Created(post) ->
       json.object([
         #("type", json.string("created")),
         #("id", json.string(post.id)),
-        #("user_id", json.int(post.user_id)),
-        #("author_name", json.string(post.author_name)),
-        #("body", json.string(post.body)),
-        #("created_at_seconds", json.int(seconds)),
-        #("created_at_nanoseconds", json.int(nanoseconds)),
       ])
       |> json.to_string
-    }
     Deleted(id) ->
       json.object([
         #("type", json.string("deleted")),
@@ -65,33 +63,59 @@ pub fn encode_post_event(event: PostEvent) -> String {
   }
 }
 
-pub fn decode_post_event(payload: String) -> Result(PostEvent, Nil) {
+pub fn decode_post_notification(
+  payload: String,
+) -> Result(PostNotification, Nil) {
   let decoder = {
     use event_type <- decode.field("type", decode.string)
     case event_type {
       "created" -> {
         use id <- decode.field("id", decode.string)
-        use user_id <- decode.field("user_id", decode.int)
-        use author_name <- decode.field("author_name", decode.string)
-        use body <- decode.field("body", decode.string)
-        use seconds <- decode.field("created_at_seconds", decode.int)
-        use nanoseconds <- decode.field("created_at_nanoseconds", decode.int)
-        let created_at =
-          timestamp.from_unix_seconds_and_nanoseconds(seconds, nanoseconds)
-        decode.success(
-          Created(Post(id:, user_id:, author_name:, body:, created_at:)),
-        )
+        decode.success(PostCreatedNotification(id))
       }
       "deleted" -> {
         use id <- decode.field("id", decode.string)
-        decode.success(Deleted(id))
+        decode.success(PostDeletedNotification(id))
       }
-      _ -> decode.failure(Deleted(""), "PostEvent")
+      _ -> decode.failure(PostDeletedNotification(""), "PostNotification")
     }
   }
 
   json.parse(payload, decoder)
   |> result.replace_error(Nil)
+}
+
+pub fn decode_post_event(
+  db: pog.Connection,
+  payload: String,
+) -> Result(PostEvent, Nil) {
+  case decode_post_notification(payload) {
+    Ok(PostDeletedNotification(id)) -> Ok(Deleted(id))
+    Ok(PostCreatedNotification(id)) ->
+      case post_repo.find_by_id(db, id) {
+        Ok(Some(row)) ->
+          Ok(
+            Created(Post(
+              id: row.id,
+              user_id: row.user_id,
+              author_name: row.author_name,
+              body: row.body,
+              created_at: row.created_at,
+            )),
+          )
+        Ok(None) -> Error(Nil)
+        Error(err) -> {
+          wisp.log_warning(
+            "Failed to load post "
+            <> id
+            <> " for PubSub event: "
+            <> string.inspect(err),
+          )
+          Error(Nil)
+        }
+      }
+    Error(Nil) -> Error(Nil)
+  }
 }
 
 pub type Flags {

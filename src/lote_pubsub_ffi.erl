@@ -22,6 +22,29 @@ default_ssl_options(Host, Ssl) ->
     end.
 
 start_and_listen(Config, Channel) ->
+    Owner = self(),
+    Options = build_options(Config),
+    InitRef = make_ref(),
+    %% Spawn unlinked so a DB disconnect/restart never crashes the PubSub actor.
+    %% The listener monitors Owner and closes its DB socket if Owner exits.
+    Pid = spawn(fun() -> listener_init(Owner, InitRef, Options, Channel) end),
+    MonRef = erlang:monitor(process, Pid),
+    receive
+        {InitRef, ok} ->
+            erlang:demonitor(MonRef, [flush]),
+            {ok, Pid};
+        {InitRef, {error, Reason}} ->
+            erlang:demonitor(MonRef, [flush]),
+            {error, format_error(Reason)};
+        {'DOWN', MonRef, process, Pid, Reason} ->
+            {error, format_error(Reason)}
+    after 4000 ->
+        erlang:demonitor(MonRef, [flush]),
+        exit(Pid, kill),
+        {error, <<"timed out starting Postgres LISTEN connection">>}
+    end.
+
+build_options(Config) ->
     #config{
         host = Host,
         port = Port,
@@ -49,18 +72,87 @@ start_and_listen(Config, Channel) ->
                 ipv6 -> [inet6]
             end
     },
-    Options2 =
-        case Password of
-            {some, Pw} -> maps:put(password, binary_to_list(Pw), Options1);
-            none -> Options1
-        end,
-    case pgo_notifications:start_link(Options2) of
-        {ok, Pid} ->
-            case pgo_notifications:listen(Pid, Channel) of
-                {ok, _Ref} -> {ok, Pid};
-                {eventually, _Ref} -> {ok, Pid};
-                Error -> {error, list_to_binary(io_lib:format("~p", [Error]))}
+    case Password of
+        {some, Pw} -> maps:put(password, binary_to_list(Pw), Options1);
+        none -> Options1
+    end.
+
+listener_init(Owner, InitRef, Options, Channel) ->
+    process_flag(trap_exit, true),
+    OwnerRef = erlang:monitor(process, Owner),
+    case open_and_listen(Options, Channel) of
+        {ok, Conn} ->
+            ListenRef = make_ref(),
+            Owner ! {InitRef, ok},
+            listen_loop(Owner, OwnerRef, ListenRef, Conn);
+        {error, Reason} ->
+            Owner ! {InitRef, {error, Reason}}
+    end.
+
+open_and_listen(Options, Channel) ->
+    try pgo_handler:open(undefined, Options) of
+        {ok, Conn} ->
+            case pgo_handler:extended_query(Conn, [<<"LISTEN ">>, Channel], []) of
+                #{command := listen} ->
+                    {ok, Conn};
+                Other ->
+                    safe_close(Conn),
+                    {error, {listen_failed, Other}}
             end;
         {error, Reason} ->
-            {error, list_to_binary(io_lib:format("~p", [Reason]))}
+            {error, Reason}
+    catch
+        Class:Reason ->
+            {error, {Class, Reason}}
     end.
+
+listen_loop(Owner, OwnerRef, ListenRef, Conn) ->
+    receive
+        {tcp, Socket, Binary} ->
+            Conn1 = dispatch_active_data(Owner, ListenRef, Binary, Conn),
+            case inet:setopts(Socket, [{active, once}]) of
+                ok ->
+                    listen_loop(Owner, OwnerRef, ListenRef, Conn1);
+                {error, _} ->
+                    safe_close(Conn1)
+            end;
+        {ssl, Socket, Binary} ->
+            Conn1 = dispatch_active_data(Owner, ListenRef, Binary, Conn),
+            case ssl:setopts(Socket, [{active, once}]) of
+                ok ->
+                    listen_loop(Owner, OwnerRef, ListenRef, Conn1);
+                {error, _} ->
+                    safe_close(Conn1)
+            end;
+        {tcp_closed, _Socket} ->
+            safe_close(Conn);
+        {tcp_error, _Socket, _Reason} ->
+            safe_close(Conn);
+        {ssl_closed, _Socket} ->
+            safe_close(Conn);
+        {ssl_error, _Socket, _Reason} ->
+            safe_close(Conn);
+        {'EXIT', _Pid, _Reason} ->
+            safe_close(Conn);
+        {'DOWN', OwnerRef, process, Owner, _Reason} ->
+            safe_close(Conn)
+    end.
+
+dispatch_active_data(Owner, ListenRef, Binary, Conn) ->
+    pgo_handler:process_active_data(Binary, Conn, fun
+        ({notification_response, _ProcId, Channel, Payload}) ->
+            Owner ! {notification, self(), ListenRef, Channel, Payload};
+        (_) ->
+            ok
+    end).
+
+safe_close(Conn) ->
+    try
+        pgo_handler:close(Conn)
+    catch
+        _:_ -> ok
+    end,
+    ok.
+
+format_error(Reason) ->
+    list_to_binary(io_lib:format("~p", [Reason])).
