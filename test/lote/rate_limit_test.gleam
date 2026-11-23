@@ -195,10 +195,48 @@ pub fn client_ip_extract_respects_trusted_proxy_hops_and_resists_spoofing_test()
     == "10.0.0.1"
   assert client_ip.extract(Some("10.0.0.1"), None, 1) == "10.0.0.1"
 
-  // Normalization: IPv4-mapped IPv6 and uppercase IPv6
+  // Normalization: IPv4-mapped IPv6 (dotted & hex), RFC 5952 IPv6, brackets/ports/zone
   assert client_ip.extract(Some("::ffff:127.0.0.1"), None, 0) == "127.0.0.1"
-  assert client_ip.extract(Some("2001:DB8::1"), None, 0) == "2001:db8::1"
+  assert client_ip.extract(Some("::ffff:cb00:710a"), None, 0) == "203.0.113.10"
+  assert client_ip.extract(Some("2001:0DB8:0000:0001::1"), None, 0)
+    == "2001:db8:0:1::1"
+  assert client_ip.extract(Some("[2001:DB8::1]:443"), None, 0) == "2001:db8::1"
+  assert client_ip.extract(Some("203.0.113.5:54321"), None, 0) == "203.0.113.5"
+  assert client_ip.extract(Some("fe80::1%eth0"), None, 0) == "fe80::1"
   assert client_ip.extract(None, None, 0) == "unknown"
+
+  // Malformed or non-strict XFF entries safely fall back to peer IP
+  assert client_ip.extract(Some("10.0.0.1"), Some("not-an-ip"), 1) == "10.0.0.1"
+  assert client_ip.extract(Some("10.0.0.1"), Some("0177.0.0.1"), 1)
+    == "10.0.0.1"
+  assert client_ip.extract(Some("10.0.0.1"), Some("2001:db8::あ"), 1)
+    == "10.0.0.1"
+}
+
+pub fn client_ip_rate_limit_bucket_masks_ipv4_32_and_ipv6_64_test() {
+  // IPv4 keeps exact /32 granularity so distinct hosts do not share a bucket
+  assert client_ip.rate_limit_bucket("203.0.113.10") == "203.0.113.10/32"
+  assert client_ip.rate_limit_bucket("203.0.113.11") == "203.0.113.11/32"
+
+  // IPv4-mapped IPv6 (dotted & hex) unwraps to the same IPv4 /32 bucket
+  assert client_ip.rate_limit_bucket("::ffff:203.0.113.10") == "203.0.113.10/32"
+  assert client_ip.rate_limit_bucket("::ffff:cb00:710a") == "203.0.113.10/32"
+
+  // IPv6 masks the lower 64-bit interface identifier into a /64 bucket
+  let v6_a = client_ip.rate_limit_bucket("2001:0DB8:abcd:0012::1")
+  let v6_b = client_ip.rate_limit_bucket("2001:db8:abcd:12:ffff:ffff:ffff:ffff")
+  let v6_other = client_ip.rate_limit_bucket("2001:db8:abcd:13::1")
+  assert v6_a == "2001:db8:abcd:12::/64"
+  assert v6_b == "2001:db8:abcd:12::/64"
+  assert v6_a == v6_b
+  assert v6_other == "2001:db8:abcd:13::/64"
+  assert v6_a != v6_other
+
+  // Edge cases: zone ID, loopback, invalid / unknown
+  assert client_ip.rate_limit_bucket("fe80::1234:5678%eth0") == "fe80::/64"
+  assert client_ip.rate_limit_bucket("::1") == "::/64"
+  assert client_ip.rate_limit_bucket("unknown") == "unknown"
+  assert client_ip.rate_limit_bucket("not-an-ip") == "unknown"
 }
 
 pub fn config_parsers_for_rate_limit_adapter_and_proxy_hops_test() {
