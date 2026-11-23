@@ -162,6 +162,28 @@ pub fn list_before(
   }
 }
 
+pub fn list_after(
+  db: pog.Connection,
+  after_id: String,
+  limit: Int,
+) -> Result(List(PostRow), pog.QueryError) {
+  case uuid.normalize(after_id) {
+    Error(_) -> Ok([])
+    Ok(normalized) ->
+      base_post_select()
+      |> s.where(w.gt(
+        w.col("posts.id"),
+        w.fragment_value(
+          f.prepared(f.placeholder <> "::uuid", [f.string(normalized)]),
+        ),
+      ))
+      |> s.order_by_desc("posts.id")
+      |> s.limit(limit)
+      |> s.to_query
+      |> postgres.run_read_query(post_row_decoder(), db)
+  }
+}
+
 pub fn find_by_id(
   db: pog.Connection,
   id: String,

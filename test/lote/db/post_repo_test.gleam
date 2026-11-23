@@ -111,6 +111,34 @@ pub fn list_before_paginates_older_posts_in_descending_order_test() {
   assert post_repo.list_before(tx, "not-a-uuid", 2) == Ok([])
 }
 
+pub fn list_after_fetches_only_newer_posts_in_descending_order_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(author) = user.create(tx, "AfterAuthor")
+  let assert Ok(p1) = post_repo.create(tx, author.id, "post 1")
+  let assert Ok(p2) = post_repo.create(tx, author.id, "post 2")
+  let assert Ok(p3) = post_repo.create(tx, author.id, "post 3")
+  let assert Ok(p4) = post_repo.create(tx, author.id, "post 4")
+
+  let assert Ok(after_p2) = post_repo.list_after(tx, p2.id, 10)
+  assert list.map(after_p2, fn(r) { r.id }) == [p4.id, p3.id]
+
+  // Limit returns the newest matching rows in descending order
+  let assert Ok(limited) = post_repo.list_after(tx, p1.id, 2)
+  assert list.map(limited, fn(r) { r.id }) == [p4.id, p3.id]
+
+  // Uppercase UUID cursor works
+  let assert Ok(after_upper) =
+    post_repo.list_after(tx, string.uppercase(p3.id), 10)
+  assert list.map(after_upper, fn(r) { r.id }) == [p4.id]
+
+  // After newest post returns empty list
+  assert post_repo.list_after(tx, p4.id, 10) == Ok([])
+
+  // Invalid UUID cursor returns Ok([]) without DB error
+  assert post_repo.list_after(tx, "not-a-uuid", 10) == Ok([])
+}
+
 pub fn validate_body_and_create_enforce_length_limit_test() {
   use tx <- test_helper.with_db
 

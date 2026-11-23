@@ -6,6 +6,7 @@ import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/order
 import gleam/result
+import gleam/set.{type Set}
 import gleam/string
 import gleam/time/timestamp.{type Timestamp}
 import lote/auth/user.{type AuthUser}
@@ -127,6 +128,8 @@ pub type Flags {
   )
 }
 
+const max_incremental_fetch = 100
+
 pub type Model {
   Model(
     db: pog.Connection,
@@ -136,11 +139,13 @@ pub type Model {
     posts: List(Post),
     has_more: Bool,
     loading_more: Bool,
-    pending_count: Int,
+    loading_newer: Bool,
+    pending_ids: Set(String),
     auto_refresh: Bool,
     confirming_delete: Option(String),
     form_key: Int,
     form_error: Option(String),
+    timeline_error: Option(String),
   )
 }
 
@@ -152,7 +157,18 @@ pub type Msg {
   UserRequestedDelete(String)
   UserCanceledDelete
   UserConfirmedDelete(String)
-  PostsReloaded(List(Post), Bool)
+  UserDismissedError
+  PostSaveSucceeded(
+    post: Post,
+    newer: Option(List(Post)),
+    reloaded: Option(#(List(Post), Bool)),
+    cleared_pending: Set(String),
+  )
+  PostSaveFailed(String)
+  PostDeleteFailed(String)
+  PostsReloaded(List(Post), Bool, Set(String))
+  NewerPostsLoaded(posts: List(Post), cleared_pending: Set(String))
+  NewerPostsLoadFailed
   OlderPostsLoaded(cursor: String, posts: List(Post), has_more: Bool)
   OlderPostsLoadFailed
   PostCreated(Post)
@@ -163,20 +179,22 @@ pub fn app() -> lustre.App(Flags, Model, Msg) {
   lustre.application(init:, update:, view:)
 }
 
+fn row_to_post(row: post_repo.PostRow) -> Post {
+  Post(
+    id: row.id,
+    user_id: row.user_id,
+    author_name: row.author_name,
+    body: row.body,
+    created_at: row.created_at,
+  )
+}
+
 fn rows_to_page(rows: List(post_repo.PostRow)) -> #(List(Post), Bool) {
   let has_more = list.length(rows) > page_size
   let posts =
     rows
     |> list.take(page_size)
-    |> list.map(fn(row) {
-      Post(
-        id: row.id,
-        user_id: row.user_id,
-        author_name: row.author_name,
-        body: row.body,
-        created_at: row.created_at,
-      )
-    })
+    |> list.map(row_to_post)
   #(posts, has_more)
 }
 
@@ -199,6 +217,64 @@ fn load_older_page(
   }
 }
 
+fn load_newer_posts_effect(
+  db: pog.Connection,
+  head_id: Option(String),
+  pending_snapshot: Set(String),
+) -> Effect(Msg) {
+  effect.from(fn(dispatch) {
+    case head_id {
+      Some(after_id) ->
+        case post_repo.list_after(db, after_id, max_incremental_fetch + 1) {
+          Ok(rows) ->
+            case list.length(rows) > max_incremental_fetch {
+              True ->
+                case load_recent_page(db) {
+                  Ok(#(posts, has_more)) ->
+                    dispatch(PostsReloaded(posts, has_more, pending_snapshot))
+                  Error(err) -> {
+                    wisp.log_warning(
+                      "Failed to reload recent posts: " <> string.inspect(err),
+                    )
+                    dispatch(NewerPostsLoadFailed)
+                  }
+                }
+              False ->
+                dispatch(NewerPostsLoaded(
+                  posts: list.map(rows, row_to_post),
+                  cleared_pending: pending_snapshot,
+                ))
+            }
+          Error(err) -> {
+            wisp.log_warning(
+              "Failed to load newer posts: " <> string.inspect(err),
+            )
+            dispatch(NewerPostsLoadFailed)
+          }
+        }
+
+      None ->
+        case load_recent_page(db) {
+          Ok(#(posts, has_more)) ->
+            dispatch(PostsReloaded(posts, has_more, pending_snapshot))
+          Error(err) -> {
+            wisp.log_warning(
+              "Failed to load recent posts: " <> string.inspect(err),
+            )
+            dispatch(NewerPostsLoadFailed)
+          }
+        }
+    }
+  })
+}
+
+fn first_post_id(posts: List(Post)) -> Option(String) {
+  case posts {
+    [first, ..] -> Some(first.id)
+    [] -> None
+  }
+}
+
 fn last_post_id(posts: List(Post)) -> Option(String) {
   case list.last(posts) {
     Ok(post) -> Some(post.id)
@@ -206,11 +282,34 @@ fn last_post_id(posts: List(Post)) -> Option(String) {
   }
 }
 
-fn is_newer_than_loaded(post: Post, loaded: List(Post)) -> Bool {
+fn is_id_newer_than_loaded(post_id: String, loaded: List(Post)) -> Bool {
   case loaded {
-    [first, ..] -> string.compare(post.id, first.id) == order.Gt
+    [first, ..] -> string.compare(post_id, first.id) == order.Gt
     [] -> True
   }
+}
+
+fn merge_posts_desc(newer: List(Post), existing: List(Post)) -> List(Post) {
+  case newer, existing {
+    [], rest -> rest
+    rest, [] -> rest
+    [a, ..a_rest], [b, ..b_rest] ->
+      case string.compare(a.id, b.id) {
+        order.Gt -> [a, ..merge_posts_desc(a_rest, existing)]
+        order.Lt -> [b, ..merge_posts_desc(newer, b_rest)]
+        order.Eq -> [a, ..merge_posts_desc(a_rest, b_rest)]
+      }
+  }
+}
+
+fn remaining_pending(
+  current_pending: Set(String),
+  cleared_pending: Set(String),
+  loaded_posts: List(Post),
+) -> Set(String) {
+  current_pending
+  |> set.difference(cleared_pending)
+  |> set.filter(fn(id) { is_id_newer_than_loaded(id, loaded_posts) })
 }
 
 pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
@@ -240,11 +339,13 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       posts:,
       has_more:,
       loading_more: False,
-      pending_count: 0,
+      loading_newer: False,
+      pending_ids: set.new(),
       auto_refresh: False,
       confirming_delete: None,
       form_key: 0,
       form_error: None,
+      timeline_error: None,
     ),
     subscribe_effect,
   )
@@ -296,6 +397,8 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             )
 
             Ok(body) -> {
+              let head_id = first_post_id(model.posts)
+              let pending_snapshot = model.pending_ids
               let save_and_publish =
                 effect.from(fn(dispatch) {
                   case post_repo.create(model.db, auth_user.id, body) {
@@ -308,20 +411,57 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                           body: row.body,
                           created_at: row.created_at,
                         )
-                      case load_recent_page(model.db) {
-                        Ok(#(posts, has_more)) ->
-                          dispatch(PostsReloaded(posts, has_more))
-                        Error(_) -> Nil
+                      let #(newer, reloaded) = case head_id {
+                        Some(after_id) ->
+                          case
+                            post_repo.list_after(
+                              model.db,
+                              after_id,
+                              max_incremental_fetch + 1,
+                            )
+                          {
+                            Ok(rows) ->
+                              case list.length(rows) > max_incremental_fetch {
+                                True ->
+                                  case load_recent_page(model.db) {
+                                    Ok(page) -> #(None, Some(page))
+                                    Error(_) -> #(Some([post]), None)
+                                  }
+                                False -> #(
+                                  Some(merge_posts_desc(
+                                    [post],
+                                    list.map(rows, row_to_post),
+                                  )),
+                                  None,
+                                )
+                              }
+                            Error(_) -> #(Some([post]), None)
+                          }
+                        None ->
+                          case load_recent_page(model.db) {
+                            Ok(page) -> #(None, Some(page))
+                            Error(_) -> #(Some([post]), None)
+                          }
                       }
+                      dispatch(PostSaveSucceeded(
+                        post:,
+                        newer:,
+                        reloaded:,
+                        cleared_pending: pending_snapshot,
+                      ))
                       pubsub.publish(model.pubsub, Created(post))
                     }
-                    Error(_) -> Nil
+                    Error(err) -> {
+                      wisp.log_warning(
+                        "Failed to create post: " <> string.inspect(err),
+                      )
+                      dispatch(PostSaveFailed(
+                        "Failed to publish post. Please try again.",
+                      ))
+                    }
                   }
                 })
-              #(
-                Model(..model, form_key: model.form_key + 1, form_error: None),
-                save_and_publish,
-              )
+              #(Model(..model, form_error: None), save_and_publish)
             }
           }
         }
@@ -329,40 +469,36 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
     }
 
     UserClickedRefresh ->
-      case load_recent_page(model.db) {
-        Ok(#(posts, has_more)) -> #(
-          Model(
-            ..model,
-            posts:,
-            has_more:,
-            loading_more: False,
-            pending_count: 0,
+      case model.loading_newer {
+        True -> #(model, effect.none())
+        False -> #(
+          Model(..model, loading_newer: True, timeline_error: None),
+          load_newer_posts_effect(
+            model.db,
+            first_post_id(model.posts),
+            model.pending_ids,
           ),
-          effect.none(),
         )
-        Error(_) -> #(model, effect.none())
       }
 
     UserToggledAutoRefresh ->
       case model.auto_refresh {
         True -> #(Model(..model, auto_refresh: False), effect.none())
         False ->
-          case model.pending_count > 0 {
-            True ->
-              case load_recent_page(model.db) {
-                Ok(#(posts, has_more)) -> #(
-                  Model(
-                    ..model,
-                    posts:,
-                    has_more:,
-                    loading_more: False,
-                    pending_count: 0,
-                    auto_refresh: True,
-                  ),
-                  effect.none(),
-                )
-                Error(_) -> #(Model(..model, auto_refresh: True), effect.none())
-              }
+          case !set.is_empty(model.pending_ids) && !model.loading_newer {
+            True -> #(
+              Model(
+                ..model,
+                auto_refresh: True,
+                loading_newer: True,
+                timeline_error: None,
+              ),
+              load_newer_posts_effect(
+                model.db,
+                first_post_id(model.posts),
+                model.pending_ids,
+              ),
+            )
             False -> #(Model(..model, auto_refresh: True), effect.none())
           }
       }
@@ -386,10 +522,18 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                         posts: older,
                         has_more:,
                       ))
-                    Error(_) -> dispatch(OlderPostsLoadFailed)
+                    Error(err) -> {
+                      wisp.log_warning(
+                        "Failed to load older posts: " <> string.inspect(err),
+                      )
+                      dispatch(OlderPostsLoadFailed)
+                    }
                   }
                 })
-              #(Model(..model, loading_more: True), load_effect)
+              #(
+                Model(..model, loading_more: True, timeline_error: None),
+                load_effect,
+              )
             }
           }
       }
@@ -403,7 +547,11 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             })
           {
             True -> #(
-              Model(..model, confirming_delete: Some(post_id)),
+              Model(
+                ..model,
+                confirming_delete: Some(post_id),
+                timeline_error: None,
+              ),
               effect.none(),
             )
             False -> #(model, effect.none())
@@ -421,18 +569,123 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         None -> #(Model(..model, confirming_delete: None), effect.none())
         Some(auth_user) -> {
           let delete_and_publish =
-            effect.from(fn(_dispatch) {
+            effect.from(fn(dispatch) {
               case post_repo.delete(model.db, post_id, auth_user.id) {
                 Ok(True) -> pubsub.publish(model.pubsub, Deleted(post_id))
-                Ok(False) | Error(_) -> Nil
+                Ok(False) -> Nil
+                Error(err) -> {
+                  wisp.log_warning(
+                    "Failed to delete post "
+                    <> post_id
+                    <> ": "
+                    <> string.inspect(err),
+                  )
+                  dispatch(PostDeleteFailed(
+                    "Failed to delete post. Please try again.",
+                  ))
+                }
               }
             })
-          #(Model(..model, confirming_delete: None), delete_and_publish)
+          #(
+            Model(..model, confirming_delete: None, timeline_error: None),
+            delete_and_publish,
+          )
         }
       }
 
-    PostsReloaded(posts, has_more) -> #(
-      Model(..model, posts:, has_more:, loading_more: False, pending_count: 0),
+    UserDismissedError -> #(Model(..model, timeline_error: None), effect.none())
+
+    PostSaveSucceeded(post:, newer:, reloaded:, cleared_pending:) ->
+      case reloaded {
+        Some(#(posts, has_more)) -> {
+          let merged = merge_posts_desc([post], posts)
+          let pending_ids =
+            remaining_pending(model.pending_ids, cleared_pending, merged)
+          #(
+            Model(
+              ..model,
+              posts: merged,
+              has_more:,
+              loading_more: False,
+              loading_newer: False,
+              pending_ids:,
+              form_key: model.form_key + 1,
+              form_error: None,
+            ),
+            effect.none(),
+          )
+        }
+        None -> {
+          let to_prepend = case newer {
+            Some(items) -> items
+            None -> [post]
+          }
+          let merged = merge_posts_desc(to_prepend, model.posts)
+          let pending_ids =
+            remaining_pending(model.pending_ids, cleared_pending, merged)
+          #(
+            Model(
+              ..model,
+              posts: merged,
+              loading_newer: False,
+              pending_ids:,
+              form_key: model.form_key + 1,
+              form_error: None,
+            ),
+            effect.none(),
+          )
+        }
+      }
+
+    PostSaveFailed(message) -> #(
+      Model(..model, form_error: Some(message)),
+      effect.none(),
+    )
+
+    PostDeleteFailed(message) -> #(
+      Model(..model, timeline_error: Some(message)),
+      effect.none(),
+    )
+
+    PostsReloaded(posts, has_more, cleared_pending) -> {
+      let pending_ids =
+        remaining_pending(model.pending_ids, cleared_pending, posts)
+      #(
+        Model(
+          ..model,
+          posts:,
+          has_more:,
+          loading_more: False,
+          loading_newer: False,
+          pending_ids:,
+          timeline_error: None,
+        ),
+        effect.none(),
+      )
+    }
+
+    NewerPostsLoaded(posts: newer, cleared_pending:) -> {
+      let merged = merge_posts_desc(newer, model.posts)
+      let pending_ids =
+        remaining_pending(model.pending_ids, cleared_pending, merged)
+      #(
+        Model(
+          ..model,
+          posts: merged,
+          loading_newer: False,
+          pending_ids:,
+          timeline_error: None,
+        ),
+        effect.none(),
+      )
+    }
+
+    NewerPostsLoadFailed -> #(
+      Model(
+        ..model,
+        loading_newer: False,
+        timeline_error: Some("Failed to load new posts. Please try again."),
+      ),
       effect.none(),
     )
 
@@ -451,21 +704,32 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       }
 
     OlderPostsLoadFailed -> #(
-      Model(..model, loading_more: False),
+      Model(
+        ..model,
+        loading_more: False,
+        timeline_error: Some("Failed to load older posts. Please try again."),
+      ),
       effect.none(),
     )
 
     PostCreated(post) ->
-      case is_newer_than_loaded(post, model.posts) {
+      case is_id_newer_than_loaded(post.id, model.posts) {
         False -> #(model, effect.none())
         True ->
           case model.auto_refresh {
             True -> #(
-              Model(..model, posts: [post, ..model.posts], pending_count: 0),
+              Model(
+                ..model,
+                posts: merge_posts_desc([post], model.posts),
+                pending_ids: set.delete(model.pending_ids, post.id),
+              ),
               effect.none(),
             )
             False -> #(
-              Model(..model, pending_count: model.pending_count + 1),
+              Model(
+                ..model,
+                pending_ids: set.insert(model.pending_ids, post.id),
+              ),
               effect.none(),
             )
           }
@@ -476,21 +740,32 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         Some(id) if id == post_id -> None
         other -> other
       }
+      let pending_ids = set.delete(model.pending_ids, post_id)
       let remaining = list.filter(model.posts, fn(p) { p.id != post_id })
       case remaining, model.has_more {
         [], True -> {
+          let pending_snapshot = pending_ids
           let reload_effect =
             effect.from(fn(dispatch) {
               case load_recent_page(model.db) {
                 Ok(#(posts, has_more)) ->
-                  dispatch(PostsReloaded(posts, has_more))
-                Error(_) -> Nil
+                  dispatch(PostsReloaded(posts, has_more, pending_snapshot))
+                Error(err) -> {
+                  wisp.log_warning(
+                    "Failed to reload posts after deletion: "
+                    <> string.inspect(err),
+                  )
+                  Nil
+                }
               }
             })
-          #(Model(..model, posts: remaining, confirming_delete:), reload_effect)
+          #(
+            Model(..model, posts: remaining, confirming_delete:, pending_ids:),
+            reload_effect,
+          )
         }
         _, _ -> #(
-          Model(..model, posts: remaining, confirming_delete:),
+          Model(..model, posts: remaining, confirming_delete:, pending_ids:),
           effect.none(),
         )
       }
@@ -562,7 +837,8 @@ pub fn view(model: Model) -> Element(Msg) {
           ]),
         ],
       ),
-      pending_banner(model.pending_count),
+      timeline_error_banner(model.timeline_error),
+      pending_banner(set.size(model.pending_ids), model.loading_newer),
       feed(model.posts, model.user, model.confirming_delete),
       load_more_footer(model),
     ])
@@ -648,19 +924,49 @@ fn auto_refresh_toggle(enabled: Bool) -> Element(Msg) {
   )
 }
 
-fn pending_banner(pending_count: Int) -> Element(Msg) {
+fn timeline_error_banner(error: Option(String)) -> Element(Msg) {
+  case error {
+    Some(message) ->
+      html.div(
+        [
+          attribute.role("alert"),
+          attribute.class(
+            "flex items-center justify-between gap-3 border-b border-red-200 bg-red-50 px-4 py-2 text-xs text-red-700",
+          ),
+        ],
+        [
+          html.span([], [html.text(message)]),
+          html.button(
+            [
+              attribute.type_("button"),
+              event.on_click(UserDismissedError),
+              attribute.class(
+                "shrink-0 cursor-pointer font-medium text-red-700 underline-offset-2 hover:underline",
+              ),
+            ],
+            [html.text("Dismiss")],
+          ),
+        ],
+      )
+    None -> element.none()
+  }
+}
+
+fn pending_banner(pending_count: Int, loading_newer: Bool) -> Element(Msg) {
   case pending_count {
     count if count > 0 -> {
-      let label = case count {
-        1 -> "Show 1 new post"
-        n -> "Show " <> int.to_string(n) <> " new posts"
+      let label = case loading_newer, count {
+        True, _ -> "Loading new posts..."
+        False, 1 -> "Show 1 new post"
+        False, n -> "Show " <> int.to_string(n) <> " new posts"
       }
       html.button(
         [
           attribute.type_("button"),
+          attribute.disabled(loading_newer),
           event.on_click(UserClickedRefresh),
           attribute.class(
-            "w-full cursor-pointer border-b border-neutral-200 bg-neutral-50 px-4 py-2 text-center text-xs font-medium text-neutral-900 hover:bg-neutral-100",
+            "w-full cursor-pointer border-b border-neutral-200 bg-neutral-50 px-4 py-2 text-center text-xs font-medium text-neutral-900 hover:bg-neutral-100 disabled:cursor-wait disabled:text-neutral-400",
           ),
         ],
         [html.text(label)],
