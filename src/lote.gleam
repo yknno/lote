@@ -5,6 +5,7 @@ import gleam/http/response.{type Response}
 import gleam/json
 import gleam/list
 import gleam/option.{type Option, None, Some}
+import gleam/otp/static_supervisor as supervisor
 import gleam/result
 import lote/auth.{type Auth, Auth, Password}
 import lote/auth/session
@@ -26,7 +27,9 @@ pub fn main() -> Nil {
   wisp.configure_logger()
 
   let cfg = config.load()
-  let db = pool.start(cfg.database_url)
+  let db_pool_name = process.new_name("lote_db")
+  let db_config = pool.config(db_pool_name, cfg.database_url)
+  let db = pog.named_connection(db_pool_name)
 
   let methods =
     list.filter_map(cfg.auth_adapters, fn(name) {
@@ -41,8 +44,8 @@ pub fn main() -> Nil {
       }
     })
 
-  let assert Ok(session_revocations) =
-    start_session_revocations_pubsub(cfg.pubsub_adapter, db, cfg.database_url)
+  let session_revocations_name = process.new_name("lote_session_revocations")
+  let session_revocations = process.named_subject(session_revocations_name)
   let auth_ctx =
     Auth(
       db:,
@@ -51,15 +54,29 @@ pub fn main() -> Nil {
       session_revocations:,
     )
 
-  let assert Ok(post_pubsub) =
-    start_post_pubsub(cfg.pubsub_adapter, db, cfg.database_url)
+  let post_pubsub_name = process.new_name("lote_post_pubsub")
+  let post_pubsub = process.named_subject(post_pubsub_name)
 
-  let assert Ok(_) =
+  let http_server =
     handler(db, post_pubsub, auth_ctx)
     |> mist.new
     |> mist.bind("0.0.0.0")
     |> mist.port(cfg.port)
-    |> mist.start
+    |> mist.supervised
+
+  let assert Ok(_) =
+    supervisor.new(supervisor.OneForOne)
+    |> supervisor.add(pool.supervised(db_config))
+    |> supervisor.add(pubsub.supervised(
+      session_revocations_name,
+      session_revocations_adapter(cfg.pubsub_adapter, db, cfg.database_url),
+    ))
+    |> supervisor.add(pubsub.supervised(
+      post_pubsub_name,
+      post_pubsub_adapter(cfg.pubsub_adapter, db, cfg.database_url),
+    ))
+    |> supervisor.add(http_server)
+    |> supervisor.start
 
   process.sleep_forever()
 }
@@ -68,12 +85,12 @@ pub const session_revocations_channel = "lote_session_revocations"
 
 pub const post_events_channel = "lote_post_events"
 
-pub fn start_session_revocations_pubsub(
+pub fn session_revocations_adapter(
   adapter_kind: config.PubSubAdapter,
   db: pog.Connection,
   database_url: String,
-) {
-  let adapter = case adapter_kind {
+) -> pubsub.Adapter(String) {
+  case adapter_kind {
     config.MemoryPubSub -> pubsub.Memory
     config.PostgresPubSub ->
       pubsub.Postgres(
@@ -89,15 +106,14 @@ pub fn start_session_revocations_pubsub(
         },
       )
   }
-  pubsub.start_with_adapter(adapter)
 }
 
-pub fn start_post_pubsub(
+pub fn post_pubsub_adapter(
   adapter_kind: config.PubSubAdapter,
   db: pog.Connection,
   database_url: String,
-) {
-  let adapter = case adapter_kind {
+) -> pubsub.Adapter(timeline.PostEvent) {
+  case adapter_kind {
     config.MemoryPubSub -> pubsub.Memory
     config.PostgresPubSub ->
       pubsub.Postgres(
@@ -105,10 +121,27 @@ pub fn start_post_pubsub(
         database_url:,
         channel: post_events_channel,
         encode: timeline.encode_post_event,
-        decode: timeline.decode_post_event,
+        decode: timeline.decode_post_event(db, _),
       )
   }
-  pubsub.start_with_adapter(adapter)
+}
+
+pub fn start_session_revocations_pubsub(
+  adapter_kind: config.PubSubAdapter,
+  db: pog.Connection,
+  database_url: String,
+) {
+  session_revocations_adapter(adapter_kind, db, database_url)
+  |> pubsub.start_with_adapter
+}
+
+pub fn start_post_pubsub(
+  adapter_kind: config.PubSubAdapter,
+  db: pog.Connection,
+  database_url: String,
+) {
+  post_pubsub_adapter(adapter_kind, db, database_url)
+  |> pubsub.start_with_adapter
 }
 
 pub fn handler(

@@ -1,7 +1,15 @@
+import gleam/bit_array
+import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/list
+import gleam/otp/static_supervisor as supervisor
+import gleam/string
+import gleam/time/duration
 import gleam/time/timestamp
 import lote
+import lote/auth/user
 import lote/config
+import lote/db/post_repo
 import lote/realtime/pubsub
 import lote/test_helper
 import lote/web/components/timeline
@@ -93,29 +101,37 @@ pub fn parse_pubsub_adapter_selects_memory_or_postgres_and_rejects_typo_test() {
   assert config.parse_pubsub_adapter(" unknown ") == Error("unknown")
 }
 
-pub fn post_event_codec_roundtrips_created_and_deleted_events_test() {
+pub fn post_event_codec_uses_compact_id_only_payloads_test() {
+  // Even with a large body (e.g. multibyte emoji sequences), the NOTIFY payload
+  // carries only the event type and post ID, staying far below 8000 bytes.
+  let huge_body = string.repeat("👨‍👩‍👧‍👦", 300)
+  assert bit_array.byte_size(<<huge_body:utf8>>) > 7000
+
   let post =
     timeline.Post(
       id: "019352a0-1234-7000-8000-000000000001",
       user_id: 42,
       author_name: "Alice",
-      body: "Hello PubSub JSON!",
+      body: huge_body,
       created_at: timestamp.from_unix_seconds_and_nanoseconds(
         1_732_250_000,
         123_456_789,
       ),
     )
 
-  let created_event = timeline.Created(post)
-  let encoded_created = timeline.encode_post_event(created_event)
-  assert timeline.decode_post_event(encoded_created) == Ok(created_event)
+  let encoded_created = timeline.encode_post_event(timeline.Created(post))
+  assert bit_array.byte_size(<<encoded_created:utf8>>) < 100
+  assert timeline.decode_post_notification(encoded_created)
+    == Ok(timeline.PostCreatedNotification(post.id))
 
-  let deleted_event = timeline.Deleted(post.id)
-  let encoded_deleted = timeline.encode_post_event(deleted_event)
-  assert timeline.decode_post_event(encoded_deleted) == Ok(deleted_event)
+  let encoded_deleted = timeline.encode_post_event(timeline.Deleted(post.id))
+  assert bit_array.byte_size(<<encoded_deleted:utf8>>) < 100
+  assert timeline.decode_post_notification(encoded_deleted)
+    == Ok(timeline.PostDeletedNotification(post.id))
 
-  assert timeline.decode_post_event("{invalid json") == Error(Nil)
-  assert timeline.decode_post_event("{\"type\":\"unknown\"}") == Error(Nil)
+  assert timeline.decode_post_notification("{invalid json") == Error(Nil)
+  assert timeline.decode_post_notification("{\"type\":\"unknown\"}")
+    == Error(Nil)
 }
 
 pub fn postgres_adapter_delivers_events_across_multiple_pubsub_instances_via_listen_notify_test() {
@@ -129,7 +145,21 @@ pub fn postgres_adapter_delivers_events_across_multiple_pubsub_instances_via_lis
   let assert Ok(started_pool) = pog.start(db_config)
   let db = started_pool.data
 
-  // Start two independent Postgres-backed PubSub instances simulating two Cloud Run containers
+  // Insert a real user & post so ID-only Postgres notifications resolve via DB
+  let assert Ok(author) = user.create(db, "PubSubBob")
+  let assert Ok(created_row) =
+    post_repo.create(db, author.id, "Multi-node LISTEN/NOTIFY post")
+
+  let sample_post =
+    timeline.Post(
+      id: created_row.id,
+      user_id: author.id,
+      author_name: author.name,
+      body: created_row.body,
+      created_at: created_row.created_at,
+    )
+
+  // Start two independent Postgres-backed PubSub instances simulating two containers
   let assert Ok(node_a_post_bus) =
     lote.start_post_pubsub(config.PostgresPubSub, db, cfg.database_url)
   let assert Ok(node_b_post_bus) =
@@ -142,32 +172,20 @@ pub fn postgres_adapter_delivers_events_across_multiple_pubsub_instances_via_lis
   assert pubsub.subscriber_count(node_a_post_bus) == 1
   assert pubsub.subscriber_count(node_b_post_bus) == 1
 
-  let sample_post =
-    timeline.Post(
-      id: "019352a0-5678-7000-8000-000000000002",
-      user_id: 7,
-      author_name: "Bob",
-      body: "Multi-node LISTEN/NOTIFY post",
-      created_at: timestamp.from_unix_seconds_and_nanoseconds(
-        1_732_250_100,
-        42_000,
-      ),
-    )
-
-  // 1. Publishing on Node A sends pg_notify; both Node A and Node B receive it via PostgreSQL LISTEN!
+  // 1. Publishing on Node A sends compact ID-only pg_notify; both nodes resolve and receive it
   pubsub.publish(node_a_post_bus, timeline.Created(sample_post))
-  assert process.receive(sub_a, 500) == Ok(timeline.Created(sample_post))
-  assert process.receive(sub_b, 500) == Ok(timeline.Created(sample_post))
+  assert process.receive(sub_a, 1000) == Ok(timeline.Created(sample_post))
+  assert process.receive(sub_b, 1000) == Ok(timeline.Created(sample_post))
   // Ensure no duplicate delivery on Node A
   assert process.receive(sub_a, 30) == Error(Nil)
 
   // 2. Publishing Deleted on Node B is received by Node A via PostgreSQL LISTEN
   let deleted_event = timeline.Deleted(sample_post.id)
   pubsub.publish(node_b_post_bus, deleted_event)
-  assert process.receive(sub_a, 500) == Ok(deleted_event)
-  assert process.receive(sub_b, 500) == Ok(deleted_event)
+  assert process.receive(sub_a, 1000) == Ok(deleted_event)
+  assert process.receive(sub_b, 1000) == Ok(deleted_event)
 
-  // 3. Two independent session_revocations PubSub instances also sync across nodes via LISTEN/NOTIFY
+  // 3. Two independent session_revocations PubSub instances also sync across nodes
   let assert Ok(node_a_revocation_bus) =
     lote.start_session_revocations_pubsub(
       config.PostgresPubSub,
@@ -188,8 +206,8 @@ pub fn postgres_adapter_delivers_events_across_multiple_pubsub_instances_via_lis
   assert pubsub.subscriber_count(node_b_revocation_bus) == 1
 
   pubsub.publish(node_a_revocation_bus, "revoked-session-xyz")
-  assert process.receive(rev_sub_a, 500) == Ok("revoked-session-xyz")
-  assert process.receive(rev_sub_b, 500) == Ok("revoked-session-xyz")
+  assert process.receive(rev_sub_a, 1000) == Ok("revoked-session-xyz")
+  assert process.receive(rev_sub_b, 1000) == Ok("revoked-session-xyz")
 
   // 4. Malformed payload on channel is safely ignored without crashing the listener
   let assert Ok(Nil) =
@@ -197,5 +215,173 @@ pub fn postgres_adapter_delivers_events_across_multiple_pubsub_instances_via_lis
   assert process.receive(sub_a, 50) == Error(Nil)
   assert process.receive(sub_b, 50) == Error(Nil)
 
+  // Clean up test rows so subsequent tests see an empty posts table
+  let assert Ok(True) = post_repo.delete(db, created_row.id, author.id)
+  let assert Ok(_) =
+    pog.query("DELETE FROM users WHERE id = $1")
+    |> pog.parameter(pog.int(author.id))
+    |> pog.returning(decode.dynamic)
+    |> pog.execute(db)
+
   process.send_exit(started_pool.pid)
+}
+
+pub fn postgres_publish_is_non_blocking_and_oversized_payload_falls_back_locally_test() {
+  let cfg = config.load()
+  let pool_name = process.new_name("lote_pubsub_async_test_db")
+  let assert Ok(db_config) = pog.url_config(pool_name, cfg.database_url)
+  let db_config =
+    db_config
+    |> pog.pool_size(2)
+    |> pog.connection_parameter("timezone", "UTC")
+  let assert Ok(started_pool) = pog.start(db_config)
+  let db = started_pool.data
+
+  let channel = "lote_test_async_and_limit"
+  let adapter =
+    pubsub.Postgres(
+      db:,
+      database_url: cfg.database_url,
+      channel:,
+      encode: fn(msg) {
+        case msg {
+          "slow" -> {
+            process.sleep(250)
+            "slow"
+          }
+          other -> other
+        }
+      },
+      decode: fn(raw) { Ok(raw) },
+    )
+
+  let assert Ok(bus) = pubsub.start_with_adapter(adapter)
+  let sub = process.new_subject()
+  pubsub.subscribe(bus, sub)
+  assert pubsub.subscriber_count(bus) == 1
+
+  // Trigger a slow publish and verify the PubSub actor itself remains responsive immediately
+  let started_at = timestamp.system_time()
+  pubsub.publish(bus, "slow")
+  assert pubsub.subscriber_count(bus) == 1
+  let elapsed_ms =
+    timestamp.difference(started_at, timestamp.system_time())
+    |> duration.to_milliseconds
+  assert elapsed_ms < 150
+
+  // The slow publish still completes and arrives via LISTEN/NOTIFY
+  assert process.receive(sub, 1000) == Ok("slow")
+
+  // A payload exceeding PostgreSQL's 8000-byte limit falls back cleanly to local delivery
+  let oversized = string.repeat("a", pubsub.max_notify_payload_bytes + 100)
+  pubsub.publish(bus, oversized)
+  assert process.receive(sub, 500) == Ok(oversized)
+
+  // Normal events continue flowing via Postgres after an oversized payload
+  pubsub.publish(bus, "after-oversized")
+  assert process.receive(sub, 1000) == Ok("after-oversized")
+
+  process.send_exit(started_pool.pid)
+}
+
+pub fn postgres_listener_reconnects_after_backend_termination_preserving_subscribers_test() {
+  let cfg = config.load()
+  let pool_name = process.new_name("lote_pubsub_reconnect_test_db")
+  let assert Ok(db_config) = pog.url_config(pool_name, cfg.database_url)
+  let db_config =
+    db_config
+    |> pog.pool_size(2)
+    |> pog.connection_parameter("timezone", "UTC")
+  let assert Ok(started_pool) = pog.start(db_config)
+  let db = started_pool.data
+
+  let channel = "lote_test_reconnect_channel"
+  let adapter =
+    pubsub.Postgres(
+      db:,
+      database_url: cfg.database_url,
+      channel:,
+      encode: fn(msg) { msg },
+      decode: fn(raw) { Ok(raw) },
+    )
+
+  let assert Ok(bus) = pubsub.start_with_adapter(adapter)
+  let sub = process.new_subject()
+  pubsub.subscribe(bus, sub)
+  assert pubsub.subscriber_count(bus) == 1
+
+  // Confirm initial delivery works
+  pubsub.publish(bus, "before-drop")
+  assert process.receive(sub, 1000) == Ok("before-drop")
+
+  // Simulate DB restart / admin disconnect by terminating the LISTEN backend connection
+  let pid_decoder = {
+    use pid <- decode.field(0, decode.int)
+    decode.success(pid)
+  }
+  let assert Ok(returned) =
+    pog.query(
+      "SELECT pid FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND query ILIKE $1",
+    )
+    |> pog.parameter(pog.text("%" <> channel <> "%"))
+    |> pog.returning(pid_decoder)
+    |> pog.execute(db)
+  assert list.length(returned.rows) >= 1
+
+  list.each(returned.rows, fn(backend_pid) {
+    let assert Ok(_) =
+      pog.query("SELECT pg_terminate_backend($1)")
+      |> pog.parameter(pog.int(backend_pid))
+      |> pog.returning(decode.dynamic)
+      |> pog.execute(db)
+    Nil
+  })
+
+  // Wait for automatic reconnect and verify the existing subscriber receives new events
+  // without re-subscribing and without crashing the PubSub actor
+  assert test_helper.wait_until(40, 100, fn() {
+    let probe = "after-reconnect"
+    let _ = pubsub.pg_notify(db, channel, probe)
+    case process.receive(sub, 80) {
+      Ok(msg) if msg == probe -> True
+      _ -> False
+    }
+  })
+  assert pubsub.subscriber_count(bus) == 1
+
+  process.send_exit(started_pool.pid)
+}
+
+pub fn supervised_named_pubsub_restarts_automatically_after_crash_test() {
+  let name = process.new_name("lote_supervised_pubsub_test")
+  let bus = process.named_subject(name)
+
+  let assert Ok(sup) =
+    supervisor.new(supervisor.OneForOne)
+    |> supervisor.add(pubsub.supervised(name, pubsub.Memory))
+    |> supervisor.start
+
+  let assert Ok(original_pid) = process.named(name)
+  let sub1 = process.new_subject()
+  pubsub.subscribe(bus, sub1)
+  assert pubsub.subscriber_count(bus) == 1
+
+  // Force-kill the PubSub actor; the supervisor must restart it under the same name
+  process.kill(original_pid)
+
+  assert test_helper.wait_until(100, 10, fn() {
+    case process.named(name) {
+      Ok(new_pid) -> new_pid != original_pid && process.is_alive(new_pid)
+      Error(_) -> False
+    }
+  })
+
+  // The same named Subject continues working with the restarted actor
+  let sub2 = process.new_subject()
+  pubsub.subscribe(bus, sub2)
+  assert pubsub.subscriber_count(bus) == 1
+  pubsub.publish(bus, "recovered")
+  assert process.receive(sub2, 200) == Ok("recovered")
+
+  process.send_exit(sup.pid)
 }
