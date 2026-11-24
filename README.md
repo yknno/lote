@@ -61,6 +61,8 @@ AUTH_ADAPTERS=password mise exec -- gleam run
 | `SECRET_KEY_BASE` | Cookie 署名キー | 起動時にランダム生成 |
 | `AUTH_ADAPTERS` | 有効にするログイン方式（カンマ区切り、例: `password`） | 空（すべて無効） |
 | `PUBSUB_ADAPTER` | PubSub バックエンド（`memory` または `postgres`） | `memory` |
+| `RATE_LIMIT_ADAPTER` | レートリミットバックエンド（`memory` または `postgres`） | `PUBSUB_ADAPTER` と同じ |
+| `TRUSTED_PROXY_HOPS` | 信頼するリバースプロキシの段数（`X-Forwarded-For` 解決用） | `0` |
 
 ## Test
 
