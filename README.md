@@ -59,6 +59,7 @@ AUTH_ADAPTERS=password mise exec -- gleam run
 | `PORT` | HTTP サーバーの待ち受けポート | `8080` |
 | `DATABASE_URL` | PostgreSQL 接続 URL | `postgres://postgres:postgres@localhost:5432/lote` |
 | `SECRET_KEY_BASE` | Cookie 署名キー | 起動時にランダム生成 |
+| `ISSUER_URL` | OAuth 2.0 / OIDC Issuer URL（兼デフォルト API Audience） | `http://localhost:<PORT>` |
 | `AUTH_ADAPTERS` | 有効にするログイン方式（カンマ区切り、例: `password`） | 空（すべて無効） |
 | `PUBSUB_ADAPTER` | PubSub バックエンド（`memory` または `postgres`） | `memory` |
 | `RATE_LIMIT_ADAPTER` | レートリミットバックエンド（`memory` または `postgres`） | `PUBSUB_ADAPTER` と同じ |

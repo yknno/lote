@@ -256,4 +256,66 @@ pub fn config_parsers_for_rate_limit_adapter_and_proxy_hops_test() {
   assert config.parse_trusted_proxy_hops(" 2 ") == Ok(2)
   assert config.parse_trusted_proxy_hops("-1") == Error("-1")
   assert config.parse_trusted_proxy_hops("abc") == Error("abc")
+
+  assert config.parse_issuer_url("", 8080) == Ok("http://localhost:8080")
+  assert config.parse_issuer_url("", 80) == Ok("http://localhost")
+  assert config.parse_issuer_url("  HTTPS://Lote.Example.COM/  ", 8080)
+    == Ok("https://lote.example.com")
+  assert config.parse_issuer_url("https://lote.example.com/subpath///", 8080)
+    == Ok("https://lote.example.com/subpath")
+  assert config.parse_issuer_url("ftp://lote.example.com", 8080)
+    == Error("ftp://lote.example.com")
+  assert config.parse_issuer_url("https://lote.example.com?q=1", 8080)
+    == Error("https://lote.example.com?q=1")
+  assert config.parse_issuer_url("https://lote.example.com#frag", 8080)
+    == Error("https://lote.example.com#frag")
+  assert config.parse_issuer_url("https://user:pass@lote.example.com", 8080)
+    == Error("https://user:pass@lote.example.com")
+}
+
+pub fn peek_at_does_not_consume_quota_or_insert_rows_test() {
+  use tx <- test_helper.with_db
+  let policy = rate_limit.Policy(limit: 2, window_ms: 20_000, burst: 2)
+  let t0 = 9_000_000
+
+  let assert Ok(mem) = rate_limit.start_memory(test_secret)
+  assert rate_limit.peek_at(mem, "peek:k1", policy, t0)
+    == rate_limit.Allowed(remaining: 1)
+  assert rate_limit.peek_at(mem, "peek:k1", policy, t0)
+    == rate_limit.Allowed(remaining: 1)
+  assert rate_limit.check_at(mem, "peek:k1", policy, t0)
+    == rate_limit.Allowed(remaining: 1)
+  assert rate_limit.check_at(mem, "peek:k1", policy, t0)
+    == rate_limit.Allowed(remaining: 0)
+  assert rate_limit.peek_at(mem, "peek:k1", policy, t0)
+    == rate_limit.Limited(retry_after_seconds: 10)
+  rate_limit.stop_memory(mem)
+
+  let pg = rate_limit.postgres(tx, test_secret)
+  let count_decoder = {
+    use n <- decode.field(0, decode.int)
+    decode.success(n)
+  }
+  let assert Ok(pog.Returned(rows: [before_rows], ..)) =
+    pog.query("SELECT COUNT(*) FROM rate_limits")
+    |> pog.returning(count_decoder)
+    |> pog.execute(tx)
+
+  assert rate_limit.peek_at(pg, "peek:pg1", policy, t0)
+    == rate_limit.Allowed(remaining: 1)
+  assert rate_limit.peek_at(pg, "peek:pg1", policy, t0)
+    == rate_limit.Allowed(remaining: 1)
+
+  let assert Ok(pog.Returned(rows: [after_peek_rows], ..)) =
+    pog.query("SELECT COUNT(*) FROM rate_limits")
+    |> pog.returning(count_decoder)
+    |> pog.execute(tx)
+  assert after_peek_rows == before_rows
+
+  assert rate_limit.check_at(pg, "peek:pg1", policy, t0)
+    == rate_limit.Allowed(remaining: 1)
+  assert rate_limit.check_at(pg, "peek:pg1", policy, t0)
+    == rate_limit.Allowed(remaining: 0)
+  assert rate_limit.peek_at(pg, "peek:pg1", policy, t0)
+    == rate_limit.Limited(retry_after_seconds: 10)
 }
