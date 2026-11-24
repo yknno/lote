@@ -1,6 +1,7 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http
+import gleam/int
 import gleam/option.{None, Some}
 import gleam/time/duration
 import gleam/time/timestamp
@@ -161,9 +162,9 @@ pub fn ws_handle_message_ignores_malformed_json_and_stops_on_close_test() {
   assert lote.ws_handle_message(state, mist.Text("{not valid json"), fn(_) {
       Nil
     })
-    == mist.continue(state)
+    != mist.stop()
   assert lote.ws_handle_message(state, mist.Binary(<<1, 2, 3>>), fn(_) { Nil })
-    == mist.continue(state)
+    != mist.stop()
 
   assert lote.ws_handle_message(state, mist.Closed, fn(_) { Nil })
     == mist.stop()
@@ -253,4 +254,98 @@ pub fn ws_stops_when_session_expires_via_timer_and_blocks_text_frames_after_expi
   assert next != mist.stop()
 
   close_and_wait(state, post_pubsub)
+}
+
+pub fn ws_connect_and_frame_rate_limits_enforce_burst_and_close_flooding_client_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+  let assert Ok(post_pubsub) = pubsub.start()
+  let secret = "ws_rl_secret_key_base_0123456789abcdefghijklmnopqrstuvwxyz"
+  let assert Ok(rate_limiter) = rate_limit.start_memory(secret)
+
+  // 1. WS handshake limit allows burst of 10 per IP, then limits the 11th
+  let ip = "203.0.113.55"
+  let _ =
+    int.range(
+      from: 1,
+      to: lote.ws_connect_policy.burst + 1,
+      with: Nil,
+      run: fn(_, _) {
+        let assert rate_limit.Allowed(_) =
+          lote.check_ws_connect_limit(rate_limiter, ip)
+        Nil
+      },
+    )
+  let assert rate_limit.Limited(retry_after) =
+    lote.check_ws_connect_limit(rate_limiter, ip)
+  assert retry_after >= 1
+
+  // Different IPv4 /32 is unaffected
+  let assert rate_limit.Allowed(_) =
+    lote.check_ws_connect_limit(rate_limiter, "203.0.113.56")
+
+  // IPv6 handshakes rotating within the same /64 share a bucket; adjacent /64 does not
+  let _ =
+    int.range(
+      from: 1,
+      to: lote.ws_connect_policy.burst + 1,
+      with: Nil,
+      run: fn(_, n) {
+        let assert rate_limit.Allowed(_) =
+          lote.check_ws_connect_limit(
+            rate_limiter,
+            "2001:db8:cafe:1::" <> int.to_string(n),
+          )
+        Nil
+      },
+    )
+  let assert rate_limit.Limited(_) =
+    lote.check_ws_connect_limit(rate_limiter, "2001:db8:cafe:1:ffff::99")
+  let assert rate_limit.Allowed(_) =
+    lote.check_ws_connect_limit(rate_limiter, "2001:db8:cafe:2::1")
+
+  // 2. Per-connection WS frame limit allows burst of 30 frames, then stops on 31st
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: secret,
+      methods: [],
+      session_revocations:,
+      rate_limiter:,
+    )
+  let ws_req = simulate.browser_request(http.Get, "/ws")
+  let assert #(state0, Some(_selector)) =
+    lote.ws_init(ws_req, tx, post_pubsub, auth_ctx)
+
+  // Simulate 30 frames sent back-to-back (each advances frame_tat_ms)
+  let state_at_limit =
+    int.range(
+      from: 1,
+      to: lote.ws_frame_policy.burst + 1,
+      with: state0,
+      run: fn(st, _) {
+        let #(_, next_tat) =
+          rate_limit.check_gcra(
+            st.frame_tat_ms,
+            rate_limit.now_ms(),
+            lote.ws_frame_policy,
+          )
+        lote.WsState(..st, frame_tat_ms: next_tat)
+      },
+    )
+
+  // Next frame exceeds the per-connection burst and closes the WebSocket
+  assert lote.ws_handle_message(
+      state_at_limit,
+      mist.Text("{not valid json"),
+      fn(_) { Nil },
+    )
+    == mist.stop()
+  assert lote.ws_handle_message(state_at_limit, mist.Binary(<<1, 2, 3>>), fn(_) {
+      Nil
+    })
+    == mist.stop()
+
+  close_and_wait(state0, post_pubsub)
+  rate_limit.stop_memory(rate_limiter)
 }

@@ -9,6 +9,7 @@ import gleam/time/calendar
 import gleam/time/timestamp
 import lote/auth/user
 import lote/db/post_repo
+import lote/rate_limit
 import lote/realtime/pubsub
 import lote/test_helper
 import lote/web/components/timeline
@@ -99,6 +100,7 @@ pub fn submitting_post_increments_form_key_and_publishes_post_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(author),
       csrf_token: "test-csrf-token",
     ))
@@ -135,6 +137,7 @@ pub fn submitting_blank_post_keeps_form_key_and_does_not_save_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(author),
       csrf_token: "test-csrf-token",
     ))
@@ -159,6 +162,7 @@ pub fn unauthenticated_user_cannot_submit_post_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: None,
       csrf_token: "anon-csrf-token",
     ))
@@ -188,6 +192,7 @@ pub fn incoming_post_shows_pending_banner_until_refreshed_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(alice),
       csrf_token: "test-csrf-token",
     ))
@@ -240,6 +245,7 @@ pub fn submitting_own_post_refreshes_pending_posts_without_echo_banner_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(alice),
       csrf_token: "test-csrf-token",
     ))
@@ -279,6 +285,7 @@ pub fn toggling_auto_refresh_flushes_pending_and_streams_new_posts_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(alice),
       csrf_token: "test-csrf-token",
     ))
@@ -336,6 +343,7 @@ pub fn post_renders_lote_time_with_rfc3339_datetime_and_permalink_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(author),
       csrf_token: "test-csrf-token",
     ))
@@ -364,6 +372,7 @@ pub fn owner_can_delete_post_with_confirmation_and_broadcasts_deletion_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(alice),
       csrf_token: "alice-csrf",
     ))
@@ -375,6 +384,7 @@ pub fn owner_can_delete_post_with_confirmation_and_broadcasts_deletion_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(bob),
       csrf_token: "bob-csrf",
     ))
@@ -426,6 +436,7 @@ pub fn non_owner_cannot_delete_another_users_post_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(bob),
       csrf_token: "bob-csrf",
     ))
@@ -465,6 +476,7 @@ pub fn timeline_loads_initial_page_and_appends_older_posts_on_load_more_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(alice),
       csrf_token: "test-csrf-token",
     ))
@@ -514,6 +526,7 @@ pub fn timeline_without_older_posts_omits_sentinel_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(alice),
       csrf_token: "test-csrf-token",
     ))
@@ -550,6 +563,7 @@ pub fn feed_assigns_stable_post_id_keys_across_prepend_delete_and_pagination_tes
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(alice),
       csrf_token: "test-csrf-token",
     ))
@@ -600,6 +614,7 @@ pub fn server_component_runtime_delivers_pubsub_events_and_cleans_up_on_shutdown
     timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(author),
       csrf_token: "test-csrf-token",
     )
@@ -638,6 +653,7 @@ pub fn submitting_over_limit_post_shows_error_without_resetting_form_and_clears_
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(author),
       csrf_token: "test-csrf-token",
     ))
@@ -697,6 +713,7 @@ pub fn incremental_refresh_and_own_submit_preserve_loaded_older_posts_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(alice),
       csrf_token: "test-csrf-token",
     ))
@@ -738,6 +755,7 @@ pub fn pending_ids_deduplicate_and_remove_deleted_pending_posts_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(alice),
       csrf_token: "test-csrf-token",
     ))
@@ -778,6 +796,7 @@ pub fn save_and_delete_failures_display_error_without_clearing_form_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(ghost_user),
       csrf_token: "test-csrf-token",
     ))
@@ -821,6 +840,7 @@ pub fn submitting_state_disables_button_and_blocks_duplicate_submit_test() {
     timeline.init(timeline.Flags(
       db: tx,
       pubsub: post_pubsub,
+      rate_limiter: rate_limit.disabled(),
       user: Some(alice),
       csrf_token: "test-csrf-token",
     ))
@@ -862,4 +882,69 @@ pub fn submitting_state_disables_button_and_blocks_duplicate_submit_test() {
   assert !failed_model.submitting
   assert failed_model.form_key == 0
   assert failed_model.form_error == Some("DB error")
+}
+
+pub fn submitting_posts_past_rate_limit_shows_error_and_preserves_draft_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "BurstAlice")
+  let assert Ok(bob) = user.create(tx, "BurstBob")
+  let assert Ok(post_pubsub) = pubsub.start()
+  let assert Ok(rate_limiter) =
+    rate_limit.start_memory("timeline_rl_secret_key_base")
+
+  let #(alice0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      rate_limiter:,
+      user: Some(alice),
+      csrf_token: "alice-csrf",
+    ))
+
+  // Alice can publish up to burst (5) posts in rapid succession
+  let alice_after_burst =
+    int.range(
+      from: 1,
+      to: timeline.post_create_policy.burst + 1,
+      with: alice0,
+      run: fn(m, n) {
+        step(
+          m,
+          timeline.UserSubmittedForm([#("body", "burst-" <> int.to_string(n))]),
+        )
+      },
+    )
+  assert alice_after_burst.form_key == timeline.post_create_policy.burst
+  assert list.length(alice_after_burst.posts)
+    == timeline.post_create_policy.burst
+  assert alice_after_burst.form_error == None
+
+  // 6th rapid post from Alice is rate-limited: preserves form_key (draft), clears submitting, shows error
+  let alice_limited =
+    step(
+      alice_after_burst,
+      timeline.UserSubmittedForm([#("body", "too fast post")]),
+    )
+  assert !alice_limited.submitting
+  assert alice_limited.form_key == timeline.post_create_policy.burst
+  assert list.length(alice_limited.posts) == timeline.post_create_policy.burst
+  let assert Some(err_msg) = alice_limited.form_error
+  assert string.contains(err_msg, "posting too fast")
+  assert string.contains(render_html(alice_limited), "role=\"alert\"")
+
+  // Bob has his own independent user_id quota and can still post
+  let #(bob0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      rate_limiter:,
+      user: Some(bob),
+      csrf_token: "bob-csrf",
+    ))
+  let bob1 = step(bob0, timeline.UserSubmittedForm([#("body", "bob ok post")]))
+  assert bob1.form_key == 1
+  assert bob1.form_error == None
+
+  rate_limit.stop_memory(rate_limiter)
 }
