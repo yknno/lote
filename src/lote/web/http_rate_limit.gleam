@@ -1,10 +1,10 @@
 import gleam/http/response
 import gleam/int
 import lote/rate_limit
+import lote/web/rate_policy
 import wisp
 
-pub const write_policy =
-  rate_limit.Policy(limit: 30, window_ms: 60_000, burst: 10)
+pub const write_policy = rate_policy.http_write_user_policy
 
 pub fn require_user_write(
   limiter: rate_limit.Limiter,
@@ -14,7 +14,7 @@ pub fn require_user_write(
   case
     rate_limit.check(
       limiter,
-      "http:write:user:" <> int.to_string(user_id),
+      rate_policy.http_write_user_key(user_id),
       write_policy,
     )
   {

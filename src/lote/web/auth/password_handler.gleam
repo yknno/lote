@@ -12,13 +12,12 @@ import lote/realtime/pubsub
 import lote/web/auth/view
 import lote/web/client_ip
 import lote/web/csrf
+import lote/web/rate_policy
 import wisp
 
-pub const ip_policy =
-  rate_limit.Policy(limit: 100, window_ms: 900_000, burst: 50)
+pub const ip_policy = rate_policy.login_ip_policy
 
-pub const account_policy =
-  rate_limit.Policy(limit: 5, window_ms: 900_000, burst: 5)
+pub const account_policy = rate_policy.login_account_policy
 
 pub fn handle(
   req: wisp.Request,
@@ -50,9 +49,9 @@ fn handle_login(
   case login_id, pass {
     Ok(login_id), Ok(pass) -> {
       let ip_bucket = client_ip.rate_limit_bucket(client_ip)
-      let ip_key = "login:ip:" <> ip_bucket
+      let ip_key = rate_policy.login_ip_key(ip_bucket)
       let normalized_id = string.lowercase(string.trim(login_id))
-      let account_key = "login:ip_id:" <> ip_bucket <> ":" <> normalized_id
+      let account_key = rate_policy.login_account_key(ip_bucket, normalized_id)
 
       case check_login_limits(auth_ctx.rate_limiter, ip_key, account_key) {
         rate_limit.Limited(retry_after_seconds:) ->

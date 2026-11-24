@@ -24,6 +24,7 @@ import lote/web/client_ip
 import lote/web/components/timeline
 import lote/web/csrf
 import lote/web/origin
+import lote/web/rate_policy
 import lote/web/router
 import lustre
 import lustre/server_component
@@ -290,11 +291,9 @@ pub fn handler_with_oidc(
 
 const max_expiry_timer_ms = 86_400_000
 
-pub const ws_connect_policy =
-  rate_limit.Policy(limit: 120, window_ms: 60_000, burst: 60)
+pub const ws_connect_policy = rate_policy.ws_connect_policy
 
-pub const ws_frame_policy =
-  rate_limit.Policy(limit: 30, window_ms: 10_000, burst: 30)
+pub const ws_frame_policy = rate_policy.ws_frame_policy
 
 pub type WsMsg {
   ComponentMessage(server_component.ClientMessage(timeline.Msg))
@@ -320,7 +319,7 @@ pub fn check_ws_connect_limit(
 ) -> rate_limit.Decision {
   rate_limit.check(
     limiter,
-    "ws:connect:ip:" <> client_ip.rate_limit_bucket(ip),
+    rate_policy.ws_connect_ip_key(client_ip.rate_limit_bucket(ip)),
     ws_connect_policy,
   )
 }
@@ -354,7 +353,9 @@ fn serve_timeline_ws(
         rate_limit.Allowed(_) ->
           mist.websocket(
             request: req,
-            on_init: fn(_conn) { ws_init(req, db, post_pubsub, auth_ctx) },
+            on_init: fn(_conn) {
+              ws_init_with_ip(req, db, post_pubsub, auth_ctx, ip)
+            },
             handler: fn(state: WsState, msg, conn) {
               ws_handle_message(state, msg, fn(payload) {
                 let _ = mist.send_text_frame(conn, payload)
@@ -372,6 +373,16 @@ pub fn ws_init(
   db: pog.Connection,
   post_pubsub: PubSub(timeline.PostEvent),
   auth_ctx: Auth,
+) -> #(WsState, Option(process.Selector(WsMsg))) {
+  ws_init_with_ip(req, db, post_pubsub, auth_ctx, "127.0.0.1")
+}
+
+pub fn ws_init_with_ip(
+  req: Request(body),
+  db: pog.Connection,
+  post_pubsub: PubSub(timeline.PostEvent),
+  auth_ctx: Auth,
+  client_ip: String,
 ) -> #(WsState, Option(process.Selector(WsMsg))) {
   let revocation_sub = process.new_subject()
   let candidate_session_id = session.session_id(req, auth_ctx.secret_key_base)
@@ -423,7 +434,7 @@ pub fn ws_init(
       csrf_token:,
     )
   let assert Ok(component) =
-    lustre.start_server_component(timeline.app(), flags)
+    lustre.start_server_component(timeline.app_with_ip(client_ip), flags)
   let self = process.new_subject()
   let selector =
     process.new_selector()

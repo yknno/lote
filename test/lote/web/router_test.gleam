@@ -19,6 +19,7 @@ import lote/web/client_ip
 import lote/web/components/timeline
 import lote/web/csrf
 import lote/web/http_rate_limit
+import lote/web/rate_policy
 import lote/web/router
 import wisp
 import wisp/simulate
@@ -1106,6 +1107,125 @@ pub fn http_write_endpoints_enforce_user_rate_limits_and_exempt_logout_test() {
         Nil
       },
     )
+
+  rate_limit.stop_memory(rate_limiter)
+}
+
+pub fn baseline_http_ip_rate_limit_protects_routes_and_exempts_health_static_and_logout_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+  let assert Ok(post_pubsub) = pubsub.start()
+  let secret = "baseline_ip_rl_secret_key_base_0123456789abcdefghijklmnopqr"
+  let assert Ok(rate_limiter) = rate_limit.start_memory(secret)
+
+  let assert Ok(alice) = user.create(tx, "BaselineAlice")
+  let assert Ok(post) = post_repo.create(tx, alice.id, "baseline ip test post")
+
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: secret,
+      methods: [Password],
+      session_revocations:,
+      rate_limiter:,
+    )
+
+  let ip = "203.0.113.199"
+  let login_page_req = simulate.browser_request(http.Get, "/auth/login")
+  let login_page_resp =
+    router.handle_request_with_ip(login_page_req, auth_ctx, post_pubsub, ip)
+  assert login_page_resp.status == 200
+  let logout_csrf = extract_form_csrf_token(simulate.read_body(login_page_resp))
+
+  // Exhaust remaining (burst - 1 = 119) slots on `http:ip:203.0.113.199/32` across GET routes
+  let _ =
+    int.range(
+      from: 2,
+      to: rate_policy.http_ip_policy.burst + 1,
+      with: Nil,
+      run: fn(_, n) {
+        let path = case n % 3 {
+          0 -> "/posts/" <> post.id
+          1 -> "/sessions"
+          _ -> "/settings/clients"
+        }
+        let resp =
+          simulate.browser_request(http.Get, path)
+          |> router.handle_request_with_ip(auth_ctx, post_pubsub, ip)
+        assert resp.status == 200 || resp.status == 303
+        Nil
+      },
+    )
+
+  // Web routes (`GET /posts/:id`, `GET /sessions`, `GET /settings/clients`, unknown 404) now return 429 + Retry-After + no-store
+  let web_limited =
+    simulate.browser_request(http.Get, "/posts/" <> post.id)
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, ip)
+  assert web_limited.status == 429
+  assert response.get_header(web_limited, "cache-control") == Ok("no-store")
+  let assert Ok(_) = response.get_header(web_limited, "retry-after")
+  assert simulate.read_body(web_limited) == "Too Many Requests"
+
+  let sessions_limited =
+    simulate.browser_request(http.Get, "/sessions")
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, ip)
+  assert sessions_limited.status == 429
+
+  let clients_limited =
+    simulate.browser_request(http.Get, "/settings/clients")
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, ip)
+  assert clients_limited.status == 429
+
+  // `/api/*` returns JSON 429 (`too_many_requests`) + `ratelimit-*` headers
+  let api_limited =
+    simulate.request(http.Get, "/api/v1/posts")
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, ip)
+  assert api_limited.status == 429
+  assert response.get_header(api_limited, "cache-control") == Ok("no-store")
+  assert response.get_header(api_limited, "ratelimit-limit")
+    == Ok(int.to_string(rate_policy.http_ip_policy.limit))
+  assert response.get_header(api_limited, "ratelimit-remaining") == Ok("0")
+  assert string.contains(simulate.read_body(api_limited), "too_many_requests")
+
+  // `/oidc/*` returns OAuth RFC 6749 JSON 429 (`temporarily_unavailable`) + `no-store` + `pragma: no-cache`
+  let oidc_limited =
+    simulate.request(http.Post, "/oidc/token")
+    |> simulate.form_body([#("grant_type", "client_credentials")])
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, ip)
+  assert oidc_limited.status == 429
+  assert response.get_header(oidc_limited, "cache-control") == Ok("no-store")
+  assert response.get_header(oidc_limited, "pragma") == Ok("no-cache")
+  assert string.contains(
+    simulate.read_body(oidc_limited),
+    "temporarily_unavailable",
+  )
+
+  // Exemptions still work even while `http:ip` is completely exhausted:
+  // 1) GET /health -> 200
+  let health_ok =
+    simulate.request(http.Get, "/health")
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, ip)
+  assert health_ok.status == 200
+
+  // 2) GET /static/* existing asset -> 200
+  let static_ok =
+    simulate.request(http.Get, "/static/lote-time.js")
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, ip)
+  assert static_ok.status == 200
+
+  // 3) POST /auth/logout -> 303
+  let logout_ok =
+    simulate.browser_request(http.Post, "/auth/logout")
+    |> simulate.session(login_page_req, login_page_resp)
+    |> simulate.form_body([#(csrf.form_field_name, logout_csrf)])
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, ip)
+  assert logout_ok.status == 303
+
+  // Another IP is completely unaffected
+  let other_ip_ok =
+    simulate.browser_request(http.Get, "/posts/" <> post.id)
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, "203.0.113.200")
+  assert other_ip_ok.status == 200
 
   rate_limit.stop_memory(rate_limiter)
 }

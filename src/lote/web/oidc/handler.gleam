@@ -16,16 +16,12 @@ import lote/oidc/scope.{type Scope}
 import lote/oidc/token
 import lote/rate_limit
 import lote/web/client_ip
+import lote/web/rate_policy
 import wisp
 
-pub const ip_endpoint_policy =
-  rate_limit.Policy(limit: 100, window_ms: 900_000, burst: 50)
+pub const ip_endpoint_policy = rate_policy.oidc_ip_policy
 
-pub const auth_fail_ip_policy =
-  rate_limit.Policy(limit: 20, window_ms: 900_000, burst: 20)
-
-pub const client_auth_fail_policy =
-  rate_limit.Policy(limit: 10, window_ms: 900_000, burst: 10)
+pub const client_auth_fail_policy = rate_policy.oidc_client_auth_policy
 
 const basic_www_authenticate = "Basic realm=\"lote\", charset=\"UTF-8\""
 
@@ -85,7 +81,6 @@ fn handle_token(
     Ok("client_credentials") -> {
       use client_id <- require_valid_client_id(creds)
       let ip_bucket = client_ip.rate_limit_bucket(client_ip)
-      use <- require_auth_fail_ip_not_limited(oidc_ctx.rate_limiter, ip_bucket)
       use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
       use authed_client <- with_authenticated_client(
         oidc_ctx,
@@ -100,7 +95,6 @@ fn handle_token(
     Ok("authorization_code") -> {
       use client_id <- require_valid_client_id(creds)
       let ip_bucket = client_ip.rate_limit_bucket(client_ip)
-      use <- require_auth_fail_ip_not_limited(oidc_ctx.rate_limiter, ip_bucket)
       use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
       use authed_client <- with_authenticated_client(
         oidc_ctx,
@@ -115,7 +109,6 @@ fn handle_token(
     Ok("refresh_token") -> {
       use client_id <- require_valid_client_id(creds)
       let ip_bucket = client_ip.rate_limit_bucket(client_ip)
-      use <- require_auth_fail_ip_not_limited(oidc_ctx.rate_limiter, ip_bucket)
       use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
       use authed_client <- with_authenticated_client(
         oidc_ctx,
@@ -236,7 +229,6 @@ fn handle_revoke(
   use client_id <- require_valid_client_id(creds)
 
   let ip_bucket = client_ip.rate_limit_bucket(client_ip)
-  use <- require_auth_fail_ip_not_limited(oidc_ctx.rate_limiter, ip_bucket)
   use authed_client <- with_authenticated_client(
     oidc_ctx,
     client_id,
@@ -265,7 +257,6 @@ fn handle_introspect(
   use client_id <- require_valid_client_id(creds)
 
   let ip_bucket = client_ip.rate_limit_bucket(client_ip)
-  use <- require_auth_fail_ip_not_limited(oidc_ctx.rate_limiter, ip_bucket)
   use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
   use authed_client <- with_authenticated_client(
     oidc_ctx,
@@ -319,25 +310,12 @@ fn require_valid_client_id(
   }
 }
 
-fn require_auth_fail_ip_not_limited(
-  limiter: rate_limit.Limiter,
-  ip_bucket: String,
-  next: fn() -> wisp.Response,
-) -> wisp.Response {
-  let key = auth_fail_ip_key(ip_bucket)
-  case rate_limit.peek(limiter, key, auth_fail_ip_policy) {
-    rate_limit.Allowed(_) -> next()
-    rate_limit.Limited(retry_after_seconds:) ->
-      rate_limited_response(retry_after_seconds)
-  }
-}
-
 fn require_ip_endpoint_limit(
   limiter: rate_limit.Limiter,
   ip_bucket: String,
   next: fn() -> wisp.Response,
 ) -> wisp.Response {
-  let key = "oidc:ip:" <> ip_bucket
+  let key = rate_policy.oidc_ip_key(ip_bucket)
   case rate_limit.check(limiter, key, ip_endpoint_policy) {
     rate_limit.Allowed(_) -> next()
     rate_limit.Limited(retry_after_seconds:) ->
@@ -377,18 +355,15 @@ fn authenticate_client_with_limits(
   case client.find_by_client_id(oidc_ctx.db, client_id) {
     Error(_) -> ClientAuthRejected(oauth_error(500, "server_error", None))
 
-    Ok(None) ->
-      ClientAuthRejected(record_ip_auth_failure(
-        oidc_ctx.rate_limiter,
-        ip_bucket,
-      ))
+    Ok(None) -> ClientAuthRejected(invalid_client_response())
 
     Ok(Some(found)) ->
       case found.kind {
         client.SubordinateBot | client.ConfidentialApp -> {
-          let ip_client_key = client_auth_fail_key(ip_bucket, found.client_id)
+          let ip_client_key =
+            rate_policy.oidc_client_auth_key(ip_bucket, found.client_id)
           case
-            rate_limit.peek(
+            rate_limit.check(
               oidc_ctx.rate_limiter,
               ip_client_key,
               client_auth_fail_policy,
@@ -399,21 +374,11 @@ fn authenticate_client_with_limits(
 
             rate_limit.Allowed(_) ->
               case creds.client_secret {
-                None ->
-                  ClientAuthRejected(record_client_secret_failure(
-                    oidc_ctx.rate_limiter,
-                    ip_bucket,
-                    ip_client_key,
-                  ))
+                None -> ClientAuthRejected(invalid_client_response())
 
                 Some(raw_secret) ->
                   case client.is_valid_secret_format(raw_secret) {
-                    False ->
-                      ClientAuthRejected(record_client_secret_failure(
-                        oidc_ctx.rate_limiter,
-                        ip_bucket,
-                        ip_client_key,
-                      ))
+                    False -> ClientAuthRejected(invalid_client_response())
 
                     True ->
                       case
@@ -428,11 +393,7 @@ fn authenticate_client_with_limits(
                           ClientAuthenticated(authed)
                         }
                         Error(client.InvalidClientCredentials) ->
-                          ClientAuthRejected(record_client_secret_failure(
-                            oidc_ctx.rate_limiter,
-                            ip_bucket,
-                            ip_client_key,
-                          ))
+                          ClientAuthRejected(invalid_client_response())
                         Error(_) ->
                           ClientAuthRejected(oauth_error(
                             500,
@@ -448,59 +409,17 @@ fn authenticate_client_with_limits(
         client.PublicApp | client.Cimd ->
           case require_confidential, creds.client_secret, creds.used_basic {
             True, _, _ | _, Some(_), _ | _, _, True ->
-              ClientAuthRejected(record_ip_auth_failure(
-                oidc_ctx.rate_limiter,
-                ip_bucket,
-              ))
+              ClientAuthRejected(invalid_client_response())
             False, None, False -> ClientAuthenticated(found)
           }
       }
   }
 }
 
-fn record_ip_auth_failure(
-  limiter: rate_limit.Limiter,
-  ip_bucket: String,
-) -> wisp.Response {
-  case
-    rate_limit.check(limiter, auth_fail_ip_key(ip_bucket), auth_fail_ip_policy)
-  {
-    rate_limit.Limited(retry_after_seconds:) ->
-      rate_limited_response(retry_after_seconds)
-    rate_limit.Allowed(_) -> invalid_client_response()
-  }
-}
-
-fn record_client_secret_failure(
-  limiter: rate_limit.Limiter,
-  ip_bucket: String,
-  ip_client_key: String,
-) -> wisp.Response {
-  let ip_decision =
-    rate_limit.check(limiter, auth_fail_ip_key(ip_bucket), auth_fail_ip_policy)
-  let client_decision =
-    rate_limit.check(limiter, ip_client_key, client_auth_fail_policy)
-
-  case client_decision, ip_decision {
-    rate_limit.Limited(retry_after_seconds:), _ ->
-      rate_limited_response(retry_after_seconds)
-    _, rate_limit.Limited(retry_after_seconds:) ->
-      rate_limited_response(retry_after_seconds)
-    rate_limit.Allowed(_), rate_limit.Allowed(_) -> invalid_client_response()
-  }
-}
-
-fn auth_fail_ip_key(ip_bucket: String) -> String {
-  "oidc:auth_fail:ip:" <> ip_bucket
-}
-
-fn client_auth_fail_key(ip_bucket: String, client_id: String) -> String {
-  "oidc:auth_fail:ip_client:" <> ip_bucket <> ":" <> client_id
-}
-
-fn rate_limited_response(retry_after_seconds: Int) -> wisp.Response {
+pub fn rate_limited_response(retry_after_seconds: Int) -> wisp.Response {
   oauth_error(429, "temporarily_unavailable", Some("Too many requests"))
   |> response.set_header("retry-after", int.to_string(retry_after_seconds))
+  |> with_no_store_headers
 }
 
 fn require_oauth_form(

@@ -8,14 +8,18 @@ import lote/auth.{type Auth}
 import lote/auth/session
 import lote/db/post_repo
 import lote/oidc.{type Oidc}
+import lote/rate_limit
 import lote/realtime/pubsub.{type PubSub}
 import lote/web/api/posts_handler
 import lote/web/auth/handler as auth_handler
+import lote/web/client_ip
 import lote/web/components/timeline
 import lote/web/csrf
 import lote/web/http_rate_limit
+import lote/web/oidc/bearer
 import lote/web/oidc/handler as oidc_handler
 import lote/web/post/view as post_view
+import lote/web/rate_policy
 import lote/web/sessions/handler as sessions_handler
 import lote/web/settings/clients_handler
 import lustre/attribute
@@ -58,7 +62,7 @@ pub fn handle_request_with_oidc(
   post_pubsub: PubSub(timeline.PostEvent),
   client_ip: String,
 ) -> Response {
-  use req <- middleware(req)
+  use req <- middleware(req, auth_ctx, oidc_ctx, client_ip)
 
   case req.method, wisp.path_segments(req) {
     _, [] -> {
@@ -134,7 +138,7 @@ pub fn handle_request_with_oidc(
     _, ["oidc", ..rest] ->
       oidc_handler.handle_request(req, rest, oidc_ctx, client_ip)
     _, ["api", "v1", "posts", ..rest] ->
-      posts_handler.handle_request(req, rest, oidc_ctx, post_pubsub, client_ip)
+      posts_handler.handle_request(req, rest, oidc_ctx, post_pubsub)
     _, ["api", ..] -> posts_handler.json_error(404, "not_found")
     _, ["health"] -> wisp.response(200) |> wisp.string_body("ok")
     _, _ -> wisp.not_found()
@@ -177,6 +181,9 @@ fn index_html() -> String {
 
 fn middleware(
   req: Request,
+  auth_ctx: Auth,
+  oidc_ctx: Oidc,
+  client_ip: String,
   handle_request: fn(Request) -> Response,
 ) -> Response {
   let req = wisp.method_override(req)
@@ -191,11 +198,67 @@ fn middleware(
       Error(_) -> "priv/static"
     }
     serve_static_with_cache(req, static_dir, fn() {
+      use <- require_baseline_ip_rate_limit(req, auth_ctx, oidc_ctx, client_ip)
       handle_request(req)
       |> ensure_cache_control(default_cache_control)
     })
   }
   |> ensure_cache_control(default_cache_control)
+}
+
+fn require_baseline_ip_rate_limit(
+  req: Request,
+  auth_ctx: Auth,
+  oidc_ctx: Oidc,
+  client_ip: String,
+  next: fn() -> Response,
+) -> Response {
+  let segments = wisp.path_segments(req)
+  case is_baseline_rate_limit_exempt(req.method, segments) {
+    True -> next()
+    False -> {
+      let limiter = case segments {
+        ["oidc", ..] | ["api", ..] -> oidc_ctx.rate_limiter
+        _ -> auth_ctx.rate_limiter
+      }
+      let ip_key =
+        client_ip
+        |> client_ip.rate_limit_bucket
+        |> rate_policy.http_ip_key
+
+      case rate_limit.check(limiter, ip_key, rate_policy.http_ip_policy) {
+        rate_limit.Allowed(_) -> next()
+        rate_limit.Limited(retry_after_seconds:) ->
+          baseline_rate_limited_response(segments, retry_after_seconds)
+      }
+    }
+  }
+}
+
+fn is_baseline_rate_limit_exempt(
+  method: http.Method,
+  segments: List(String),
+) -> Bool {
+  case method, segments {
+    _, ["health"] -> True
+    http.Post, ["auth", "logout"] -> True
+    _, _ -> False
+  }
+}
+
+fn baseline_rate_limited_response(
+  segments: List(String),
+  retry_after_seconds: Int,
+) -> Response {
+  case segments {
+    ["api", ..] ->
+      bearer.too_many_requests_with_limit(
+        rate_policy.http_ip_policy.limit,
+        retry_after_seconds,
+      )
+    ["oidc", ..] -> oidc_handler.rate_limited_response(retry_after_seconds)
+    _ -> http_rate_limit.too_many_requests(retry_after_seconds)
+  }
 }
 
 fn apply_origin_or_strip_cookies(

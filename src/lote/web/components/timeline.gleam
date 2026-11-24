@@ -13,7 +13,9 @@ import lote/auth/user.{type AuthUser}
 import lote/db/post_repo
 import lote/rate_limit.{type Limiter}
 import lote/realtime/pubsub.{type PubSub}
+import lote/web/client_ip
 import lote/web/csrf
+import lote/web/rate_policy
 import lote/web/time as web_time
 import lustre
 import lustre/attribute
@@ -120,8 +122,11 @@ pub fn decode_post_event(
   }
 }
 
-pub const post_create_policy =
-  rate_limit.Policy(limit: 10, window_ms: 60_000, burst: 5)
+pub const post_create_policy = rate_policy.post_create_user_policy
+
+pub const ws_read_policy = rate_policy.ws_read_policy
+
+pub const delete_write_policy = rate_policy.http_write_user_policy
 
 pub type Flags {
   Flags(
@@ -140,6 +145,7 @@ pub type Model {
     db: pog.Connection,
     pubsub: PubSub(PostEvent),
     rate_limiter: Limiter,
+    read_rate_key: String,
     user: Option(AuthUser),
     csrf_token: String,
     posts: List(Post),
@@ -173,6 +179,7 @@ pub type Msg {
   )
   PostSaveFailed(String)
   PostDeleteFailed(String)
+  TimelineReadRateLimited(Int)
   PostsReloaded(List(Post), Bool, Set(String))
   NewerPostsLoaded(posts: List(Post), cleared_pending: Set(String))
   NewerPostsLoadFailed
@@ -183,7 +190,11 @@ pub type Msg {
 }
 
 pub fn app() -> lustre.App(Flags, Model, Msg) {
-  lustre.application(init:, update:, view:)
+  app_with_ip("127.0.0.1")
+}
+
+pub fn app_with_ip(client_ip: String) -> lustre.App(Flags, Model, Msg) {
+  lustre.application(init: init_with_ip(_, client_ip), update:, view:)
 }
 
 fn row_to_post(row: post_repo.PostRow) -> Post {
@@ -225,51 +236,64 @@ fn load_older_page(
 }
 
 fn load_newer_posts_effect(
+  limiter: Limiter,
+  read_rate_key: String,
   db: pog.Connection,
   head_id: Option(String),
   pending_snapshot: Set(String),
 ) -> Effect(Msg) {
   effect.from(fn(dispatch) {
-    case head_id {
-      Some(after_id) ->
-        case post_repo.list_after(db, after_id, max_incremental_fetch + 1) {
-          Ok(rows) ->
-            case list.length(rows) > max_incremental_fetch {
-              True ->
-                case load_recent_page(db) {
-                  Ok(#(posts, has_more)) ->
-                    dispatch(PostsReloaded(posts, has_more, pending_snapshot))
-                  Error(err) -> {
-                    wisp.log_warning(
-                      "Failed to reload recent posts: " <> string.inspect(err),
-                    )
-                    dispatch(NewerPostsLoadFailed)
-                  }
-                }
-              False ->
-                dispatch(NewerPostsLoaded(
-                  posts: list.map(rows, row_to_post),
-                  cleared_pending: pending_snapshot,
-                ))
-            }
-          Error(err) -> {
-            wisp.log_warning(
-              "Failed to load newer posts: " <> string.inspect(err),
-            )
-            dispatch(NewerPostsLoadFailed)
-          }
-        }
+    case rate_limit.check(limiter, read_rate_key, ws_read_policy) {
+      rate_limit.Limited(retry_after_seconds:) ->
+        dispatch(TimelineReadRateLimited(retry_after_seconds))
 
-      None ->
-        case load_recent_page(db) {
-          Ok(#(posts, has_more)) ->
-            dispatch(PostsReloaded(posts, has_more, pending_snapshot))
-          Error(err) -> {
-            wisp.log_warning(
-              "Failed to load recent posts: " <> string.inspect(err),
-            )
-            dispatch(NewerPostsLoadFailed)
-          }
+      rate_limit.Allowed(_) ->
+        case head_id {
+          Some(after_id) ->
+            case post_repo.list_after(db, after_id, max_incremental_fetch + 1) {
+              Ok(rows) ->
+                case list.length(rows) > max_incremental_fetch {
+                  True ->
+                    case load_recent_page(db) {
+                      Ok(#(posts, has_more)) ->
+                        dispatch(PostsReloaded(
+                          posts,
+                          has_more,
+                          pending_snapshot,
+                        ))
+                      Error(err) -> {
+                        wisp.log_warning(
+                          "Failed to reload recent posts: "
+                          <> string.inspect(err),
+                        )
+                        dispatch(NewerPostsLoadFailed)
+                      }
+                    }
+                  False ->
+                    dispatch(NewerPostsLoaded(
+                      posts: list.map(rows, row_to_post),
+                      cleared_pending: pending_snapshot,
+                    ))
+                }
+              Error(err) -> {
+                wisp.log_warning(
+                  "Failed to load newer posts: " <> string.inspect(err),
+                )
+                dispatch(NewerPostsLoadFailed)
+              }
+            }
+
+          None ->
+            case load_recent_page(db) {
+              Ok(#(posts, has_more)) ->
+                dispatch(PostsReloaded(posts, has_more, pending_snapshot))
+              Error(err) -> {
+                wisp.log_warning(
+                  "Failed to load recent posts: " <> string.inspect(err),
+                )
+                dispatch(NewerPostsLoadFailed)
+              }
+            }
         }
     }
   })
@@ -320,9 +344,21 @@ fn remaining_pending(
 }
 
 pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
+  init_with_ip(flags, "127.0.0.1")
+}
+
+pub fn init_with_ip(flags: Flags, client_ip: String) -> #(Model, Effect(Msg)) {
   let #(posts, has_more) = case load_recent_page(flags.db) {
     Ok(page) -> page
     Error(_) -> #([], False)
+  }
+
+  let read_rate_key = case flags.user {
+    Some(auth_user) -> rate_policy.ws_read_user_key(auth_user.id)
+    None ->
+      client_ip
+      |> client_ip.rate_limit_bucket
+      |> rate_policy.ws_read_ip_key
   }
 
   let subscribe_effect =
@@ -342,6 +378,7 @@ pub fn init(flags: Flags) -> #(Model, Effect(Msg)) {
       db: flags.db,
       pubsub: flags.pubsub,
       rate_limiter: flags.rate_limiter,
+      read_rate_key:,
       user: flags.user,
       csrf_token: flags.csrf_token,
       posts:,
@@ -408,7 +445,7 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             Ok(body) -> {
               let head_id = first_post_id(model.posts)
               let pending_snapshot = model.pending_ids
-              let rate_key = "post:create:user:" <> int.to_string(auth_user.id)
+              let rate_key = rate_policy.post_create_user_key(auth_user.id)
               let save_and_publish =
                 effect.from(fn(dispatch) {
                   case
@@ -504,6 +541,8 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
         False -> #(
           Model(..model, loading_newer: True, timeline_error: None),
           load_newer_posts_effect(
+            model.rate_limiter,
+            model.read_rate_key,
             model.db,
             first_post_id(model.posts),
             model.pending_ids,
@@ -524,6 +563,8 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
                 timeline_error: None,
               ),
               load_newer_posts_effect(
+                model.rate_limiter,
+                model.read_rate_key,
                 model.db,
                 first_post_id(model.posts),
                 model.pending_ids,
@@ -545,19 +586,31 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
             Some(cursor) -> {
               let load_effect =
                 effect.from(fn(dispatch) {
-                  case load_older_page(model.db, cursor) {
-                    Ok(#(older, has_more)) ->
-                      dispatch(OlderPostsLoaded(
-                        cursor:,
-                        posts: older,
-                        has_more:,
-                      ))
-                    Error(err) -> {
-                      wisp.log_warning(
-                        "Failed to load older posts: " <> string.inspect(err),
-                      )
-                      dispatch(OlderPostsLoadFailed)
-                    }
+                  case
+                    rate_limit.check(
+                      model.rate_limiter,
+                      model.read_rate_key,
+                      ws_read_policy,
+                    )
+                  {
+                    rate_limit.Limited(retry_after_seconds:) ->
+                      dispatch(TimelineReadRateLimited(retry_after_seconds))
+                    rate_limit.Allowed(_) ->
+                      case load_older_page(model.db, cursor) {
+                        Ok(#(older, has_more)) ->
+                          dispatch(OlderPostsLoaded(
+                            cursor:,
+                            posts: older,
+                            has_more:,
+                          ))
+                        Error(err) -> {
+                          wisp.log_warning(
+                            "Failed to load older posts: "
+                            <> string.inspect(err),
+                          )
+                          dispatch(OlderPostsLoadFailed)
+                        }
+                      }
                   }
                 })
               #(
@@ -598,22 +651,38 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
       case model.user {
         None -> #(Model(..model, confirming_delete: None), effect.none())
         Some(auth_user) -> {
+          let write_key = rate_policy.http_write_user_key(auth_user.id)
           let delete_and_publish =
             effect.from(fn(dispatch) {
-              case post_repo.delete(model.db, post_id, auth_user.id) {
-                Ok(True) -> pubsub.publish(model.pubsub, Deleted(post_id))
-                Ok(False) -> Nil
-                Error(err) -> {
-                  wisp.log_warning(
-                    "Failed to delete post "
-                    <> post_id
-                    <> ": "
-                    <> string.inspect(err),
-                  )
+              case
+                rate_limit.check(
+                  model.rate_limiter,
+                  write_key,
+                  delete_write_policy,
+                )
+              {
+                rate_limit.Limited(retry_after_seconds:) ->
                   dispatch(PostDeleteFailed(
-                    "Failed to delete post. Please try again.",
+                    "Too many requests. Please wait "
+                    <> int.to_string(retry_after_seconds)
+                    <> "s and try again.",
                   ))
-                }
+                rate_limit.Allowed(_) ->
+                  case post_repo.delete(model.db, post_id, auth_user.id) {
+                    Ok(True) -> pubsub.publish(model.pubsub, Deleted(post_id))
+                    Ok(False) -> Nil
+                    Error(err) -> {
+                      wisp.log_warning(
+                        "Failed to delete post "
+                        <> post_id
+                        <> ": "
+                        <> string.inspect(err),
+                      )
+                      dispatch(PostDeleteFailed(
+                        "Failed to delete post. Please try again.",
+                      ))
+                    }
+                  }
               }
             })
           #(
@@ -676,6 +745,20 @@ pub fn update(model: Model, msg: Msg) -> #(Model, Effect(Msg)) {
 
     PostDeleteFailed(message) -> #(
       Model(..model, timeline_error: Some(message)),
+      effect.none(),
+    )
+
+    TimelineReadRateLimited(retry_after_seconds) -> #(
+      Model(
+        ..model,
+        loading_newer: False,
+        loading_more: False,
+        timeline_error: Some(
+          "Too many requests. Please wait "
+          <> int.to_string(retry_after_seconds)
+          <> "s and try again.",
+        ),
+      ),
       effect.none(),
     )
 
