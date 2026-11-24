@@ -14,7 +14,8 @@ import lote/web/client_ip
 import lote/web/csrf
 import wisp
 
-pub const ip_policy = rate_limit.Policy(limit: 20, window_ms: 900_000, burst: 20)
+pub const ip_policy =
+  rate_limit.Policy(limit: 100, window_ms: 900_000, burst: 50)
 
 pub const account_policy =
   rate_limit.Policy(limit: 5, window_ms: 900_000, burst: 5)

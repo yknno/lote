@@ -263,7 +263,7 @@ pub fn ws_connect_and_frame_rate_limits_enforce_burst_and_close_flooding_client_
   let secret = "ws_rl_secret_key_base_0123456789abcdefghijklmnopqrstuvwxyz"
   let assert Ok(rate_limiter) = rate_limit.start_memory(secret)
 
-  // 1. WS handshake limit allows burst of 10 per IP, then limits the 11th
+  // 1. WS handshake limit allows burst of 60 per IP, then limits the 61st
   let ip = "203.0.113.55"
   let _ =
     int.range(
