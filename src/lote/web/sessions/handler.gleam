@@ -5,6 +5,7 @@ import lote/auth.{type Auth}
 import lote/auth/session
 import lote/realtime/pubsub
 import lote/web/csrf
+import lote/web/http_rate_limit
 import lote/web/sessions/view
 import wisp
 
@@ -65,7 +66,11 @@ fn handle_revoke_one(
 
   case session.current_session(req, auth_ctx.db, auth_ctx.secret_key_base) {
     None -> wisp.response(401)
-    Some(active) ->
+    Some(active) -> {
+      use <- http_rate_limit.require_user_write(
+        auth_ctx.rate_limiter,
+        active.user.id,
+      )
       case session.revoke_by_public_id(auth_ctx.db, public_id, active.user.id) {
         Ok(Some(revoked_id)) -> {
           pubsub.publish(auth_ctx.session_revocations, revoked_id)
@@ -80,6 +85,7 @@ fn handle_revoke_one(
         Ok(None) -> wisp.not_found()
         Error(_) -> wisp.internal_server_error()
       }
+    }
   }
 }
 
@@ -93,7 +99,11 @@ fn handle_revoke_others(req: wisp.Request, auth_ctx: Auth) -> wisp.Response {
 
   case session.current_session(req, auth_ctx.db, auth_ctx.secret_key_base) {
     None -> wisp.response(401)
-    Some(active) ->
+    Some(active) -> {
+      use <- http_rate_limit.require_user_write(
+        auth_ctx.rate_limiter,
+        active.user.id,
+      )
       case session.revoke_others(auth_ctx.db, active.user.id, active.id) {
         Ok(revoked_ids) -> {
           list.each(revoked_ids, pubsub.publish(auth_ctx.session_revocations, _))
@@ -101,5 +111,6 @@ fn handle_revoke_others(req: wisp.Request, auth_ctx: Auth) -> wisp.Response {
         }
         Error(_) -> wisp.internal_server_error()
       }
+    }
   }
 }
