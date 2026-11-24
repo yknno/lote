@@ -87,6 +87,20 @@ pub fn normalize_audience(
   }
 }
 
+pub fn is_valid_token_format(prefix: String, raw: String) -> Bool {
+  let expected_bytes = bit_array.byte_size(<<prefix:utf8>>) + 43
+  case
+    bit_array.byte_size(<<raw:utf8>>) == expected_bytes
+    && string.starts_with(raw, prefix)
+  {
+    False -> False
+    True -> {
+      let rand_part = string.drop_start(raw, up_to: string.length(prefix))
+      is_base64url_43(rand_part)
+    }
+  }
+}
+
 pub fn compute_pkce_s256_challenge(code_verifier: String) -> String {
   crypto.hash(crypto.Sha256, <<code_verifier:utf8>>)
   |> bit_array.base64_url_encode(False)
@@ -108,6 +122,22 @@ pub fn issue_client_credentials(
     },
   )
 
+  issue_client_credentials_for_client(
+    oidc_ctx,
+    authed_client,
+    requested_scopes,
+    requested_resource,
+    user_agent,
+  )
+}
+
+pub fn issue_client_credentials_for_client(
+  oidc_ctx: Oidc,
+  authed_client: Client,
+  requested_scopes: Option(Set(Scope)),
+  requested_resource: Option(String),
+  user_agent: String,
+) -> Result(IssuedTokens, TokenError) {
   use owner_id <- result.try(
     case authed_client.kind, authed_client.owner_user_id {
       client.SubordinateBot, Some(uid) -> Ok(uid)
@@ -321,6 +351,10 @@ pub fn exchange_authorization_code(
   code_verifier: String,
   requested_resource: Option(String),
 ) -> Result(IssuedTokens, TokenError) {
+  use _ <- result.try(case is_valid_token_format("lote_ac_", raw_code) {
+    True -> Ok(Nil)
+    False -> Error(InvalidGrant)
+  })
   let code_hash = sha256(raw_code)
 
   let lookup_sql =
@@ -602,6 +636,12 @@ pub fn rotate_refresh_token(
   requested_scopes: Option(Set(Scope)),
   requested_resource: Option(String),
 ) -> Result(IssuedTokens, TokenError) {
+  use _ <- result.try(
+    case is_valid_token_format("lote_rt_", raw_refresh_token) {
+      True -> Ok(Nil)
+      False -> Error(InvalidGrant)
+    },
+  )
   let rt_hash = sha256(raw_refresh_token)
 
   let lookup_sql =
@@ -796,7 +836,7 @@ pub fn authenticate_access_token(
   raw_token: String,
   expected_audience: Option(String),
 ) -> Result(Principal, Nil) {
-  case string.starts_with(raw_token, "lote_at_") {
+  case is_valid_token_format("lote_at_", raw_token) {
     False -> Error(Nil)
     True -> {
       let token_hash = sha256(raw_token)
@@ -829,12 +869,20 @@ pub fn authenticate_access_token(
           SET last_used_at = NOW()
           FROM matched
           WHERE oidc_access_tokens.token_hash = matched.token_hash
+            AND (
+              oidc_access_tokens.last_used_at IS NULL
+              OR oidc_access_tokens.last_used_at < NOW() - INTERVAL '60 seconds'
+            )
         ),
         touch_grant AS (
           UPDATE oidc_grants
           SET last_used_at = NOW()
           FROM matched
           WHERE oidc_grants.id = matched.grant_id
+            AND (
+              oidc_grants.last_used_at IS NULL
+              OR oidc_grants.last_used_at < NOW() - INTERVAL '60 seconds'
+            )
         )
         SELECT
           user_id,
@@ -893,36 +941,43 @@ pub fn revoke_by_raw_token(
   client: Client,
   raw_token: String,
 ) -> Result(Nil, pog.QueryError) {
-  let token_hash = sha256(raw_token)
-
-  let rt_sql =
-    "DELETE FROM oidc_grants g
-    USING oidc_refresh_tokens rt, oidc_consents con
-    WHERE rt.grant_id = g.id
-      AND g.consent_id = con.id
-      AND rt.token_hash = $1
-      AND con.client_ref_id = $2
-    RETURNING g.public_id"
-
   let uuid_col_decoder = {
     use gid <- decode.field(0, uuid.decoder())
     decode.success(gid)
   }
 
-  use rt_returned <- result.try(
-    pog.query(rt_sql)
-    |> pog.parameter(pog.bytea(token_hash))
-    |> pog.parameter(pog.int(client.id))
-    |> pog.returning(uuid_col_decoder)
-    |> pog.execute(oidc_ctx.db),
-  )
+  case
+    is_valid_token_format("lote_rt_", raw_token),
+    is_valid_token_format("lote_at_", raw_token)
+  {
+    True, _ -> {
+      let token_hash = sha256(raw_token)
+      let rt_sql =
+        "DELETE FROM oidc_grants g
+        USING oidc_refresh_tokens rt, oidc_consents con
+        WHERE rt.grant_id = g.id
+          AND g.consent_id = con.id
+          AND rt.token_hash = $1
+          AND con.client_ref_id = $2
+        RETURNING g.public_id"
 
-  case rt_returned.rows {
-    [grant_public_id, ..] -> {
-      oidc.publish_revocation(oidc_ctx, grant_public_id)
-      Ok(Nil)
+      use rt_returned <- result.map(
+        pog.query(rt_sql)
+        |> pog.parameter(pog.bytea(token_hash))
+        |> pog.parameter(pog.int(client.id))
+        |> pog.returning(uuid_col_decoder)
+        |> pog.execute(oidc_ctx.db),
+      )
+
+      case rt_returned.rows {
+        [grant_public_id, ..] ->
+          oidc.publish_revocation(oidc_ctx, grant_public_id)
+        [] -> Nil
+      }
     }
-    [] -> {
+
+    False, True -> {
+      let token_hash = sha256(raw_token)
       let at_sql =
         "WITH deleted_at AS (
           DELETE FROM oidc_access_tokens at
@@ -958,6 +1013,8 @@ pub fn revoke_by_raw_token(
         [] -> Nil
       }
     }
+
+    False, False -> Ok(Nil)
   }
 }
 
@@ -966,8 +1023,6 @@ pub fn introspect_raw_token(
   client: Client,
   raw_token: String,
 ) -> Result(Introspection, pog.QueryError) {
-  let token_hash = sha256(raw_token)
-
   let decoder = {
     use uid <- decode.field(0, decode.int)
     use uname <- decode.field(1, decode.string)
@@ -998,44 +1053,55 @@ pub fn introspect_raw_token(
     ))
   }
 
-  let at_sql =
-    "SELECT
-      u.id,
-      u.name,
-      u.public_id,
-      c.client_id,
-      g.public_id,
-      at.scopes,
-      at.audience,
-      at.expires_at,
-      at.created_at,
-      at.token_hash
-    FROM oidc_access_tokens at
-    INNER JOIN oidc_grants g ON g.id = at.grant_id
-    INNER JOIN oidc_consents con ON con.id = g.consent_id
-    INNER JOIN oidc_clients c ON c.id = con.client_ref_id
-    INNER JOIN users u ON u.id = con.user_id
-    WHERE at.token_hash = $1
-      AND con.client_ref_id = $2
-      AND at.expires_at > NOW()
-      AND g.expires_at > NOW()
-    LIMIT 1"
+  case
+    is_valid_token_format("lote_at_", raw_token),
+    is_valid_token_format("lote_rt_", raw_token)
+  {
+    True, _ -> {
+      let token_hash = sha256(raw_token)
+      let at_sql =
+        "SELECT
+          u.id,
+          u.name,
+          u.public_id,
+          c.client_id,
+          g.public_id,
+          at.scopes,
+          at.audience,
+          at.expires_at,
+          at.created_at,
+          at.token_hash
+        FROM oidc_access_tokens at
+        INNER JOIN oidc_grants g ON g.id = at.grant_id
+        INNER JOIN oidc_consents con ON con.id = g.consent_id
+        INNER JOIN oidc_clients c ON c.id = con.client_ref_id
+        INNER JOIN users u ON u.id = con.user_id
+        WHERE at.token_hash = $1
+          AND con.client_ref_id = $2
+          AND at.expires_at > NOW()
+          AND g.expires_at > NOW()
+        LIMIT 1"
 
-  use at_returned <- result.try(
-    pog.query(at_sql)
-    |> pog.parameter(pog.bytea(token_hash))
-    |> pog.parameter(pog.int(client.id))
-    |> pog.returning(decoder)
-    |> pog.execute(db),
-  )
+      use at_returned <- result.map(
+        pog.query(at_sql)
+        |> pog.parameter(pog.bytea(token_hash))
+        |> pog.parameter(pog.int(client.id))
+        |> pog.returning(decoder)
+        |> pog.execute(db),
+      )
 
-  case at_returned.rows {
-    [#(active, stored_hash), ..] ->
-      case crypto.secure_compare(token_hash, stored_hash) {
-        True -> Ok(active)
-        False -> Ok(Inactive)
+      case at_returned.rows {
+        [#(active, stored_hash), ..] ->
+          case crypto.secure_compare(token_hash, stored_hash) {
+            True -> active
+            False -> Inactive
+          }
+        [] -> Inactive
       }
-    [] -> {
+    }
+
+    False, True -> {
+      let token_hash = sha256(raw_token)
       let rt_sql =
         "SELECT
           u.id,
@@ -1077,6 +1143,8 @@ pub fn introspect_raw_token(
         [] -> Inactive
       }
     }
+
+    False, False -> Ok(Inactive)
   }
 }
 
@@ -1180,6 +1248,21 @@ fn is_valid_code_challenge(s: String) -> Bool {
   let len = string.length(s)
   len >= 43
   && len <= 128
+  && s
+  |> string.to_utf_codepoints
+  |> list.all(fn(cp) {
+    case string.utf_codepoint_to_int(cp) {
+      n if n >= 0x41 && n <= 0x5A -> True
+      n if n >= 0x61 && n <= 0x7A -> True
+      n if n >= 0x30 && n <= 0x39 -> True
+      0x2D | 0x5F -> True
+      _ -> False
+    }
+  })
+}
+
+fn is_base64url_43(s: String) -> Bool {
+  string.length(s) == 43
   && s
   |> string.to_utf_codepoints
   |> list.all(fn(cp) {

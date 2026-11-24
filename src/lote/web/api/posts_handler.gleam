@@ -29,24 +29,29 @@ pub fn handle_request(
   segments: List(String),
   oidc_ctx: Oidc,
   post_pubsub: PubSub(timeline.PostEvent),
+  client_ip: String,
 ) -> wisp.Response {
   case req.method, segments {
-    http.Get, [] -> handle_list(req, oidc_ctx)
-    http.Post, [] -> handle_create(req, oidc_ctx, post_pubsub)
+    http.Get, [] -> handle_list(req, oidc_ctx, client_ip)
+    http.Post, [] -> handle_create(req, oidc_ctx, post_pubsub, client_ip)
     _, [] -> json_method_not_allowed([http.Get, http.Head, http.Post])
 
-    http.Get, [id] -> handle_show(req, id, oidc_ctx)
-    http.Delete, [id] -> handle_delete(req, id, oidc_ctx, post_pubsub)
+    http.Get, [id] -> handle_show(req, id, oidc_ctx, client_ip)
+    http.Delete, [id] ->
+      handle_delete(req, id, oidc_ctx, post_pubsub, client_ip)
     _, [_] -> json_method_not_allowed([http.Get, http.Head, http.Delete])
 
     _, _ -> json_error(404, "not_found")
   }
 }
 
-fn handle_list(req: wisp.Request, oidc_ctx: Oidc) -> wisp.Response {
-  use principal <- bearer.authenticate(req, oidc_ctx)
+fn handle_list(
+  req: wisp.Request,
+  oidc_ctx: Oidc,
+  client_ip: String,
+) -> wisp.Response {
+  use principal <- bearer.authenticate(req, oidc_ctx, client_ip)
   use <- bearer.require_scope(principal, scope.PostsRead)
-  use <- bearer.require_read_rate_limit(oidc_ctx.rate_limiter, principal)
 
   case parse_list_query(wisp.get_query(req)) {
     Error(_) -> json_error(400, "invalid_request")
@@ -71,10 +76,14 @@ fn handle_list(req: wisp.Request, oidc_ctx: Oidc) -> wisp.Response {
   }
 }
 
-fn handle_show(req: wisp.Request, id: String, oidc_ctx: Oidc) -> wisp.Response {
-  use principal <- bearer.authenticate(req, oidc_ctx)
+fn handle_show(
+  req: wisp.Request,
+  id: String,
+  oidc_ctx: Oidc,
+  client_ip: String,
+) -> wisp.Response {
+  use principal <- bearer.authenticate(req, oidc_ctx, client_ip)
   use <- bearer.require_scope(principal, scope.PostsRead)
-  use <- bearer.require_read_rate_limit(oidc_ctx.rate_limiter, principal)
 
   case post_repo.find_by_id(oidc_ctx.db, id) {
     Ok(Some(row)) ->
@@ -90,10 +99,11 @@ fn handle_create(
   req: wisp.Request,
   oidc_ctx: Oidc,
   post_pubsub: PubSub(timeline.PostEvent),
+  client_ip: String,
 ) -> wisp.Response {
-  use principal <- bearer.authenticate(req, oidc_ctx)
+  use principal <- bearer.authenticate(req, oidc_ctx, client_ip)
   use <- bearer.require_scope(principal, scope.PostsWrite)
-  use <- bearer.require_write_rate_limit(oidc_ctx.rate_limiter, principal)
+  use <- bearer.require_post_create_rate_limit(oidc_ctx.rate_limiter, principal)
 
   let body_decoder = {
     use raw_body <- decode.field("body", decode.string)
@@ -141,8 +151,9 @@ fn handle_delete(
   id: String,
   oidc_ctx: Oidc,
   post_pubsub: PubSub(timeline.PostEvent),
+  client_ip: String,
 ) -> wisp.Response {
-  use principal <- bearer.authenticate(req, oidc_ctx)
+  use principal <- bearer.authenticate(req, oidc_ctx, client_ip)
   use <- bearer.require_scope(principal, scope.PostsDelete)
   use <- bearer.require_write_rate_limit(oidc_ctx.rate_limiter, principal)
 

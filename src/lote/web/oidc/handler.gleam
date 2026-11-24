@@ -16,16 +16,20 @@ import lote/oidc/scope.{type Scope}
 import lote/oidc/token
 import lote/rate_limit
 import lote/web/client_ip
-import pog
 import wisp
 
 pub const ip_endpoint_policy =
-  rate_limit.Policy(limit: 60, window_ms: 60_000, burst: 30)
+  rate_limit.Policy(limit: 100, window_ms: 900_000, burst: 50)
 
-pub const client_endpoint_policy =
-  rate_limit.Policy(limit: 60, window_ms: 60_000, burst: 20)
+pub const auth_fail_ip_policy =
+  rate_limit.Policy(limit: 20, window_ms: 900_000, burst: 20)
+
+pub const client_auth_fail_policy =
+  rate_limit.Policy(limit: 10, window_ms: 900_000, burst: 10)
 
 const basic_www_authenticate = "Basic realm=\"lote\", charset=\"UTF-8\""
+
+const max_oauth_form_bytes = 16_384
 
 type ExtractedCredentials {
   ExtractedCredentials(
@@ -38,6 +42,11 @@ type ExtractedCredentials {
 type CredentialExtractError {
   MalformedBasicHeader
   InvalidCredentialRequest
+}
+
+type ClientAuthOutcome {
+  ClientAuthenticated(Client)
+  ClientAuthRejected(wisp.Response)
 }
 
 pub fn handle_request(
@@ -67,22 +76,56 @@ fn handle_token(
   oidc_ctx: Oidc,
   client_ip: String,
 ) -> wisp.Response {
-  use <- require_ip_rate_limit(oidc_ctx.rate_limiter, client_ip)
   use form_values <- require_oauth_form(req)
   use creds <- require_extracted_credentials(req, form_values)
-  use <- require_client_rate_limit(oidc_ctx.rate_limiter, creds.client_id)
 
   case list.key_find(form_values, "grant_type") {
     Error(_) | Ok("") -> oauth_error(400, "invalid_request", None)
 
-    Ok("client_credentials") ->
-      handle_client_credentials_grant(req, oidc_ctx, creds, form_values)
+    Ok("client_credentials") -> {
+      use client_id <- require_valid_client_id(creds)
+      let ip_bucket = client_ip.rate_limit_bucket(client_ip)
+      use <- require_auth_fail_ip_not_limited(oidc_ctx.rate_limiter, ip_bucket)
+      use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
+      use authed_client <- with_authenticated_client(
+        oidc_ctx,
+        client_id,
+        creds,
+        ip_bucket,
+        True,
+      )
+      handle_client_credentials_grant(req, oidc_ctx, authed_client, form_values)
+    }
 
-    Ok("authorization_code") ->
-      handle_authorization_code_grant(oidc_ctx, creds, form_values)
+    Ok("authorization_code") -> {
+      use client_id <- require_valid_client_id(creds)
+      let ip_bucket = client_ip.rate_limit_bucket(client_ip)
+      use <- require_auth_fail_ip_not_limited(oidc_ctx.rate_limiter, ip_bucket)
+      use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
+      use authed_client <- with_authenticated_client(
+        oidc_ctx,
+        client_id,
+        creds,
+        ip_bucket,
+        False,
+      )
+      handle_authorization_code_grant(oidc_ctx, authed_client, form_values)
+    }
 
-    Ok("refresh_token") ->
-      handle_refresh_token_grant(oidc_ctx, creds, form_values)
+    Ok("refresh_token") -> {
+      use client_id <- require_valid_client_id(creds)
+      let ip_bucket = client_ip.rate_limit_bucket(client_ip)
+      use <- require_auth_fail_ip_not_limited(oidc_ctx.rate_limiter, ip_bucket)
+      use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
+      use authed_client <- with_authenticated_client(
+        oidc_ctx,
+        client_id,
+        creds,
+        ip_bucket,
+        False,
+      )
+      handle_refresh_token_grant(oidc_ctx, authed_client, form_values)
+    }
 
     Ok(_) -> oauth_error(400, "unsupported_grant_type", None)
   }
@@ -91,50 +134,35 @@ fn handle_token(
 fn handle_client_credentials_grant(
   req: wisp.Request,
   oidc_ctx: Oidc,
-  creds: ExtractedCredentials,
+  authed_client: Client,
   form_values: List(#(String, String)),
 ) -> wisp.Response {
-  case creds.client_id, creds.client_secret {
-    Some(client_id), Some(client_secret)
-      if client_id != "" && client_secret != ""
-    -> {
-      let result = {
-        use requested_scopes <- result.try(parse_optional_scopes(form_values))
-        let requested_resource =
-          optional_non_empty_param(form_values, "resource")
-        let user_agent =
-          request.get_header(req, "user-agent") |> result.unwrap("")
+  let result = {
+    use requested_scopes <- result.try(parse_optional_scopes(form_values))
+    let requested_resource = optional_non_empty_param(form_values, "resource")
+    let user_agent = request.get_header(req, "user-agent") |> result.unwrap("")
 
-        token.issue_client_credentials(
-          oidc_ctx,
-          client_id,
-          client_secret,
-          requested_scopes,
-          requested_resource,
-          user_agent,
-        )
-      }
+    token.issue_client_credentials_for_client(
+      oidc_ctx,
+      authed_client,
+      requested_scopes,
+      requested_resource,
+      user_agent,
+    )
+  }
 
-      case result {
-        Ok(issued) -> token_success_response(issued)
-        Error(err) -> token_error_response(err)
-      }
-    }
-
-    _, _ -> invalid_client_response()
+  case result {
+    Ok(issued) -> token_success_response(issued)
+    Error(err) -> token_error_response(err)
   }
 }
 
 fn handle_authorization_code_grant(
   oidc_ctx: Oidc,
-  creds: ExtractedCredentials,
+  authed_client: Client,
   form_values: List(#(String, String)),
 ) -> wisp.Response {
   let result = {
-    use authed_client <- result.try(authenticate_client_for_grant(
-      oidc_ctx.db,
-      creds,
-    ))
     use _ <- result.try(case authed_client.kind {
       client.SubordinateBot -> Error(token.UnauthorizedClient)
       _ -> Ok(Nil)
@@ -168,14 +196,10 @@ fn handle_authorization_code_grant(
 
 fn handle_refresh_token_grant(
   oidc_ctx: Oidc,
-  creds: ExtractedCredentials,
+  authed_client: Client,
   form_values: List(#(String, String)),
 ) -> wisp.Response {
   let result = {
-    use authed_client <- result.try(authenticate_client_for_grant(
-      oidc_ctx.db,
-      creds,
-    ))
     use _ <- result.try(case authed_client.kind {
       client.SubordinateBot -> Error(token.UnauthorizedClient)
       _ -> Ok(Nil)
@@ -207,21 +231,26 @@ fn handle_revoke(
   oidc_ctx: Oidc,
   client_ip: String,
 ) -> wisp.Response {
-  use <- require_ip_rate_limit(oidc_ctx.rate_limiter, client_ip)
   use form_values <- require_oauth_form(req)
   use creds <- require_extracted_credentials(req, form_values)
-  use <- require_client_rate_limit(oidc_ctx.rate_limiter, creds.client_id)
+  use client_id <- require_valid_client_id(creds)
 
-  case authenticate_client_for_grant(oidc_ctx.db, creds) {
+  let ip_bucket = client_ip.rate_limit_bucket(client_ip)
+  use <- require_auth_fail_ip_not_limited(oidc_ctx.rate_limiter, ip_bucket)
+  use authed_client <- with_authenticated_client(
+    oidc_ctx,
+    client_id,
+    creds,
+    ip_bucket,
+    False,
+  )
+
+  case require_non_empty_param(form_values, "token") {
     Error(err) -> token_error_response(err)
-    Ok(authed_client) ->
-      case require_non_empty_param(form_values, "token") {
-        Error(err) -> token_error_response(err)
-        Ok(raw_token) ->
-          case token.revoke_by_raw_token(oidc_ctx, authed_client, raw_token) {
-            Ok(Nil) -> wisp.json_response("{}", 200)
-            Error(_) -> oauth_error(500, "server_error", None)
-          }
+    Ok(raw_token) ->
+      case token.revoke_by_raw_token(oidc_ctx, authed_client, raw_token) {
+        Ok(Nil) -> wisp.json_response("{}", 200)
+        Error(_) -> oauth_error(500, "server_error", None)
       }
   }
 }
@@ -231,107 +260,84 @@ fn handle_introspect(
   oidc_ctx: Oidc,
   client_ip: String,
 ) -> wisp.Response {
-  use <- require_ip_rate_limit(oidc_ctx.rate_limiter, client_ip)
   use form_values <- require_oauth_form(req)
   use creds <- require_extracted_credentials(req, form_values)
-  use <- require_client_rate_limit(oidc_ctx.rate_limiter, creds.client_id)
+  use client_id <- require_valid_client_id(creds)
 
-  case authenticate_confidential_client(oidc_ctx.db, creds) {
+  let ip_bucket = client_ip.rate_limit_bucket(client_ip)
+  use <- require_auth_fail_ip_not_limited(oidc_ctx.rate_limiter, ip_bucket)
+  use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
+  use authed_client <- with_authenticated_client(
+    oidc_ctx,
+    client_id,
+    creds,
+    ip_bucket,
+    True,
+  )
+
+  case require_non_empty_param(form_values, "token") {
     Error(err) -> token_error_response(err)
-    Ok(authed_client) ->
-      case require_non_empty_param(form_values, "token") {
-        Error(err) -> token_error_response(err)
-        Ok(raw_token) ->
-          case
-            token.introspect_raw_token(oidc_ctx.db, authed_client, raw_token)
-          {
-            Error(_) -> oauth_error(500, "server_error", None)
-            Ok(token.Inactive) ->
-              json.object([#("active", json.bool(False))])
-              |> json.to_string
-              |> wisp.json_response(200)
-            Ok(token.Active(principal:, exp:, iat:)) ->
-              json.object([
-                #("active", json.bool(True)),
-                #(
-                  "scope",
-                  json.string(scope.format_space_delimited(principal.scopes)),
-                ),
-                #("client_id", json.string(principal.client_id)),
-                #("sub", json.string(principal.sub)),
-                #("aud", json.string(principal.audience)),
-                #("iss", json.string(oidc_ctx.issuer)),
-                #("exp", json.int(exp)),
-                #("iat", json.int(iat)),
-                #("token_type", json.string("Bearer")),
-              ])
-              |> json.to_string
-              |> wisp.json_response(200)
-          }
+    Ok(raw_token) ->
+      case token.introspect_raw_token(oidc_ctx.db, authed_client, raw_token) {
+        Error(_) -> oauth_error(500, "server_error", None)
+        Ok(token.Inactive) ->
+          json.object([#("active", json.bool(False))])
+          |> json.to_string
+          |> wisp.json_response(200)
+        Ok(token.Active(principal:, exp:, iat:)) ->
+          json.object([
+            #("active", json.bool(True)),
+            #(
+              "scope",
+              json.string(scope.format_space_delimited(principal.scopes)),
+            ),
+            #("client_id", json.string(principal.client_id)),
+            #("sub", json.string(principal.sub)),
+            #("aud", json.string(principal.audience)),
+            #("iss", json.string(oidc_ctx.issuer)),
+            #("exp", json.int(exp)),
+            #("iat", json.int(iat)),
+            #("token_type", json.string("Bearer")),
+          ])
+          |> json.to_string
+          |> wisp.json_response(200)
       }
   }
 }
 
-fn authenticate_confidential_client(
-  db: pog.Connection,
+fn require_valid_client_id(
   creds: ExtractedCredentials,
-) -> Result(Client, token.TokenError) {
-  case creds.client_id, creds.client_secret {
-    Some(client_id), Some(client_secret)
-      if client_id != "" && client_secret != ""
-    ->
-      case client.authenticate_secret(db, client_id, client_secret) {
-        Ok(authed) -> Ok(authed)
-        Error(client.InvalidClientCredentials) -> Error(token.InvalidClient)
-        Error(_) -> Error(token.InternalError)
-      }
-    _, _ -> Error(token.InvalidClient)
-  }
-}
-
-fn authenticate_client_for_grant(
-  db: pog.Connection,
-  creds: ExtractedCredentials,
-) -> Result(Client, token.TokenError) {
+  next: fn(String) -> wisp.Response,
+) -> wisp.Response {
   case creds.client_id {
-    None | Some("") -> Error(token.InvalidClient)
-    Some(client_id) ->
-      case creds.client_secret, creds.used_basic {
-        Some(client_secret), _ ->
-          case client_secret != "" {
-            True ->
-              case client.authenticate_secret(db, client_id, client_secret) {
-                Ok(authed) -> Ok(authed)
-                Error(client.InvalidClientCredentials) ->
-                  Error(token.InvalidClient)
-                Error(_) -> Error(token.InternalError)
-              }
-            False -> Error(token.InvalidClient)
-          }
-
-        None, True -> Error(token.InvalidClient)
-
-        None, False ->
-          case client.find_by_client_id(db, client_id) {
-            Ok(Some(found)) ->
-              case found.kind {
-                client.PublicApp | client.Cimd -> Ok(found)
-                client.SubordinateBot | client.ConfidentialApp ->
-                  Error(token.InvalidClient)
-              }
-            Ok(None) -> Error(token.InvalidClient)
-            Error(_) -> Error(token.InternalError)
-          }
+    Some(cid) ->
+      case client.is_valid_client_id_format(cid) {
+        True -> next(cid)
+        False -> invalid_client_response()
       }
+    None -> invalid_client_response()
   }
 }
 
-fn require_ip_rate_limit(
+fn require_auth_fail_ip_not_limited(
   limiter: rate_limit.Limiter,
-  client_ip: String,
+  ip_bucket: String,
   next: fn() -> wisp.Response,
 ) -> wisp.Response {
-  let key = "oidc:endpoint:ip:" <> client_ip.rate_limit_bucket(client_ip)
+  let key = auth_fail_ip_key(ip_bucket)
+  case rate_limit.peek(limiter, key, auth_fail_ip_policy) {
+    rate_limit.Allowed(_) -> next()
+    rate_limit.Limited(retry_after_seconds:) ->
+      rate_limited_response(retry_after_seconds)
+  }
+}
+
+fn require_ip_endpoint_limit(
+  limiter: rate_limit.Limiter,
+  ip_bucket: String,
+  next: fn() -> wisp.Response,
+) -> wisp.Response {
+  let key = "oidc:ip:" <> ip_bucket
   case rate_limit.check(limiter, key, ip_endpoint_policy) {
     rate_limit.Allowed(_) -> next()
     rate_limit.Limited(retry_after_seconds:) ->
@@ -339,38 +345,163 @@ fn require_ip_rate_limit(
   }
 }
 
-fn require_client_rate_limit(
-  limiter: rate_limit.Limiter,
-  client_id: Option(String),
-  next: fn() -> wisp.Response,
+fn with_authenticated_client(
+  oidc_ctx: Oidc,
+  client_id: String,
+  creds: ExtractedCredentials,
+  ip_bucket: String,
+  require_confidential: Bool,
+  next: fn(Client) -> wisp.Response,
 ) -> wisp.Response {
-  case client_id {
-    None | Some("") -> next()
-    Some(cid) ->
-      case bit_array.byte_size(<<cid:utf8>>) > 512 {
-        True -> invalid_client_response()
-        False ->
+  case
+    authenticate_client_with_limits(
+      oidc_ctx,
+      client_id,
+      creds,
+      ip_bucket,
+      require_confidential,
+    )
+  {
+    ClientAuthenticated(authed) -> next(authed)
+    ClientAuthRejected(resp) -> resp
+  }
+}
+
+fn authenticate_client_with_limits(
+  oidc_ctx: Oidc,
+  client_id: String,
+  creds: ExtractedCredentials,
+  ip_bucket: String,
+  require_confidential: Bool,
+) -> ClientAuthOutcome {
+  case client.find_by_client_id(oidc_ctx.db, client_id) {
+    Error(_) -> ClientAuthRejected(oauth_error(500, "server_error", None))
+
+    Ok(None) ->
+      ClientAuthRejected(record_ip_auth_failure(
+        oidc_ctx.rate_limiter,
+        ip_bucket,
+      ))
+
+    Ok(Some(found)) ->
+      case found.kind {
+        client.SubordinateBot | client.ConfidentialApp -> {
+          let ip_client_key = client_auth_fail_key(ip_bucket, found.client_id)
           case
-            rate_limit.check(
-              limiter,
-              "oidc:endpoint:client:" <> cid,
-              client_endpoint_policy,
+            rate_limit.peek(
+              oidc_ctx.rate_limiter,
+              ip_client_key,
+              client_auth_fail_policy,
             )
           {
-            rate_limit.Allowed(_) -> next()
             rate_limit.Limited(retry_after_seconds:) ->
-              rate_limited_response(retry_after_seconds)
+              ClientAuthRejected(rate_limited_response(retry_after_seconds))
+
+            rate_limit.Allowed(_) ->
+              case creds.client_secret {
+                None ->
+                  ClientAuthRejected(record_client_secret_failure(
+                    oidc_ctx.rate_limiter,
+                    ip_bucket,
+                    ip_client_key,
+                  ))
+
+                Some(raw_secret) ->
+                  case client.is_valid_secret_format(raw_secret) {
+                    False ->
+                      ClientAuthRejected(record_client_secret_failure(
+                        oidc_ctx.rate_limiter,
+                        ip_bucket,
+                        ip_client_key,
+                      ))
+
+                    True ->
+                      case
+                        client.authenticate_secret_for_client(
+                          oidc_ctx.db,
+                          found,
+                          raw_secret,
+                        )
+                      {
+                        Ok(authed) -> {
+                          rate_limit.reset(oidc_ctx.rate_limiter, ip_client_key)
+                          ClientAuthenticated(authed)
+                        }
+                        Error(client.InvalidClientCredentials) ->
+                          ClientAuthRejected(record_client_secret_failure(
+                            oidc_ctx.rate_limiter,
+                            ip_bucket,
+                            ip_client_key,
+                          ))
+                        Error(_) ->
+                          ClientAuthRejected(oauth_error(
+                            500,
+                            "server_error",
+                            None,
+                          ))
+                      }
+                  }
+              }
+          }
+        }
+
+        client.PublicApp | client.Cimd ->
+          case require_confidential, creds.client_secret, creds.used_basic {
+            True, _, _ | _, Some(_), _ | _, _, True ->
+              ClientAuthRejected(record_ip_auth_failure(
+                oidc_ctx.rate_limiter,
+                ip_bucket,
+              ))
+            False, None, False -> ClientAuthenticated(found)
           }
       }
   }
+}
+
+fn record_ip_auth_failure(
+  limiter: rate_limit.Limiter,
+  ip_bucket: String,
+) -> wisp.Response {
+  case
+    rate_limit.check(limiter, auth_fail_ip_key(ip_bucket), auth_fail_ip_policy)
+  {
+    rate_limit.Limited(retry_after_seconds:) ->
+      rate_limited_response(retry_after_seconds)
+    rate_limit.Allowed(_) -> invalid_client_response()
+  }
+}
+
+fn record_client_secret_failure(
+  limiter: rate_limit.Limiter,
+  ip_bucket: String,
+  ip_client_key: String,
+) -> wisp.Response {
+  let ip_decision =
+    rate_limit.check(limiter, auth_fail_ip_key(ip_bucket), auth_fail_ip_policy)
+  let client_decision =
+    rate_limit.check(limiter, ip_client_key, client_auth_fail_policy)
+
+  case client_decision, ip_decision {
+    rate_limit.Limited(retry_after_seconds:), _ ->
+      rate_limited_response(retry_after_seconds)
+    _, rate_limit.Limited(retry_after_seconds:) ->
+      rate_limited_response(retry_after_seconds)
+    rate_limit.Allowed(_), rate_limit.Allowed(_) -> invalid_client_response()
+  }
+}
+
+fn auth_fail_ip_key(ip_bucket: String) -> String {
+  "oidc:auth_fail:ip:" <> ip_bucket
+}
+
+fn client_auth_fail_key(ip_bucket: String, client_id: String) -> String {
+  "oidc:auth_fail:ip_client:" <> ip_bucket <> ":" <> client_id
 }
 
 fn rate_limited_response(retry_after_seconds: Int) -> wisp.Response {
   oauth_error(429, "temporarily_unavailable", Some("Too many requests"))
   |> response.set_header("retry-after", int.to_string(retry_after_seconds))
 }
-
-const max_oauth_form_bytes = 16_384
 
 fn require_oauth_form(
   req: wisp.Request,

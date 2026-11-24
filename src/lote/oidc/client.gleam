@@ -560,36 +560,63 @@ pub fn list_for_owner(
   }
 }
 
+pub fn is_valid_client_id_format(raw: String) -> Bool {
+  case bit_array.byte_size(<<raw:utf8>>) == 36 {
+    False -> False
+    True ->
+      case raw {
+        "cli_" <> hex_part -> is_lowercase_hex(hex_part)
+        _ -> False
+      }
+  }
+}
+
+pub fn is_valid_secret_format(raw: String) -> Bool {
+  case bit_array.byte_size(<<raw:utf8>>) == 51 {
+    False -> False
+    True ->
+      case raw {
+        "lote_cs_" <> b64_part -> is_base64url_unpadded(b64_part)
+        _ -> False
+      }
+  }
+}
+
 pub fn find_by_client_id(
   db: pog.Connection,
   client_id: String,
 ) -> Result(Option(Client), pog.QueryError) {
-  let sql =
-    "SELECT
-      id,
-      client_id,
-      owner_user_id,
-      kind,
-      visibility,
-      application_type,
-      name,
-      redirect_uris,
-      allowed_scopes,
-      created_at
-    FROM oidc_clients
-    WHERE client_id = $1
-    LIMIT 1"
+  case is_valid_client_id_format(client_id) {
+    False -> Ok(None)
+    True -> {
+      let sql =
+        "SELECT
+          id,
+          client_id,
+          owner_user_id,
+          kind,
+          visibility,
+          application_type,
+          name,
+          redirect_uris,
+          allowed_scopes,
+          created_at
+        FROM oidc_clients
+        WHERE client_id = $1
+        LIMIT 1"
 
-  use returned <- result.map(
-    pog.query(sql)
-    |> pog.parameter(pog.text(client_id))
-    |> pog.returning(client_decoder_at(0))
-    |> pog.execute(db),
-  )
+      use returned <- result.map(
+        pog.query(sql)
+        |> pog.parameter(pog.text(client_id))
+        |> pog.returning(client_decoder_at(0))
+        |> pog.execute(db),
+      )
 
-  case returned.rows {
-    [client, ..] -> Some(client)
-    [] -> None
+      case returned.rows {
+        [client, ..] -> Some(client)
+        [] -> None
+      }
+    }
   }
 }
 
@@ -600,84 +627,90 @@ pub fn create_secret(
   label: String,
   ttl_seconds: Option(Int),
 ) -> Result(CreatedSecret, Error) {
-  use trimmed_label <- result.try(validate_secret_label(label))
-  use _ <- result.try(validate_ttl(ttl_seconds))
+  case is_valid_client_id_format(client_id) {
+    False -> Error(NotFound)
+    True -> {
+      use trimmed_label <- result.try(validate_secret_label(label))
+      use _ <- result.try(validate_ttl(ttl_seconds))
 
-  let lookup_sql =
-    "SELECT id, kind
-    FROM oidc_clients
-    WHERE client_id = $1 AND owner_user_id = $2
-    FOR UPDATE"
+      let lookup_sql =
+        "SELECT id, kind
+        FROM oidc_clients
+        WHERE client_id = $1 AND owner_user_id = $2
+        FOR UPDATE"
 
-  let lookup_decoder = {
-    use id <- decode.field(0, decode.int)
-    use kind <- decode.field(1, kind_decoder())
-    decode.success(#(id, kind))
-  }
+      let lookup_decoder = {
+        use id <- decode.field(0, decode.int)
+        use kind <- decode.field(1, kind_decoder())
+        decode.success(#(id, kind))
+      }
 
-  let lookup_result =
-    pog.query(lookup_sql)
-    |> pog.parameter(pog.text(client_id))
-    |> pog.parameter(pog.int(owner_user_id))
-    |> pog.returning(lookup_decoder)
-    |> pog.execute(db)
-
-  case lookup_result {
-    Error(_) -> Error(InternalError)
-    Ok(pog.Returned(rows: [], ..)) -> Error(NotFound)
-    Ok(pog.Returned(rows: [#(_, PublicApp), ..], ..))
-    | Ok(pog.Returned(rows: [#(_, Cimd), ..], ..)) ->
-      Error(InvalidInput("This client kind does not support client secrets"))
-    Ok(pog.Returned(rows: [#(client_ref_id, _), ..], ..)) -> {
-      let #(raw_secret, secret_prefix, secret_hash) = generate_client_secret()
-
-      let insert_sql =
-        "INSERT INTO oidc_client_secrets (
-          client_ref_id,
-          label,
-          secret_prefix,
-          secret_hash,
-          expires_at
-        )
-        SELECT
-          $1,
-          $2,
-          $3,
-          $4,
-          CASE
-            WHEN $5::bigint IS NULL THEN NULL
-            ELSE NOW() + ($5::bigint * INTERVAL '1 second')
-          END
-        WHERE (
-          SELECT COUNT(*)
-          FROM oidc_client_secrets
-          WHERE client_ref_id = $1
-            AND (expires_at IS NULL OR expires_at > NOW())
-        ) < $6
-        RETURNING
-          public_id,
-          label,
-          secret_prefix,
-          expires_at,
-          last_used_at,
-          created_at"
-
-      let insert_result =
-        pog.query(insert_sql)
-        |> pog.parameter(pog.int(client_ref_id))
-        |> pog.parameter(pog.text(trimmed_label))
-        |> pog.parameter(pog.text(secret_prefix))
-        |> pog.parameter(pog.bytea(secret_hash))
-        |> pog.parameter(pog.nullable(pog.int, ttl_seconds))
-        |> pog.parameter(pog.int(max_active_secrets_per_client))
-        |> pog.returning(secret_info_decoder_at(0))
+      let lookup_result =
+        pog.query(lookup_sql)
+        |> pog.parameter(pog.text(client_id))
+        |> pog.parameter(pog.int(owner_user_id))
+        |> pog.returning(lookup_decoder)
         |> pog.execute(db)
 
-      case insert_result {
-        Ok(pog.Returned(rows: [info, ..], ..)) ->
-          Ok(CreatedSecret(secret: raw_secret, info:))
-        Ok(pog.Returned(rows: [], ..)) -> Error(SecretLimitExceeded)
+      case lookup_result {
         Error(_) -> Error(InternalError)
+        Ok(pog.Returned(rows: [], ..)) -> Error(NotFound)
+        Ok(pog.Returned(rows: [#(_, PublicApp), ..], ..))
+        | Ok(pog.Returned(rows: [#(_, Cimd), ..], ..)) ->
+          Error(InvalidInput("This client kind does not support client secrets"))
+        Ok(pog.Returned(rows: [#(client_ref_id, _), ..], ..)) -> {
+          let #(raw_secret, secret_prefix, secret_hash) =
+            generate_client_secret()
+
+          let insert_sql =
+            "INSERT INTO oidc_client_secrets (
+              client_ref_id,
+              label,
+              secret_prefix,
+              secret_hash,
+              expires_at
+            )
+            SELECT
+              $1,
+              $2,
+              $3,
+              $4,
+              CASE
+                WHEN $5::bigint IS NULL THEN NULL
+                ELSE NOW() + ($5::bigint * INTERVAL '1 second')
+              END
+            WHERE (
+              SELECT COUNT(*)
+              FROM oidc_client_secrets
+              WHERE client_ref_id = $1
+                AND (expires_at IS NULL OR expires_at > NOW())
+            ) < $6
+            RETURNING
+              public_id,
+              label,
+              secret_prefix,
+              expires_at,
+              last_used_at,
+              created_at"
+
+          let insert_result =
+            pog.query(insert_sql)
+            |> pog.parameter(pog.int(client_ref_id))
+            |> pog.parameter(pog.text(trimmed_label))
+            |> pog.parameter(pog.text(secret_prefix))
+            |> pog.parameter(pog.bytea(secret_hash))
+            |> pog.parameter(pog.nullable(pog.int, ttl_seconds))
+            |> pog.parameter(pog.int(max_active_secrets_per_client))
+            |> pog.returning(secret_info_decoder_at(0))
+            |> pog.execute(db)
+
+          case insert_result {
+            Ok(pog.Returned(rows: [info, ..], ..)) ->
+              Ok(CreatedSecret(secret: raw_secret, info:))
+            Ok(pog.Returned(rows: [], ..)) -> Error(SecretLimitExceeded)
+            Error(_) -> Error(InternalError)
+          }
+        }
       }
     }
   }
@@ -689,9 +722,9 @@ pub fn revoke_secret(
   client_id: String,
   secret_public_id: String,
 ) -> Result(Bool, pog.QueryError) {
-  case uuid.normalize(secret_public_id) {
-    Error(_) -> Ok(False)
-    Ok(normalized) -> {
+  case is_valid_client_id_format(client_id), uuid.normalize(secret_public_id) {
+    False, _ | _, Error(_) -> Ok(False)
+    True, Ok(normalized) -> {
       let sql =
         "DELETE FROM oidc_client_secrets s
         USING oidc_clients c
@@ -720,48 +753,109 @@ pub fn delete_for_owner(
   owner_user_id: Int,
   client_id: String,
 ) -> Result(Option(List(String)), pog.QueryError) {
-  let sql =
-    "WITH target_client AS (
-      DELETE FROM oidc_clients
-      WHERE client_id = $1 AND owner_user_id = $2
-      RETURNING id
-    ),
-    revoked_grants AS (
-      SELECT g.public_id
-      FROM oidc_grants g
-      INNER JOIN oidc_consents con ON con.id = g.consent_id
-      INNER JOIN target_client tc ON tc.id = con.client_ref_id
-      WHERE g.expires_at > NOW()
-    )
-    SELECT tc.id, rg.public_id
-    FROM target_client tc
-    LEFT JOIN revoked_grants rg ON TRUE"
+  case is_valid_client_id_format(client_id) {
+    False -> Ok(None)
+    True -> {
+      let sql =
+        "WITH target_client AS (
+          DELETE FROM oidc_clients
+          WHERE client_id = $1 AND owner_user_id = $2
+          RETURNING id
+        ),
+        revoked_grants AS (
+          SELECT g.public_id
+          FROM oidc_grants g
+          INNER JOIN oidc_consents con ON con.id = g.consent_id
+          INNER JOIN target_client tc ON tc.id = con.client_ref_id
+          WHERE g.expires_at > NOW()
+        )
+        SELECT tc.id, rg.public_id
+        FROM target_client tc
+        LEFT JOIN revoked_grants rg ON TRUE"
 
-  let decoder = {
-    use deleted_id <- decode.field(0, decode.int)
-    use grant_public_id <- decode.field(1, decode.optional(uuid.decoder()))
-    decode.success(#(deleted_id, grant_public_id))
+      let decoder = {
+        use deleted_id <- decode.field(0, decode.int)
+        use grant_public_id <- decode.field(1, decode.optional(uuid.decoder()))
+        decode.success(#(deleted_id, grant_public_id))
+      }
+
+      use returned <- result.map(
+        pog.query(sql)
+        |> pog.parameter(pog.text(client_id))
+        |> pog.parameter(pog.int(owner_user_id))
+        |> pog.returning(decoder)
+        |> pog.execute(db),
+      )
+
+      case returned.rows {
+        [] -> None
+        rows ->
+          rows
+          |> list.filter_map(fn(row) {
+            case row.1 {
+              Some(gid) -> Ok(gid)
+              None -> Error(Nil)
+            }
+          })
+          |> Some
+      }
+    }
   }
+}
 
-  use returned <- result.map(
-    pog.query(sql)
-    |> pog.parameter(pog.text(client_id))
-    |> pog.parameter(pog.int(owner_user_id))
-    |> pog.returning(decoder)
-    |> pog.execute(db),
-  )
+pub fn authenticate_secret_for_client(
+  db: pog.Connection,
+  client: Client,
+  raw_secret: String,
+) -> Result(Client, Error) {
+  case client.kind, is_valid_secret_format(raw_secret) {
+    PublicApp, _ | Cimd, _ | _, False -> Error(InvalidClientCredentials)
+    SubordinateBot, True | ConfidentialApp, True -> {
+      let secret_hash = crypto.hash(crypto.Sha256, <<raw_secret:utf8>>)
 
-  case returned.rows {
-    [] -> None
-    rows ->
-      rows
-      |> list.filter_map(fn(row) {
-        case row.1 {
-          Some(gid) -> Ok(gid)
-          None -> Error(Nil)
-        }
-      })
-      |> Some
+      let sql =
+        "WITH matched AS (
+          SELECT id, secret_hash
+          FROM oidc_client_secrets
+          WHERE client_ref_id = $1
+            AND secret_hash = $2
+            AND (expires_at IS NULL OR expires_at > NOW())
+          LIMIT 1
+        ),
+        touch AS (
+          UPDATE oidc_client_secrets
+          SET last_used_at = NOW()
+          FROM matched
+          WHERE oidc_client_secrets.id = matched.id
+            AND (
+              oidc_client_secrets.last_used_at IS NULL
+              OR oidc_client_secrets.last_used_at < NOW() - INTERVAL '60 seconds'
+            )
+        )
+        SELECT secret_hash FROM matched"
+
+      let decoder = {
+        use stored_hash <- decode.field(0, decode.bit_array)
+        decode.success(stored_hash)
+      }
+
+      let result =
+        pog.query(sql)
+        |> pog.parameter(pog.int(client.id))
+        |> pog.parameter(pog.bytea(secret_hash))
+        |> pog.returning(decoder)
+        |> pog.execute(db)
+
+      case result {
+        Ok(pog.Returned(rows: [stored_hash, ..], ..)) ->
+          case crypto.secure_compare(secret_hash, stored_hash) {
+            True -> Ok(client)
+            False -> Error(InvalidClientCredentials)
+          }
+        Ok(pog.Returned(rows: [], ..)) -> Error(InvalidClientCredentials)
+        Error(_) -> Error(InternalError)
+      }
+    }
   }
 }
 
@@ -770,52 +864,43 @@ pub fn authenticate_secret(
   client_id: String,
   raw_secret: String,
 ) -> Result(Client, Error) {
-  let secret_hash = crypto.hash(crypto.Sha256, <<raw_secret:utf8>>)
-
-  let sql =
-    "UPDATE oidc_client_secrets AS s
-    SET last_used_at = NOW()
-    FROM oidc_clients AS c
-    WHERE s.client_ref_id = c.id
-      AND s.secret_hash = $1
-      AND (s.expires_at IS NULL OR s.expires_at > NOW())
-      AND c.client_id = $2
-      AND c.kind IN ('subordinate_bot', 'confidential_app')
-    RETURNING
-      c.id,
-      c.client_id,
-      c.owner_user_id,
-      c.kind,
-      c.visibility,
-      c.application_type,
-      c.name,
-      c.redirect_uris,
-      c.allowed_scopes,
-      c.created_at,
-      s.secret_hash"
-
-  let decoder = {
-    use client <- decode.then(client_decoder_at(0))
-    use stored_hash <- decode.field(10, decode.bit_array)
-    decode.success(#(client, stored_hash))
-  }
-
-  let result =
-    pog.query(sql)
-    |> pog.parameter(pog.bytea(secret_hash))
-    |> pog.parameter(pog.text(client_id))
-    |> pog.returning(decoder)
-    |> pog.execute(db)
-
-  case result {
-    Ok(pog.Returned(rows: [#(client, stored_hash), ..], ..)) ->
-      case crypto.secure_compare(secret_hash, stored_hash) {
-        True -> Ok(client)
-        False -> Error(InvalidClientCredentials)
+  case
+    is_valid_client_id_format(client_id) && is_valid_secret_format(raw_secret)
+  {
+    False -> Error(InvalidClientCredentials)
+    True ->
+      case find_by_client_id(db, client_id) {
+        Ok(Some(found)) -> authenticate_secret_for_client(db, found, raw_secret)
+        Ok(None) -> Error(InvalidClientCredentials)
+        Error(_) -> Error(InternalError)
       }
-    Ok(pog.Returned(rows: [], ..)) -> Error(InvalidClientCredentials)
-    Error(_) -> Error(InternalError)
   }
+}
+
+fn is_lowercase_hex(s: String) -> Bool {
+  s
+  |> string.to_utf_codepoints
+  |> list.all(fn(cp) {
+    case string.utf_codepoint_to_int(cp) {
+      n if n >= 0x30 && n <= 0x39 -> True
+      n if n >= 0x61 && n <= 0x66 -> True
+      _ -> False
+    }
+  })
+}
+
+fn is_base64url_unpadded(s: String) -> Bool {
+  s
+  |> string.to_utf_codepoints
+  |> list.all(fn(cp) {
+    case string.utf_codepoint_to_int(cp) {
+      n if n >= 0x41 && n <= 0x5A -> True
+      n if n >= 0x61 && n <= 0x7A -> True
+      n if n >= 0x30 && n <= 0x39 -> True
+      0x2D | 0x5F -> True
+      _ -> False
+    }
+  })
 }
 
 fn generate_client_id() -> String {

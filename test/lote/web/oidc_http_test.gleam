@@ -27,7 +27,6 @@ import lote/realtime/pubsub.{type PubSub}
 import lote/test_helper
 import lote/web/components/timeline
 import lote/web/csrf
-import lote/web/http_rate_limit
 import lote/web/oidc/bearer
 import lote/web/oidc/handler as oidc_handler
 import lote/web/router
@@ -1427,105 +1426,287 @@ pub fn api_v1_posts_crud_scopes_pagination_realtime_and_privilege_separation_tes
   assert bearer_clients_post.status == 401
 }
 
-pub fn two_tier_rate_limits_and_oidc_endpoint_rate_limits_test() {
+pub fn two_tier_rate_limits_and_invalid_client_db_protection_test() {
   use tx <- test_helper.with_db
-  let assert Ok(limiter) = rate_limit.start_memory(test_secret)
+  let pg_limiter = rate_limit.postgres(tx, test_secret)
   let #(auth_ctx, oidc_ctx, post_pubsub, _grant_revocations) =
-    setup_contexts(tx, limiter)
+    setup_contexts(tx, pg_limiter)
+
+  let count_rate_limit_rows = fn() -> Int {
+    let decoder = {
+      use n <- decode.field(0, decode.int)
+      decode.success(n)
+    }
+    let assert Ok(pog.Returned(rows: [count], ..)) =
+      pog.query("SELECT COUNT(*) FROM rate_limits")
+      |> pog.returning(decoder)
+      |> pog.execute(tx)
+    count
+  }
+
+  let initial_rl_rows = count_rate_limit_rows()
 
   let assert Ok(alice) = user.create(tx, "TieredAlice")
   let assert Ok(carol) = user.create(tx, "MultiBotCarol")
-
-  // Part 1: Single Bot hits its per-client write burst (5), leaving owner's remaining user write quota (5) intact!
-  let assert Ok(alice_bot) =
-    client.create_subordinate_bot(
-      tx,
-      alice.id,
-      "Alice Noisy Bot",
-      set.from_list([scope.PostsWrite]),
-      "v1",
-      None,
-    )
-  let assert Ok(alice_bot_tok) =
-    token.issue_client_credentials(
-      oidc_ctx,
-      alice_bot.client.client_id,
-      alice_bot.secret.secret,
-      None,
-      None,
-      "Bot/1.0",
-    )
 
   let dispatch_ip = fn(req: wisp.Request, ip: String) {
     router.handle_request_with_oidc(req, auth_ctx, oidc_ctx, post_pubsub, ip)
   }
 
-  let post_via_token = fn(tok: String) {
-    simulate.request(http.Post, "/api/v1/posts")
-    |> request.set_header("authorization", "Bearer " <> tok)
-    |> simulate.json_body(json.object([#("body", json.string("rate test"))]))
-    |> dispatch_ip("127.0.0.1")
-  }
+  // Part 1: Malformed client_id & malformed Bearer tokens are rejected in O(1) memory with ZERO rate_limits / DB writes!
+  let _ =
+    list.each(
+      ["", "not-a-client", "cli_short", "cli_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ"],
+      fn(bad_cid) {
+        let r1 =
+          simulate.request(http.Post, "/oidc/token")
+          |> simulate.form_body([
+            #("grant_type", "client_credentials"),
+            #("client_id", bad_cid),
+            #("client_secret", "lote_cs_anything"),
+          ])
+          |> dispatch_ip("198.51.100.10")
+        assert r1.status == 401
+        assert parse_error_code(r1) == "invalid_client"
 
-  // First 5 writes by alice_bot succeed (burst = 5)
+        let r2 =
+          simulate.request(http.Post, "/oidc/revoke")
+          |> simulate.form_body([#("client_id", bad_cid), #("token", "x")])
+          |> dispatch_ip("198.51.100.10")
+        assert r2.status == 401
+      },
+    )
+
+  let _ =
+    list.each(["bad", "lote_at_short", "lote_at_invalid!chars!"], fn(bad_tok) {
+      let r =
+        simulate.request(http.Get, "/api/v1/posts")
+        |> request.set_header("authorization", "Bearer " <> bad_tok)
+        |> dispatch_ip("198.51.100.10")
+      assert r.status == 401
+    })
+
+  assert count_rate_limit_rows() == initial_rl_rows
+
+  // Part 2: Flooding distinct valid-format non-existent `cli_<32hex>` IDs NEVER creates per-client_id rows in `rate_limits`
+  // (only `oidc:ip:<ip>` + `oidc:auth_fail:ip:<ip>` = 2 rows for the IP), and locks out the IP after 20 misses!
+  let scanner_ip = "203.0.113.200"
   let _ =
     int.range(
       from: 1,
-      to: bearer.client_write_policy.burst + 1,
+      to: oidc_handler.auth_fail_ip_policy.burst + 1,
       with: Nil,
-      run: fn(_, _) {
-        assert post_via_token(alice_bot_tok.access_token).status == 201
+      run: fn(_, idx) {
+        let hex_suffix =
+          int.to_base16(idx)
+          |> string.lowercase
+          |> string.pad_start(to: 32, with: "0")
+        let fake_cid = "cli_" <> hex_suffix
+        let r =
+          simulate.request(http.Post, "/oidc/token")
+          |> simulate.form_body([
+            #("grant_type", "client_credentials"),
+            #("client_id", fake_cid),
+            #(
+              "client_secret",
+              "lote_cs_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG",
+            ),
+          ])
+          |> dispatch_ip(scanner_ip)
+        assert r.status == 401
         Nil
       },
     )
 
-  // 6th write by alice_bot is throttled at Tier 1 (client bucket) BEFORE touching Alice's user bucket!
-  let throttled_bot_resp = post_via_token(alice_bot_tok.access_token)
-  assert throttled_bot_resp.status == 429
-  assert parse_error_code(throttled_bot_resp) == "too_many_requests"
-  let assert Ok(retry_hdr) =
-    response.get_header(throttled_bot_resp, "retry-after")
-  let assert Ok(retry_sec) = int.parse(retry_hdr)
-  assert retry_sec >= 1
+  // Only 2 rows created in rate_limits despite 20 distinct non-existent client_ids!
+  assert count_rate_limit_rows() == initial_rl_rows + 2
 
-  // Even repeated rejected attempts by alice_bot do NOT drain Alice's user write bucket!
-  assert post_via_token(alice_bot_tok.access_token).status == 429
-  assert post_via_token(alice_bot_tok.access_token).status == 429
+  // 21st request from scanner_ip is blocked at `peek` with 429 BEFORE touching oidc_clients!
+  let scanner_blocked =
+    simulate.request(http.Post, "/oidc/token")
+    |> simulate.form_body([
+      #("grant_type", "client_credentials"),
+      #("client_id", "cli_ffffffffffffffffffffffffffffffff"),
+      #("client_secret", "lote_cs_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG"),
+    ])
+    |> dispatch_ip(scanner_ip)
+  assert scanner_blocked.status == 429
+  assert parse_error_code(scanner_blocked) == "temporarily_unavailable"
+  assert response.get_header(scanner_blocked, "cache-control") == Ok("no-store")
+  assert response.get_header(scanner_blocked, "pragma") == Ok("no-cache")
+  let assert Ok(_) = response.get_header(scanner_blocked, "retry-after")
 
-  // Alice in her human browser session STILL has 5 writes remaining (10 - 5 = 5)!
-  let login_req = simulate.browser_request(http.Post, "/auth/password/login")
-  let assert Ok(alice_login) =
-    session.create(wisp.ok(), login_req, tx, test_secret, alice)
-  let sess_req =
-    simulate.browser_request(http.Get, "/sessions")
-    |> simulate.session(login_req, alice_login)
-  let sess_resp = dispatch_ip(sess_req, "127.0.0.1")
-  let alice_csrf = extract_form_csrf_token(simulate.read_body(sess_resp))
+  // Part 3: Brute-forcing wrong secrets against a real client_id only locks out (attacker_ip, client_id)
+  // — NEVER collateral-DoSing the legitimate Bot on another IP!
+  let assert Ok(alice_bot) =
+    client.create_subordinate_bot(
+      tx,
+      alice.id,
+      "Alice Noisy Bot",
+      set.from_list([scope.PostsRead, scope.PostsWrite, scope.PostsDelete]),
+      "v1",
+      None,
+    )
 
-  let remaining_human_writes =
-    http_rate_limit.write_policy.burst - bearer.client_write_policy.burst
-  assert remaining_human_writes == 5
-
+  let attacker_ip = "198.51.100.77"
+  let legit_bot_ip = "198.51.100.78"
   let _ =
-    int.range(from: 1, to: remaining_human_writes + 1, with: Nil, run: fn(_, _) {
-      let resp =
-        simulate.browser_request(http.Post, "/sessions/revoke-others")
-        |> simulate.session(sess_req, sess_resp)
-        |> simulate.form_body([#(csrf.form_field_name, alice_csrf)])
-        |> dispatch_ip("127.0.0.1")
-      assert resp.status == 303
+    int.range(
+      from: 1,
+      to: oidc_handler.client_auth_fail_policy.burst + 1,
+      with: Nil,
+      run: fn(_, _) {
+        let r =
+          simulate.request(http.Post, "/oidc/token")
+          |> request.set_header(
+            "authorization",
+            basic_auth_header(
+              alice_bot.client.client_id,
+              "lote_cs_wrong0123456789abcdefghijklmnopqrstuvwxyzAB",
+            ),
+          )
+          |> simulate.form_body([#("grant_type", "client_credentials")])
+          |> dispatch_ip(attacker_ip)
+        assert r.status == 401
+        Nil
+      },
+    )
+
+  // 11th attempt from attacker_ip is 429
+  let attacker_locked =
+    simulate.request(http.Post, "/oidc/token")
+    |> request.set_header(
+      "authorization",
+      basic_auth_header(
+        alice_bot.client.client_id,
+        "lote_cs_wrong0123456789abcdefghijklmnopqrstuvwxyzAB",
+      ),
+    )
+    |> simulate.form_body([#("grant_type", "client_credentials")])
+    |> dispatch_ip(attacker_ip)
+  assert attacker_locked.status == 429
+
+  // Meanwhile, Alice's legitimate Bot on legit_bot_ip is 100% unaffected (200 OK)!
+  let legit_tok_resp =
+    simulate.request(http.Post, "/oidc/token")
+    |> request.set_header(
+      "authorization",
+      basic_auth_header(alice_bot.client.client_id, alice_bot.secret.secret),
+    )
+    |> simulate.form_body([#("grant_type", "client_credentials")])
+    |> dispatch_ip(legit_bot_ip)
+  assert legit_tok_resp.status == 200
+  let assert #(alice_at, _, None) = parse_access_token(legit_tok_resp)
+
+  // Part 4: Valid `POST /oidc/revoke` is NEVER rate-limited even across 60 back-to-back calls (PR #40 parity)!
+  let _ =
+    int.range(from: 1, to: 61, with: Nil, run: fn(_, _) {
+      let r =
+        simulate.request(http.Post, "/oidc/revoke")
+        |> request.set_header(
+          "authorization",
+          basic_auth_header(alice_bot.client.client_id, alice_bot.secret.secret),
+        )
+        |> simulate.form_body([
+          #("token", "lote_at_0000000000000000000000000000000000000000000"),
+        ])
+        |> dispatch_ip(legit_bot_ip)
+      assert r.status == 200
       Nil
     })
 
-  // Now Alice's shared user write ceiling (10) is exhausted -> 11th total write returns 429
-  let human_over_resp =
-    simulate.browser_request(http.Post, "/sessions/revoke-others")
-    |> simulate.session(sess_req, sess_resp)
-    |> simulate.form_body([#(csrf.form_field_name, alice_csrf)])
-    |> dispatch_ip("127.0.0.1")
-  assert human_over_resp.status == 429
+  // Part 5: `GET /api/v1/posts` does NOT write rate_limit entries on valid tokens,
+  // while random valid-format `lote_at_<43 chars>` flood locks out the IP after 20 misses!
+  let rows_before_gets = count_rate_limit_rows()
+  let _ =
+    int.range(from: 1, to: 25, with: Nil, run: fn(_, _) {
+      let r =
+        simulate.request(http.Get, "/api/v1/posts")
+        |> request.set_header("authorization", "Bearer " <> alice_at)
+        |> dispatch_ip("192.0.2.50")
+      assert r.status == 200
+      Nil
+    })
+  assert count_rate_limit_rows() == rows_before_gets
 
-  // Part 2: Multiple Subordinate Bots owned by Carol CANNOT exceed Carol's total user write ceiling (burst 10)!
+  let bearer_flood_ip = "192.0.2.99"
+  let _ =
+    int.range(
+      from: 1,
+      to: bearer.auth_fail_ip_policy.burst + 1,
+      with: Nil,
+      run: fn(_, idx) {
+        let suffix = int.to_string(idx) |> string.pad_start(to: 43, with: "A")
+        let r =
+          simulate.request(http.Get, "/api/v1/posts")
+          |> request.set_header("authorization", "Bearer lote_at_" <> suffix)
+          |> dispatch_ip(bearer_flood_ip)
+        assert r.status == 401
+        Nil
+      },
+    )
+  let bearer_flood_blocked =
+    simulate.request(http.Get, "/api/v1/posts")
+    |> request.set_header(
+      "authorization",
+      "Bearer lote_at_ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+    )
+    |> dispatch_ip(bearer_flood_ip)
+  assert bearer_flood_blocked.status == 429
+
+  // Part 6: `POST /api/v1/posts` enforces per-Bot `client_post_create_policy` (burst 3)
+  // AND shares `post:create:user:<id>` (burst 5) with Web composer & sibling Bots!
+  let post_via_token = fn(tok: String) {
+    simulate.request(http.Post, "/api/v1/posts")
+    |> request.set_header("authorization", "Bearer " <> tok)
+    |> simulate.json_body(json.object([#("body", json.string("rate test"))]))
+    |> dispatch_ip(legit_bot_ip)
+  }
+
+  let _ =
+    int.range(
+      from: 1,
+      to: bearer.client_post_create_policy.burst + 1,
+      with: Nil,
+      run: fn(_, _) {
+        assert post_via_token(alice_at).status == 201
+        Nil
+      },
+    )
+
+  // 4th post by alice_bot hits Tier 1 (`post:create:client:<cid>`, burst 3), leaving 2 slots in `post:create:user:<alice>` (burst 5)!
+  let throttled_bot_post = post_via_token(alice_at)
+  assert throttled_bot_post.status == 429
+  assert parse_error_code(throttled_bot_post) == "too_many_requests"
+
+  // Repeated rejected attempts by alice_bot do NOT consume Alice's remaining 2 user post slots!
+  assert post_via_token(alice_at).status == 429
+
+  let assert Ok(alice_bot2) =
+    client.create_subordinate_bot(
+      tx,
+      alice.id,
+      "Alice Second Bot",
+      set.from_list([scope.PostsWrite]),
+      "v1",
+      None,
+    )
+  let assert Ok(alice_bot2_tok) =
+    token.issue_client_credentials(
+      oidc_ctx,
+      alice_bot2.client.client_id,
+      alice_bot2.secret.secret,
+      None,
+      None,
+      "Bot/1.0",
+    )
+
+  // Remaining 2 slots in `post:create:user:<alice>` (5 - 3 = 2) succeed, and the 6th total post on Alice's account hits 429!
+  assert post_via_token(alice_bot2_tok.access_token).status == 201
+  assert post_via_token(alice_bot2_tok.access_token).status == 201
+  assert post_via_token(alice_bot2_tok.access_token).status == 429
+
+  // Carol with 2 bots also hits Carol's `post:create:user:<carol>` ceiling at 5 total posts (3 + 2)!
   let mint_carol_bot = fn(label: String) {
     let assert Ok(b) =
       client.create_subordinate_bot(
@@ -1547,90 +1728,14 @@ pub fn two_tier_rate_limits_and_oidc_endpoint_rate_limits_test() {
       )
     tok.access_token
   }
-
-  let bot_a_tok = mint_carol_bot("a")
-  let bot_b_tok = mint_carol_bot("b")
-  let bot_c_tok = mint_carol_bot("c")
-
-  // bot_a uses 5 writes, bot_b uses 5 writes -> total 10 writes on Carol's account
-  let _ =
-    int.range(from: 1, to: 6, with: Nil, run: fn(_, _) {
-      assert post_via_token(bot_a_tok).status == 201
-      Nil
-    })
-  let _ =
-    int.range(from: 1, to: 6, with: Nil, run: fn(_, _) {
-      assert post_via_token(bot_b_tok).status == 201
-      Nil
-    })
-
-  // bot_c has a fresh client bucket, yet its very 1st write is blocked by Tier 2 (Carol's user write ceiling)!
-  let bot_c_blocked = post_via_token(bot_c_tok)
-  assert bot_c_blocked.status == 429
-  assert parse_error_code(bot_c_blocked) == "too_many_requests"
-
-  // Part 3: /oidc/token per-client (burst 20) and per-IP (burst 30) rate limits
-  let endpoint_ip = "198.51.100.77"
-  let _ =
-    int.range(
-      from: 1,
-      to: oidc_handler.client_endpoint_policy.burst + 1,
-      with: Nil,
-      run: fn(_, _) {
-        let r =
-          simulate.request(http.Post, "/oidc/token")
-          |> request.set_header(
-            "authorization",
-            basic_auth_header(
-              alice_bot.client.client_id,
-              alice_bot.secret.secret,
-            ),
-          )
-          |> simulate.form_body([#("grant_type", "client_credentials")])
-          |> dispatch_ip(endpoint_ip)
-        assert r.status == 200
-        Nil
-      },
-    )
-
-  let client_rl_resp =
-    simulate.request(http.Post, "/oidc/token")
-    |> request.set_header(
-      "authorization",
-      basic_auth_header(alice_bot.client.client_id, alice_bot.secret.secret),
-    )
-    |> simulate.form_body([#("grant_type", "client_credentials")])
-    |> dispatch_ip("198.51.100.78")
-  assert client_rl_resp.status == 429
-  assert parse_error_code(client_rl_resp) == "temporarily_unavailable"
-  assert response.get_header(client_rl_resp, "cache-control") == Ok("no-store")
-  assert response.get_header(client_rl_resp, "pragma") == Ok("no-cache")
-  let assert Ok(_) = response.get_header(client_rl_resp, "retry-after")
-
-  // Exhaust IP burst (30) on a fresh IP
-  let flood_ip = "203.0.113.200"
-  let _ =
-    int.range(
-      from: 1,
-      to: oidc_handler.ip_endpoint_policy.burst + 1,
-      with: Nil,
-      run: fn(_, _) {
-        let r =
-          simulate.request(http.Post, "/oidc/revoke")
-          |> simulate.form_body([#("token", "x")])
-          |> dispatch_ip(flood_ip)
-        assert r.status == 401
-        Nil
-      },
-    )
-  let ip_rl_resp =
-    simulate.request(http.Post, "/oidc/revoke")
-    |> simulate.form_body([#("token", "x")])
-    |> dispatch_ip(flood_ip)
-  assert ip_rl_resp.status == 429
-  assert parse_error_code(ip_rl_resp) == "temporarily_unavailable"
-
-  rate_limit.stop_memory(limiter)
+  let carol_tok1 = mint_carol_bot("1")
+  let carol_tok2 = mint_carol_bot("2")
+  assert post_via_token(carol_tok1).status == 201
+  assert post_via_token(carol_tok1).status == 201
+  assert post_via_token(carol_tok1).status == 201
+  assert post_via_token(carol_tok2).status == 201
+  assert post_via_token(carol_tok2).status == 201
+  assert post_via_token(carol_tok2).status == 429
 }
 
 pub fn grant_revocations_pubsub_adapter_memory_and_postgres_test() {
