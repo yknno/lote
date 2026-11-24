@@ -1,8 +1,10 @@
 import envoy
 import gleam/int
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/result
 import gleam/string
+import gleam/uri
 import wisp
 
 pub type PubSubAdapter {
@@ -20,6 +22,7 @@ pub type Config {
     port: Int,
     secret_key_base: String,
     database_url: String,
+    issuer_url: String,
     auth_adapters: List(String),
     pubsub_adapter: PubSubAdapter,
     rate_limit_adapter: RateLimitAdapter,
@@ -40,6 +43,25 @@ pub fn load() -> Config {
   let database_url =
     envoy.get("DATABASE_URL")
     |> result.unwrap("postgres://postgres:postgres@localhost:5432/lote")
+
+  let default_issuer = default_issuer_url(port)
+  let issuer_url = case
+    envoy.get("ISSUER_URL")
+    |> result.unwrap("")
+    |> parse_issuer_url(port)
+  {
+    Ok(issuer) -> issuer
+    Error(invalid) -> {
+      wisp.log_warning(
+        "Invalid ISSUER_URL \""
+        <> invalid
+        <> "\", falling back to \""
+        <> default_issuer
+        <> "\"",
+      )
+      default_issuer
+    }
+  }
 
   let auth_adapters =
     envoy.get("AUTH_ADAPTERS")
@@ -102,11 +124,66 @@ pub fn load() -> Config {
     port:,
     secret_key_base:,
     database_url:,
+    issuer_url:,
     auth_adapters:,
     pubsub_adapter:,
     rate_limit_adapter:,
     trusted_proxy_hops:,
   )
+}
+
+pub fn default_issuer_url(port: Int) -> String {
+  case port {
+    80 -> "http://localhost"
+    _ -> "http://localhost:" <> int.to_string(port)
+  }
+}
+
+pub fn parse_issuer_url(raw: String, port: Int) -> Result(String, String) {
+  let trimmed = string.trim(raw)
+  case trimmed {
+    "" -> Ok(default_issuer_url(port))
+    _ ->
+      case uri.parse(trimmed) {
+        Error(_) -> Error(trimmed)
+        Ok(parsed) ->
+          case
+            parsed.scheme,
+            parsed.host,
+            parsed.userinfo,
+            parsed.query,
+            parsed.fragment
+          {
+            Some(scheme), Some(host), None, None, None
+              if { scheme == "http" || scheme == "https" } && host != ""
+            -> {
+              let clean_path = trim_trailing_slashes(parsed.path)
+              let normalized =
+                uri.Uri(
+                  scheme: Some(string.lowercase(scheme)),
+                  userinfo: None,
+                  host: Some(string.lowercase(host)),
+                  port: parsed.port,
+                  path: clean_path,
+                  query: None,
+                  fragment: None,
+                )
+              Ok(uri.to_string(normalized))
+            }
+            _, _, _, _, _ -> Error(trimmed)
+          }
+      }
+  }
+}
+
+fn trim_trailing_slashes(path: String) -> String {
+  case string.ends_with(path, "/") {
+    True ->
+      path
+      |> string.drop_end(up_to: 1)
+      |> trim_trailing_slashes
+    False -> path
+  }
 }
 
 pub fn parse_pubsub_adapter(raw: String) -> Result(PubSubAdapter, String) {

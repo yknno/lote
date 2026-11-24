@@ -1020,6 +1020,15 @@ fn account_bar(
         ]),
         html.a(
           [
+            attribute.href("/settings/clients"),
+            attribute.class(
+              "text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
+            ),
+          ],
+          [html.text("Clients")],
+        ),
+        html.a(
+          [
             attribute.href("/sessions"),
             attribute.class(
               "text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",

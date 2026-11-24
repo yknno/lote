@@ -16,6 +16,8 @@ import lote/auth/session
 import lote/auth/session_cleanup
 import lote/config
 import lote/db/pool
+import lote/oidc.{type Oidc}
+import lote/oidc/cleanup as oidc_cleanup
 import lote/rate_limit
 import lote/realtime/pubsub.{type PubSub}
 import lote/web/client_ip
@@ -54,6 +56,9 @@ pub fn main() -> Nil {
   let session_revocations_name = process.new_name("lote_session_revocations")
   let session_revocations = process.named_subject(session_revocations_name)
 
+  let grant_revocations_name = process.new_name("lote_grant_revocations")
+  let grant_revocations = process.named_subject(grant_revocations_name)
+
   let rate_limit_name = process.new_name("lote_rate_limit")
   let rate_limiter = case cfg.rate_limit_adapter {
     config.MemoryRateLimit ->
@@ -70,11 +75,19 @@ pub fn main() -> Nil {
       rate_limiter:,
     )
 
+  let oidc_ctx = oidc.new(db, cfg.issuer_url, grant_revocations, rate_limiter)
+
   let post_pubsub_name = process.new_name("lote_post_pubsub")
   let post_pubsub = process.named_subject(post_pubsub_name)
 
   let http_server =
-    handler_with_proxy_hops(db, post_pubsub, auth_ctx, cfg.trusted_proxy_hops)
+    handler_with_oidc(
+      db,
+      post_pubsub,
+      auth_ctx,
+      oidc_ctx,
+      cfg.trusted_proxy_hops,
+    )
     |> mist.new
     |> mist.bind("0.0.0.0")
     |> mist.port(cfg.port)
@@ -88,6 +101,10 @@ pub fn main() -> Nil {
       session_revocations_adapter(cfg.pubsub_adapter, db, cfg.database_url),
     ))
     |> supervisor.add(pubsub.supervised(
+      grant_revocations_name,
+      grant_revocations_adapter(cfg.pubsub_adapter, db, cfg.database_url),
+    ))
+    |> supervisor.add(pubsub.supervised(
       post_pubsub_name,
       post_pubsub_adapter(cfg.pubsub_adapter, db, cfg.database_url),
     ))
@@ -96,6 +113,12 @@ pub fn main() -> Nil {
       session_revocations,
       session_cleanup.default_interval_ms,
       session_cleanup.default_batch_limit,
+    ))
+    |> supervisor.add(oidc_cleanup.supervised(
+      db,
+      Some(grant_revocations),
+      oidc_cleanup.default_interval_ms,
+      oidc_cleanup.default_batch_limit,
     ))
 
   let sup_builder = case cfg.rate_limit_adapter {
@@ -121,6 +144,8 @@ pub fn main() -> Nil {
 
 pub const session_revocations_channel = "lote_session_revocations"
 
+pub const grant_revocations_channel = "lote_grant_revocations"
+
 pub const post_events_channel = "lote_post_events"
 
 pub fn session_revocations_adapter(
@@ -135,6 +160,29 @@ pub fn session_revocations_adapter(
         db:,
         database_url:,
         channel: session_revocations_channel,
+        encode: fn(id) { id },
+        decode: fn(raw) {
+          case raw {
+            "" -> Error(Nil)
+            id -> Ok(id)
+          }
+        },
+      )
+  }
+}
+
+pub fn grant_revocations_adapter(
+  adapter_kind: config.PubSubAdapter,
+  db: pog.Connection,
+  database_url: String,
+) -> pubsub.Adapter(String) {
+  case adapter_kind {
+    config.MemoryPubSub -> pubsub.Memory
+    config.PostgresPubSub ->
+      pubsub.Postgres(
+        db:,
+        database_url:,
+        channel: grant_revocations_channel,
         encode: fn(id) { id },
         decode: fn(raw) {
           case raw {
@@ -173,6 +221,15 @@ pub fn start_session_revocations_pubsub(
   |> pubsub.start_with_adapter
 }
 
+pub fn start_grant_revocations_pubsub(
+  adapter_kind: config.PubSubAdapter,
+  db: pog.Connection,
+  database_url: String,
+) {
+  grant_revocations_adapter(adapter_kind, db, database_url)
+  |> pubsub.start_with_adapter
+}
+
 pub fn start_post_pubsub(
   adapter_kind: config.PubSubAdapter,
   db: pog.Connection,
@@ -196,13 +253,35 @@ pub fn handler_with_proxy_hops(
   auth_ctx: Auth,
   trusted_proxy_hops: Int,
 ) -> fn(Request(Connection)) -> Response(ResponseData) {
+  handler_with_oidc(
+    db,
+    post_pubsub,
+    auth_ctx,
+    oidc.from_auth(auth_ctx),
+    trusted_proxy_hops,
+  )
+}
+
+pub fn handler_with_oidc(
+  db: pog.Connection,
+  post_pubsub: PubSub(timeline.PostEvent),
+  auth_ctx: Auth,
+  oidc_ctx: Oidc,
+  trusted_proxy_hops: Int,
+) -> fn(Request(Connection)) -> Response(ResponseData) {
   fn(req: Request(Connection)) -> Response(ResponseData) {
     let ip = client_ip.from_mist_request(req, trusted_proxy_hops)
     case request.path_segments(req) {
       ["ws"] -> serve_timeline_ws(req, db, post_pubsub, auth_ctx, ip)
       _ ->
         wisp_mist.handler(
-          router.handle_request_with_ip(_, auth_ctx, post_pubsub, ip),
+          router.handle_request_with_oidc(
+            _,
+            auth_ctx,
+            oidc_ctx,
+            post_pubsub,
+            ip,
+          ),
           auth_ctx.secret_key_base,
         )(req)
     }

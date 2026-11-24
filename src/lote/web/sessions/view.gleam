@@ -103,6 +103,15 @@ pub fn index_page(
                     ],
                     [html.text("Timeline")],
                   ),
+                  html.a(
+                    [
+                      attribute.href("/settings/clients"),
+                      attribute.class(
+                        "text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
+                      ),
+                    ],
+                    [html.text("Clients")],
+                  ),
                   html.form(
                     [
                       attribute.method("post"),

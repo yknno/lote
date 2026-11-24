@@ -1,17 +1,23 @@
 import gleam/http
+import gleam/http/request
 import gleam/http/response
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
 import lote/auth.{type Auth}
 import lote/auth/session
 import lote/db/post_repo
+import lote/oidc.{type Oidc}
 import lote/realtime/pubsub.{type PubSub}
+import lote/web/api/posts_handler
 import lote/web/auth/handler as auth_handler
 import lote/web/components/timeline
 import lote/web/csrf
 import lote/web/http_rate_limit
+import lote/web/oidc/handler as oidc_handler
 import lote/web/post/view as post_view
 import lote/web/sessions/handler as sessions_handler
+import lote/web/settings/clients_handler
 import lustre/attribute
 import lustre/element
 import lustre/element/html
@@ -33,6 +39,22 @@ pub fn handle_request(
 pub fn handle_request_with_ip(
   req: Request,
   auth_ctx: Auth,
+  post_pubsub: PubSub(timeline.PostEvent),
+  client_ip: String,
+) -> Response {
+  handle_request_with_oidc(
+    req,
+    auth_ctx,
+    oidc.from_auth(auth_ctx),
+    post_pubsub,
+    client_ip,
+  )
+}
+
+pub fn handle_request_with_oidc(
+  req: Request,
+  auth_ctx: Auth,
+  oidc_ctx: Oidc,
   post_pubsub: PubSub(timeline.PostEvent),
   client_ip: String,
 ) -> Response {
@@ -105,8 +127,15 @@ pub fn handle_request_with_ip(
     _, ["posts", _, "delete"] -> wisp.method_not_allowed([http.Post])
     _, ["sessions", ..rest] ->
       sessions_handler.handle_request(req, rest, auth_ctx)
+    _, ["settings", "clients", ..rest] ->
+      clients_handler.handle_request(req, rest, auth_ctx, oidc_ctx)
     _, ["auth", ..rest] ->
       auth_handler.handle_request(req, rest, auth_ctx, client_ip)
+    _, ["oidc", ..rest] ->
+      oidc_handler.handle_request(req, rest, oidc_ctx, client_ip)
+    _, ["api", "v1", "posts", ..rest] ->
+      posts_handler.handle_request(req, rest, oidc_ctx, post_pubsub)
+    _, ["api", ..] -> posts_handler.json_error(404, "not_found")
     _, ["health"] -> wisp.response(200) |> wisp.string_body("ok")
     _, _ -> wisp.not_found()
   }
@@ -155,7 +184,7 @@ fn middleware(
   {
     use <- wisp.rescue_crashes
     use req <- wisp.handle_head(req)
-    use req <- wisp.csrf_known_header_protection(req)
+    use req <- apply_origin_or_strip_cookies(req)
 
     let static_dir = case wisp.priv_directory("lote") {
       Ok(priv) -> priv <> "/static"
@@ -167,6 +196,30 @@ fn middleware(
     })
   }
   |> ensure_cache_control(default_cache_control)
+}
+
+fn apply_origin_or_strip_cookies(
+  req: Request,
+  next: fn(Request) -> Response,
+) -> Response {
+  case is_cookieless_route(wisp.path_segments(req)) {
+    True -> {
+      let headers =
+        list.filter(req.headers, fn(h) { string.lowercase(h.0) != "cookie" })
+      next(request.Request(..req, headers:))
+    }
+    False -> wisp.csrf_known_header_protection(req, next)
+  }
+}
+
+fn is_cookieless_route(segments: List(String)) -> Bool {
+  case segments {
+    ["oidc", "token"]
+    | ["oidc", "revoke"]
+    | ["oidc", "introspect"]
+    | ["api", ..] -> True
+    _ -> False
+  }
 }
 
 fn serve_static_with_cache(
