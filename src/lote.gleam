@@ -16,7 +16,9 @@ import lote/auth/session
 import lote/auth/session_cleanup
 import lote/config
 import lote/db/pool
+import lote/rate_limit
 import lote/realtime/pubsub.{type PubSub}
+import lote/web/client_ip
 import lote/web/components/timeline
 import lote/web/csrf
 import lote/web/origin
@@ -51,25 +53,34 @@ pub fn main() -> Nil {
 
   let session_revocations_name = process.new_name("lote_session_revocations")
   let session_revocations = process.named_subject(session_revocations_name)
+
+  let rate_limit_name = process.new_name("lote_rate_limit")
+  let rate_limiter = case cfg.rate_limit_adapter {
+    config.MemoryRateLimit ->
+      rate_limit.memory_named(rate_limit_name, cfg.secret_key_base)
+    config.PostgresRateLimit -> rate_limit.postgres(db, cfg.secret_key_base)
+  }
+
   let auth_ctx =
     Auth(
       db:,
       secret_key_base: cfg.secret_key_base,
       methods:,
       session_revocations:,
+      rate_limiter:,
     )
 
   let post_pubsub_name = process.new_name("lote_post_pubsub")
   let post_pubsub = process.named_subject(post_pubsub_name)
 
   let http_server =
-    handler(db, post_pubsub, auth_ctx)
+    handler_with_proxy_hops(db, post_pubsub, auth_ctx, cfg.trusted_proxy_hops)
     |> mist.new
     |> mist.bind("0.0.0.0")
     |> mist.port(cfg.port)
     |> mist.supervised
 
-  let assert Ok(_) =
+  let sup_builder =
     supervisor.new(supervisor.OneForOne)
     |> supervisor.add(pool.supervised(db_config))
     |> supervisor.add(pubsub.supervised(
@@ -86,6 +97,22 @@ pub fn main() -> Nil {
       session_cleanup.default_interval_ms,
       session_cleanup.default_batch_limit,
     ))
+
+  let sup_builder = case cfg.rate_limit_adapter {
+    config.MemoryRateLimit ->
+      sup_builder
+      |> supervisor.add(rate_limit.supervised_memory(rate_limit_name))
+    config.PostgresRateLimit ->
+      sup_builder
+      |> supervisor.add(rate_limit.supervised_postgres_cleanup(
+        db,
+        rate_limit.default_cleanup_interval_ms,
+        rate_limit.default_cleanup_batch_limit,
+      ))
+  }
+
+  let assert Ok(_) =
+    sup_builder
     |> supervisor.add(http_server)
     |> supervisor.start
 
@@ -160,16 +187,24 @@ pub fn handler(
   post_pubsub: PubSub(timeline.PostEvent),
   auth_ctx: Auth,
 ) -> fn(Request(Connection)) -> Response(ResponseData) {
-  let http_handler =
-    wisp_mist.handler(
-      router.handle_request(_, auth_ctx, post_pubsub),
-      auth_ctx.secret_key_base,
-    )
+  handler_with_proxy_hops(db, post_pubsub, auth_ctx, 0)
+}
 
+pub fn handler_with_proxy_hops(
+  db: pog.Connection,
+  post_pubsub: PubSub(timeline.PostEvent),
+  auth_ctx: Auth,
+  trusted_proxy_hops: Int,
+) -> fn(Request(Connection)) -> Response(ResponseData) {
   fn(req: Request(Connection)) -> Response(ResponseData) {
+    let ip = client_ip.from_mist_request(req, trusted_proxy_hops)
     case request.path_segments(req) {
       ["ws"] -> serve_timeline_ws(req, db, post_pubsub, auth_ctx)
-      _ -> http_handler(req)
+      _ ->
+        wisp_mist.handler(
+          router.handle_request_with_ip(_, auth_ctx, post_pubsub, ip),
+          auth_ctx.secret_key_base,
+        )(req)
     }
   }
 }

@@ -26,6 +26,15 @@ pub fn handle_request(
   auth_ctx: Auth,
   post_pubsub: PubSub(timeline.PostEvent),
 ) -> Response {
+  handle_request_with_ip(req, auth_ctx, post_pubsub, "127.0.0.1")
+}
+
+pub fn handle_request_with_ip(
+  req: Request,
+  auth_ctx: Auth,
+  post_pubsub: PubSub(timeline.PostEvent),
+  client_ip: String,
+) -> Response {
   use req <- middleware(req)
 
   case req.method, wisp.path_segments(req) {
@@ -90,7 +99,8 @@ pub fn handle_request(
     _, ["posts", _, "delete"] -> wisp.method_not_allowed([http.Post])
     _, ["sessions", ..rest] ->
       sessions_handler.handle_request(req, rest, auth_ctx)
-    _, ["auth", ..rest] -> auth_handler.handle_request(req, rest, auth_ctx)
+    _, ["auth", ..rest] ->
+      auth_handler.handle_request(req, rest, auth_ctx, client_ip)
     _, ["health"] -> wisp.response(200) |> wisp.string_body("ok")
     _, _ -> wisp.not_found()
   }

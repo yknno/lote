@@ -2,6 +2,7 @@ import gleam/erlang/process
 import gleam/http
 import gleam/http/request
 import gleam/http/response
+import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -10,8 +11,11 @@ import lote/auth/password
 import lote/auth/session
 import lote/auth/user
 import lote/db/post_repo
+import lote/rate_limit
 import lote/realtime/pubsub
 import lote/test_helper
+import lote/web/auth/password_handler
+import lote/web/client_ip
 import lote/web/components/timeline
 import lote/web/csrf
 import lote/web/router
@@ -53,6 +57,7 @@ pub fn health_endpoint_returns_ok_test() {
       secret_key_base: simulate.default_secret_key_base,
       methods: [],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
   let req = simulate.request(http.Get, "/health")
   let resp = router.handle_request(req, auth_ctx, post_pubsub)
@@ -72,6 +77,7 @@ pub fn password_login_returns_404_when_adapter_disabled_test() {
       secret_key_base: simulate.default_secret_key_base,
       methods: [],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
   let req =
     simulate.browser_request(http.Post, "/auth/password/login")
@@ -101,6 +107,7 @@ pub fn password_login_issues_session_cookie_when_enabled_test() {
       secret_key_base: secret,
       methods: [Password],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   // Fetch login page to obtain CSRF cookie and embedded form token
@@ -169,6 +176,7 @@ pub fn relogin_destroys_and_revokes_previous_session_test() {
       secret_key_base: secret,
       methods: [Password],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   // First login as Alice
@@ -245,6 +253,7 @@ pub fn failed_login_preserves_csrf_token_and_issues_no_session_test() {
       secret_key_base: secret,
       methods: [Password],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   let page_req = simulate.browser_request(http.Get, "/auth/login")
@@ -301,6 +310,7 @@ pub fn login_and_logout_reject_missing_token_or_cross_origin_test() {
       secret_key_base: secret,
       methods: [Password],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   let login_page_req = simulate.browser_request(http.Get, "/auth/login")
@@ -394,6 +404,7 @@ pub fn get_post_permalink_renders_post_and_handles_missing_or_invalid_id_test() 
       secret_key_base: simulate.default_secret_key_base,
       methods: [],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   let ok_resp =
@@ -452,6 +463,7 @@ pub fn post_delete_route_enforces_csrf_auth_and_ownership_and_broadcasts_test() 
       secret_key_base: secret,
       methods: [Password],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   let delete_path = "/posts/" <> created.id <> "/delete"
@@ -574,6 +586,7 @@ pub fn dynamic_and_error_routes_return_no_store_cache_control_test() {
       secret_key_base: simulate.default_secret_key_base,
       methods: [Password],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   // GET / -> no-store
@@ -639,6 +652,7 @@ pub fn static_assets_return_public_no_cache_with_etag_and_errors_return_no_store
       secret_key_base: simulate.default_secret_key_base,
       methods: [],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   // GET existing static file -> 200 + public, no-cache + ETag
@@ -705,6 +719,7 @@ pub fn sessions_routes_list_and_revoke_with_csrf_ownership_and_pubsub_test() {
       secret_key_base: secret,
       methods: [Password],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   // Unauthenticated GET /sessions -> 303 redirect to /auth/login + no-store
@@ -880,4 +895,108 @@ pub fn sessions_routes_list_and_revoke_with_csrf_ownership_and_pubsub_test() {
   assert response.get_header(revoke_self_resp, "location") == Ok("/")
   assert process.receive(revocation_sub, 100) == Ok(a1_sid)
   assert session.current_user(a1_check, tx, secret) == None
+}
+
+pub fn password_login_rate_limits_by_ip_and_account_and_resets_on_success_test() {
+  use tx <- test_helper.with_db
+  let assert Ok(session_revocations) = pubsub.start()
+  let assert Ok(post_pubsub) = pubsub.start()
+  let secret = "login_rl_secret_key_base_0123456789abcdefghijklmnopqrstuvwxyz"
+  let assert Ok(rate_limiter) = rate_limit.start_memory(secret)
+
+  let assert Ok(alice) = user.create(tx, "RateAlice")
+  let assert Ok(Nil) =
+    password.create(tx, alice.id, "rate_alice", "correctpass123")
+  let assert Ok(bob) = user.create(tx, "RateBob")
+  let assert Ok(Nil) = password.create(tx, bob.id, "rate_bob", "correctpass123")
+  let auth_ctx =
+    Auth(
+      db: tx,
+      secret_key_base: secret,
+      methods: [Password],
+      session_revocations:,
+      rate_limiter:,
+    )
+
+  let page_req = simulate.browser_request(http.Get, "/auth/login")
+  let page_resp = router.handle_request(page_req, auth_ctx, post_pubsub)
+  let login_csrf = extract_form_csrf_token(simulate.read_body(page_resp))
+
+  let submit_login = fn(ip: String, login_id: String, pw: String) {
+    simulate.browser_request(http.Post, "/auth/password/login")
+    |> simulate.session(page_req, page_resp)
+    |> simulate.form_body([
+      #(csrf.form_field_name, login_csrf),
+      #("login_id", login_id),
+      #("password", pw),
+    ])
+    |> router.handle_request_with_ip(auth_ctx, post_pubsub, ip)
+  }
+
+  // 5 failed attempts from 203.0.113.10 for rate_alice return 200 with credential error
+  let _ =
+    int.range(from: 1, to: 6, with: Nil, run: fn(_, _) {
+      let resp = submit_login("203.0.113.10", "rate_alice", "wrongpass")
+      assert resp.status == 200
+      Nil
+    })
+
+  // 6th attempt from same IP for same account (even uppercase) returns 429 + Retry-After + no-store
+  let limited_resp =
+    submit_login("203.0.113.10", "RATE_ALICE", "correctpass123")
+  assert limited_resp.status == 429
+  assert response.get_header(limited_resp, "cache-control") == Ok("no-store")
+  let assert Ok(retry_after) = response.get_header(limited_resp, "retry-after")
+  let assert Ok(retry_seconds) = int.parse(retry_after)
+  assert retry_seconds >= 1
+  assert string.contains(simulate.read_body(limited_resp), "ログイン試行回数が上限に達しました")
+
+  // Another IP is NOT locked out of rate_alice (prevents cross-IP lockout DoS)
+  let other_ip_resp =
+    submit_login("203.0.113.20", "rate_alice", "correctpass123")
+  assert other_ip_resp.status == 303
+
+  // Same IP can still log in to a different account (rate_bob), and success resets account quota
+  let bob_fail1 = submit_login("203.0.113.10", "rate_bob", "wrongpass")
+  assert bob_fail1.status == 200
+  let bob_ok = submit_login("203.0.113.10", "rate_bob", "correctpass123")
+  assert bob_ok.status == 303
+  // After reset on success, rate_bob from 203.0.113.10 gets a fresh account bucket
+  let bob_after_reset = submit_login("203.0.113.10", "rate_bob", "wrongpass")
+  assert bob_after_reset.status == 200
+
+  // IP-wide limit (20/15m) blocks the 21st attempt from an IP even with fresh login_ids
+  let flood_ip = "198.51.100.9"
+  let _ =
+    int.range(from: 1, to: 20, with: Nil, run: fn(_, _) {
+      let _ =
+        rate_limit.check(
+          rate_limiter,
+          "login:ip:" <> client_ip.rate_limit_bucket(flood_ip),
+          password_handler.ip_policy,
+        )
+      Nil
+    })
+  let ip_ok = submit_login(flood_ip, "brand_new_id_20", "wrong")
+  assert ip_ok.status == 200
+  let ip_limited = submit_login(flood_ip, "brand_new_id_21", "wrong")
+  assert ip_limited.status == 429
+
+  // IPv6 addresses rotating within the same /64 share the rate-limit bucket,
+  // while an adjacent /64 remains unaffected
+  let _ =
+    ["1", "2", "3", "4", "5"]
+    |> list.each(fn(host) {
+      let resp =
+        submit_login("2001:db8:aaaa:bbbb::" <> host, "rate_alice", "wrongpass")
+      assert resp.status == 200
+    })
+  let v6_same_prefix_limited =
+    submit_login("2001:0DB8:aaaa:bbbb:ffff::99", "rate_alice", "correctpass123")
+  assert v6_same_prefix_limited.status == 429
+  let v6_other_prefix_ok =
+    submit_login("2001:db8:aaaa:bbbc::1", "rate_alice", "correctpass123")
+  assert v6_other_prefix_ok.status == 303
+
+  rate_limit.stop_memory(rate_limiter)
 }

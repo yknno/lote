@@ -10,6 +10,7 @@ import lote/auth.{Auth, Password}
 import lote/auth/session
 import lote/auth/user
 import lote/db/post_repo
+import lote/rate_limit
 import lote/realtime/pubsub
 import lote/test_helper
 import lustre/server_component
@@ -47,6 +48,7 @@ pub fn ws_init_authenticated_subscribes_to_revocations_and_stops_on_revocation_t
       secret_key_base: secret,
       methods: [Password],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   let login_req = simulate.browser_request(http.Post, "/auth/password/login")
@@ -105,6 +107,7 @@ pub fn ws_init_with_deleted_or_expired_session_unsubscribes_revocation_test() {
       secret_key_base: secret,
       methods: [Password],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   let login_req = simulate.browser_request(http.Post, "/auth/password/login")
@@ -140,7 +143,13 @@ pub fn ws_handle_message_ignores_malformed_json_and_stops_on_close_test() {
 
   let secret = "anon_ws_test_secret_key_base_0123456789abcdefghijklmnopqrstuv"
   let auth_ctx =
-    Auth(db: tx, secret_key_base: secret, methods: [], session_revocations:)
+    Auth(
+      db: tx,
+      secret_key_base: secret,
+      methods: [],
+      session_revocations:,
+      rate_limiter: rate_limit.disabled(),
+    )
 
   let ws_req = simulate.browser_request(http.Get, "/ws")
   let assert #(state, Some(_selector)) =
@@ -177,6 +186,7 @@ pub fn ws_stops_when_session_expires_via_timer_and_blocks_text_frames_after_expi
       secret_key_base: secret,
       methods: [Password],
       session_revocations:,
+      rate_limiter: rate_limit.disabled(),
     )
 
   let login_req = simulate.browser_request(http.Post, "/auth/password/login")

@@ -13,6 +13,7 @@ pub fn handle_request(
   req: wisp.Request,
   segments: List(String),
   auth_ctx: Auth,
+  client_ip: String,
 ) -> wisp.Response {
   case req.method, segments {
     http.Get, ["login"] -> {
@@ -48,7 +49,7 @@ pub fn handle_request(
 
     _, ["password", ..rest] ->
       case list.contains(auth_ctx.methods, Password) {
-        True -> password_handler.handle(req, rest, auth_ctx)
+        True -> password_handler.handle(req, rest, auth_ctx, client_ip)
         False -> wisp.not_found()
       }
 
