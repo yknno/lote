@@ -967,21 +967,26 @@ pub fn password_login_rate_limits_by_ip_and_account_and_resets_on_success_test()
   let bob_after_reset = submit_login("203.0.113.10", "rate_bob", "wrongpass")
   assert bob_after_reset.status == 200
 
-  // IP-wide limit (20/15m) blocks the 21st attempt from an IP even with fresh login_ids
+  // IP-wide limit (100/15m, burst 50) blocks the (burst+1)th attempt from an IP even with fresh login_ids
   let flood_ip = "198.51.100.9"
   let _ =
-    int.range(from: 1, to: 20, with: Nil, run: fn(_, _) {
-      let _ =
-        rate_limit.check(
-          rate_limiter,
-          "login:ip:" <> client_ip.rate_limit_bucket(flood_ip),
-          password_handler.ip_policy,
-        )
-      Nil
-    })
-  let ip_ok = submit_login(flood_ip, "brand_new_id_20", "wrong")
+    int.range(
+      from: 1,
+      to: password_handler.ip_policy.burst,
+      with: Nil,
+      run: fn(_, _) {
+        let _ =
+          rate_limit.check(
+            rate_limiter,
+            "login:ip:" <> client_ip.rate_limit_bucket(flood_ip),
+            password_handler.ip_policy,
+          )
+        Nil
+      },
+    )
+  let ip_ok = submit_login(flood_ip, "brand_new_id_last", "wrong")
   assert ip_ok.status == 200
-  let ip_limited = submit_login(flood_ip, "brand_new_id_21", "wrong")
+  let ip_limited = submit_login(flood_ip, "brand_new_id_over", "wrong")
   assert ip_limited.status == 429
 
   // IPv6 addresses rotating within the same /64 share the rate-limit bucket,
@@ -1003,7 +1008,7 @@ pub fn password_login_rate_limits_by_ip_and_account_and_resets_on_success_test()
   rate_limit.stop_memory(rate_limiter)
 }
 
-pub fn http_write_endpoints_enforce_user_and_ip_rate_limits_test() {
+pub fn http_write_endpoints_enforce_user_rate_limits_and_exempt_logout_test() {
   use tx <- test_helper.with_db
   let assert Ok(session_revocations) = pubsub.start()
   let assert Ok(post_pubsub) = pubsub.start()
@@ -1081,7 +1086,7 @@ pub fn http_write_endpoints_enforce_user_and_ip_rate_limits_test() {
     |> router.handle_request(auth_ctx, post_pubsub)
   assert bob_revoke.status == 303
 
-  // POST /auth/logout enforces per-IP write rate limit
+  // POST /auth/logout is intentionally exempt from rate limiting so users can always sign out
   let logout_ip = "203.0.113.88"
   let page_req = simulate.browser_request(http.Get, "/auth/login")
   let page_resp = router.handle_request(page_req, auth_ctx, post_pubsub)
@@ -1089,7 +1094,7 @@ pub fn http_write_endpoints_enforce_user_and_ip_rate_limits_test() {
   let _ =
     int.range(
       from: 1,
-      to: http_rate_limit.write_policy.burst + 1,
+      to: http_rate_limit.write_policy.burst + 5,
       with: Nil,
       run: fn(_, _) {
         let resp =
@@ -1101,44 +1106,6 @@ pub fn http_write_endpoints_enforce_user_and_ip_rate_limits_test() {
         Nil
       },
     )
-  let logout_limited =
-    simulate.browser_request(http.Post, "/auth/logout")
-    |> simulate.session(page_req, page_resp)
-    |> simulate.form_body([#(csrf.form_field_name, logout_csrf)])
-    |> router.handle_request_with_ip(auth_ctx, post_pubsub, logout_ip)
-  assert logout_limited.status == 429
-  assert response.get_header(logout_limited, "cache-control") == Ok("no-store")
-
-  // IPv6 logout writes rotating within the same /64 share a bucket
-  let _ =
-    int.range(
-      from: 1,
-      to: http_rate_limit.write_policy.burst + 1,
-      with: Nil,
-      run: fn(_, n) {
-        let resp =
-          simulate.browser_request(http.Post, "/auth/logout")
-          |> simulate.session(page_req, page_resp)
-          |> simulate.form_body([#(csrf.form_field_name, logout_csrf)])
-          |> router.handle_request_with_ip(
-            auth_ctx,
-            post_pubsub,
-            "2001:db8:feed:1::" <> int.to_string(n),
-          )
-        assert resp.status == 303
-        Nil
-      },
-    )
-  let logout_v6_limited =
-    simulate.browser_request(http.Post, "/auth/logout")
-    |> simulate.session(page_req, page_resp)
-    |> simulate.form_body([#(csrf.form_field_name, logout_csrf)])
-    |> router.handle_request_with_ip(
-      auth_ctx,
-      post_pubsub,
-      "2001:db8:feed:1:ffff::99",
-    )
-  assert logout_v6_limited.status == 429
 
   rate_limit.stop_memory(rate_limiter)
 }

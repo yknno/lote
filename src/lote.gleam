@@ -212,7 +212,7 @@ pub fn handler_with_proxy_hops(
 const max_expiry_timer_ms = 86_400_000
 
 pub const ws_connect_policy =
-  rate_limit.Policy(limit: 30, window_ms: 60_000, burst: 10)
+  rate_limit.Policy(limit: 120, window_ms: 60_000, burst: 60)
 
 pub const ws_frame_policy =
   rate_limit.Policy(limit: 30, window_ms: 10_000, burst: 30)
