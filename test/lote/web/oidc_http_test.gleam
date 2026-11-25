@@ -392,7 +392,14 @@ pub fn settings_clients_browser_workflow_secret_rotation_and_revocation_test() {
     ).status
     == 404
 
-  // Alice revokes secret1 -> 303 redirect, secret1 fails at /oidc/token, secret2 still works!
+  // Prior to revoking secret1, at1 (minted with secret1) authenticates on /api/v1/posts
+  assert dispatch(
+      simulate.request(http.Get, "/api/v1/posts")
+      |> request.set_header("authorization", "Bearer " <> at1),
+    ).status
+    == 200
+
+  // Alice revokes secret1 -> 303 redirect, publishes at1's grant revocation, secret1 & at1 immediately fail, secret2 still works!
   let revoke_s1_resp =
     simulate.browser_request(http.Post, s1_revoke_path)
     |> simulate.session(index_req, index_resp)
@@ -402,6 +409,8 @@ pub fn settings_clients_browser_workflow_secret_rotation_and_revocation_test() {
   assert response.get_header(revoke_s1_resp, "location")
     == Ok("/settings/clients")
 
+  let assert Ok(_rev_s1_grant) = process.receive(grant_rev_sub, 100)
+
   let revoked_s1_tok = token_with_secret(secret1)
   assert revoked_s1_tok.status == 401
   assert parse_error_code(revoked_s1_tok) == "invalid_client"
@@ -410,10 +419,17 @@ pub fn settings_clients_browser_workflow_secret_rotation_and_revocation_test() {
   assert still_valid_s2_tok.status == 200
   let assert #(at3, _, None) = parse_access_token(still_valid_s2_tok)
 
-  // Verify issued access tokens currently authenticate on /api/v1/posts
+  // at1 (from revoked secret1) is immediately rejected with 401, while at2 & at3 (from secret2) authenticate!
+  let revoked_at1_api =
+    simulate.request(http.Get, "/api/v1/posts")
+    |> request.set_header("authorization", "Bearer " <> at1)
+    |> dispatch
+  assert revoked_at1_api.status == 401
+  assert parse_error_code(revoked_at1_api) == "invalid_token"
+
   assert dispatch(
       simulate.request(http.Get, "/api/v1/posts")
-      |> request.set_header("authorization", "Bearer " <> at1),
+      |> request.set_header("authorization", "Bearer " <> at2),
     ).status
     == 200
   assert dispatch(
@@ -424,11 +440,11 @@ pub fn settings_clients_browser_workflow_secret_rotation_and_revocation_test() {
 
   let assert Ok(active_grants_before) =
     grant.list_active_grants_for_user(tx, alice.id)
-  assert list.length(active_grants_before) == 3
+  assert list.length(active_grants_before) == 2
   let expected_grant_ids =
     active_grants_before |> list.map(fn(g) { g.public_id }) |> set.from_list
 
-  // Alice deletes the Bot -> 303 redirect, publishes all active grant_ids, and tokens immediately 401!
+  // Alice deletes the Bot -> 303 redirect, publishes remaining active grant_ids, and tokens immediately 401!
   let delete_bot_resp =
     simulate.browser_request(
       http.Post,
@@ -443,21 +459,20 @@ pub fn settings_clients_browser_workflow_secret_rotation_and_revocation_test() {
 
   let assert Ok(rev1) = process.receive(grant_rev_sub, 100)
   let assert Ok(rev2) = process.receive(grant_rev_sub, 100)
-  let assert Ok(rev3) = process.receive(grant_rev_sub, 100)
-  assert set.from_list([rev1, rev2, rev3]) == expected_grant_ids
-
-  let after_del_api1 =
-    simulate.request(http.Get, "/api/v1/posts")
-    |> request.set_header("authorization", "Bearer " <> at1)
-    |> dispatch
-  assert after_del_api1.status == 401
-  assert parse_error_code(after_del_api1) == "invalid_token"
+  assert set.from_list([rev1, rev2]) == expected_grant_ids
 
   let after_del_api2 =
     simulate.request(http.Get, "/api/v1/posts")
     |> request.set_header("authorization", "Bearer " <> at2)
     |> dispatch
   assert after_del_api2.status == 401
+  assert parse_error_code(after_del_api2) == "invalid_token"
+
+  let after_del_api3 =
+    simulate.request(http.Get, "/api/v1/posts")
+    |> request.set_header("authorization", "Bearer " <> at3)
+    |> dispatch
+  assert after_del_api3.status == 401
 }
 
 pub fn oidc_token_client_credentials_auth_methods_origin_cookies_scopes_and_audience_test() {

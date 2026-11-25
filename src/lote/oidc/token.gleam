@@ -114,17 +114,20 @@ pub fn issue_client_credentials(
   requested_resource: Option(String),
   user_agent: String,
 ) -> Result(IssuedTokens, TokenError) {
-  use authed_client <- result.try(
-    case client.authenticate_secret(oidc_ctx.db, client_id, client_secret) {
-      Ok(c) -> Ok(c)
+  use #(authed_client, secret_id) <- result.try(
+    case
+      client.authenticate_secret_with_id(oidc_ctx.db, client_id, client_secret)
+    {
+      Ok(pair) -> Ok(pair)
       Error(client.InvalidClientCredentials) -> Error(InvalidClient)
       Error(_) -> Error(InternalError)
     },
   )
 
-  issue_client_credentials_for_client(
+  issue_client_credentials_with_secret(
     oidc_ctx,
     authed_client,
+    Some(secret_id),
     requested_scopes,
     requested_resource,
     user_agent,
@@ -134,6 +137,24 @@ pub fn issue_client_credentials(
 pub fn issue_client_credentials_for_client(
   oidc_ctx: Oidc,
   authed_client: Client,
+  requested_scopes: Option(Set(Scope)),
+  requested_resource: Option(String),
+  user_agent: String,
+) -> Result(IssuedTokens, TokenError) {
+  issue_client_credentials_with_secret(
+    oidc_ctx,
+    authed_client,
+    None,
+    requested_scopes,
+    requested_resource,
+    user_agent,
+  )
+}
+
+pub fn issue_client_credentials_with_secret(
+  oidc_ctx: Oidc,
+  authed_client: Client,
+  issued_by_secret_id: Option(Int),
   requested_scopes: Option(Set(Scope)),
   requested_resource: Option(String),
   user_agent: String,
@@ -201,9 +222,10 @@ pub fn issue_client_credentials_for_client(
         scopes,
         audience,
         user_agent,
+        issued_by_secret_id,
         expires_at
       )
-      VALUES ($1, $2, $3, $4, NOW() + ($5::bigint * INTERVAL '1 second'))
+      VALUES ($1, $2, $3, $4, $7, NOW() + ($5::bigint * INTERVAL '1 second'))
       RETURNING id, public_id
     ),
     new_token AS (
@@ -212,9 +234,10 @@ pub fn issue_client_credentials_for_client(
         grant_id,
         scopes,
         audience,
+        issued_by_secret_id,
         expires_at
       )
-      SELECT $6, id, $2, $3, NOW() + ($5::bigint * INTERVAL '1 second')
+      SELECT $6, id, $2, $3, $7, NOW() + ($5::bigint * INTERVAL '1 second')
       FROM new_grant
     )
     SELECT public_id FROM new_grant"
@@ -232,6 +255,7 @@ pub fn issue_client_credentials_for_client(
     |> pog.parameter(pog.text(clean_ua))
     |> pog.parameter(pog.int(access_token_ttl_seconds))
     |> pog.parameter(pog.bytea(at_hash))
+    |> pog.parameter(pog.nullable(pog.int, issued_by_secret_id))
     |> pog.returning(grant_id_decoder)
     |> pog.execute(oidc_ctx.db)
 
@@ -346,6 +370,26 @@ pub fn issue_authorization_code(
 pub fn exchange_authorization_code(
   oidc_ctx: Oidc,
   client: Client,
+  raw_code: String,
+  redirect_uri: String,
+  code_verifier: String,
+  requested_resource: Option(String),
+) -> Result(IssuedTokens, TokenError) {
+  exchange_authorization_code_with_secret(
+    oidc_ctx,
+    client,
+    None,
+    raw_code,
+    redirect_uri,
+    code_verifier,
+    requested_resource,
+  )
+}
+
+pub fn exchange_authorization_code_with_secret(
+  oidc_ctx: Oidc,
+  client: Client,
+  issued_by_secret_id: Option(Int),
   raw_code: String,
   redirect_uri: String,
   code_verifier: String,
@@ -498,6 +542,7 @@ pub fn exchange_authorization_code(
                     grant_id,
                     scopes,
                     audience,
+                    issued_by_secret_id,
                     expires_at
                   )
                   SELECT
@@ -505,6 +550,7 @@ pub fn exchange_authorization_code(
                     id,
                     $3,
                     $4,
+                    $8,
                     NOW() + ($5::bigint * INTERVAL '1 second')
                   FROM touch_grant
                 ),
@@ -531,6 +577,7 @@ pub fn exchange_authorization_code(
                 |> pog.parameter(pog.int(access_token_ttl_seconds))
                 |> pog.parameter(pog.bytea(rt_hash))
                 |> pog.parameter(pog.int(refresh_token_ttl_seconds))
+                |> pog.parameter(pog.nullable(pog.int, issued_by_secret_id))
                 |> pog.returning(decode.dynamic)
                 |> pog.execute(oidc_ctx.db)
 
@@ -580,6 +627,7 @@ pub fn exchange_authorization_code(
                     grant_id,
                     scopes,
                     audience,
+                    issued_by_secret_id,
                     expires_at
                   )
                   SELECT
@@ -587,6 +635,7 @@ pub fn exchange_authorization_code(
                     id,
                     $3,
                     $4,
+                    $6,
                     NOW() + ($5::bigint * INTERVAL '1 second')
                   FROM touch_grant
                 )
@@ -599,6 +648,7 @@ pub fn exchange_authorization_code(
                 |> pog.parameter(pog.array(pog.text, scope_strings))
                 |> pog.parameter(pog.text(audience))
                 |> pog.parameter(pog.int(access_token_ttl_seconds))
+                |> pog.parameter(pog.nullable(pog.int, issued_by_secret_id))
                 |> pog.returning(decode.dynamic)
                 |> pog.execute(oidc_ctx.db)
 
@@ -632,6 +682,24 @@ pub fn exchange_authorization_code(
 pub fn rotate_refresh_token(
   oidc_ctx: Oidc,
   client: Client,
+  raw_refresh_token: String,
+  requested_scopes: Option(Set(Scope)),
+  requested_resource: Option(String),
+) -> Result(IssuedTokens, TokenError) {
+  rotate_refresh_token_with_secret(
+    oidc_ctx,
+    client,
+    None,
+    raw_refresh_token,
+    requested_scopes,
+    requested_resource,
+  )
+}
+
+pub fn rotate_refresh_token_with_secret(
+  oidc_ctx: Oidc,
+  client: Client,
+  issued_by_secret_id: Option(Int),
   raw_refresh_token: String,
   requested_scopes: Option(Set(Scope)),
   requested_resource: Option(String),
@@ -770,6 +838,7 @@ pub fn rotate_refresh_token(
                 grant_id,
                 scopes,
                 audience,
+                issued_by_secret_id,
                 expires_at
               )
               SELECT
@@ -777,6 +846,7 @@ pub fn rotate_refresh_token(
                 id,
                 $4,
                 $5,
+                $8,
                 NOW() + ($6::bigint * INTERVAL '1 second')
               FROM touch_grant
             ),
@@ -803,6 +873,7 @@ pub fn rotate_refresh_token(
             |> pog.parameter(pog.text(audience))
             |> pog.parameter(pog.int(access_token_ttl_seconds))
             |> pog.parameter(pog.bytea(new_rt_hash))
+            |> pog.parameter(pog.nullable(pog.int, issued_by_secret_id))
             |> pog.returning(decode.dynamic)
             |> pog.execute(oidc_ctx.db)
 
