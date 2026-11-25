@@ -29,24 +29,31 @@ pub fn handle_request(
   segments: List(String),
   oidc_ctx: Oidc,
   post_pubsub: PubSub(timeline.PostEvent),
+  client_ip: String,
 ) -> wisp.Response {
   case req.method, segments {
-    http.Get, [] -> handle_list(req, oidc_ctx)
-    http.Post, [] -> handle_create(req, oidc_ctx, post_pubsub)
+    http.Get, [] -> handle_list(req, oidc_ctx, client_ip)
+    http.Post, [] -> handle_create(req, oidc_ctx, post_pubsub, client_ip)
     _, [] -> json_method_not_allowed([http.Get, http.Head, http.Post])
 
-    http.Get, [id] -> handle_show(req, id, oidc_ctx)
-    http.Delete, [id] -> handle_delete(req, id, oidc_ctx, post_pubsub)
+    http.Get, [id] -> handle_show(req, id, oidc_ctx, client_ip)
+    http.Delete, [id] ->
+      handle_delete(req, id, oidc_ctx, post_pubsub, client_ip)
     _, [_] -> json_method_not_allowed([http.Get, http.Head, http.Delete])
 
     _, _ -> json_error(404, "not_found")
   }
 }
 
-fn handle_list(req: wisp.Request, oidc_ctx: Oidc) -> wisp.Response {
+fn handle_list(
+  req: wisp.Request,
+  oidc_ctx: Oidc,
+  client_ip: String,
+) -> wisp.Response {
   use _principal <- bearer.authorize(
     req,
     oidc_ctx,
+    client_ip,
     scope.PostsRead,
     bearer.Read,
   )
@@ -74,10 +81,16 @@ fn handle_list(req: wisp.Request, oidc_ctx: Oidc) -> wisp.Response {
   }
 }
 
-fn handle_show(req: wisp.Request, id: String, oidc_ctx: Oidc) -> wisp.Response {
+fn handle_show(
+  req: wisp.Request,
+  id: String,
+  oidc_ctx: Oidc,
+  client_ip: String,
+) -> wisp.Response {
   use _principal <- bearer.authorize(
     req,
     oidc_ctx,
+    client_ip,
     scope.PostsRead,
     bearer.Read,
   )
@@ -96,10 +109,12 @@ fn handle_create(
   req: wisp.Request,
   oidc_ctx: Oidc,
   post_pubsub: PubSub(timeline.PostEvent),
+  client_ip: String,
 ) -> wisp.Response {
   use principal <- bearer.authorize(
     req,
     oidc_ctx,
+    client_ip,
     scope.PostsWrite,
     bearer.PostCreate,
   )
@@ -150,10 +165,12 @@ fn handle_delete(
   id: String,
   oidc_ctx: Oidc,
   post_pubsub: PubSub(timeline.PostEvent),
+  client_ip: String,
 ) -> wisp.Response {
   use principal <- bearer.authorize(
     req,
     oidc_ctx,
+    client_ip,
     scope.PostsDelete,
     bearer.Write,
   )

@@ -1453,7 +1453,7 @@ pub fn unified_three_layer_oidc_and_api_rate_limits_test() {
     router.handle_request_with_oidc(req, auth_ctx, oidc_ctx, post_pubsub, ip)
   }
 
-  // Part 1: Malformed client_id & malformed Bearer tokens fail fast after Layer 1 `http:ip:<ip>`
+  // Part 1: Malformed client_id & malformed Bearer tokens fail fast on O(1) format checks
   // without touching `oidc:ip` or creating per-client/per-token entries!
   let bad_format_ip = "198.51.100.10"
   let _ =
@@ -1488,12 +1488,12 @@ pub fn unified_three_layer_oidc_and_api_rate_limits_test() {
       assert r.status == 401
     })
 
-  // Only 1 row (`http:ip:198.51.100.10/32`) written across all 11 malformed requests!
-  assert count_rate_limit_rows() == initial_rl_rows + 1
+  // No rows written across all 11 malformed requests!
+  assert count_rate_limit_rows() == initial_rl_rows
   let rows_after_part1 = count_rate_limit_rows()
 
   // Part 2: Flooding 50 distinct valid-format non-existent `cli_<32hex>` IDs NEVER creates
-  // per-client_id rows in `rate_limits` (only `http:ip:<ip>` + `oidc:ip:<ip>` = 2 rows),
+  // per-client_id rows in `rate_limits` (only `oidc:ip:<ip>` = 1 row),
   // and blocks the 51st attempt with 429!
   let scanner_ip = "203.0.113.200"
   let _ =
@@ -1523,8 +1523,8 @@ pub fn unified_three_layer_oidc_and_api_rate_limits_test() {
       },
     )
 
-  // Only 2 rows created for scanner_ip (`http:ip` + `oidc:ip`) despite 50 distinct fake client_ids!
-  assert count_rate_limit_rows() == rows_after_part1 + 2
+  // Only 1 row created for scanner_ip (`oidc:ip`) despite 50 distinct fake client_ids!
+  assert count_rate_limit_rows() == rows_after_part1 + 1
 
   let scanner_blocked =
     simulate.request(http.Post, "/oidc/token")
@@ -1908,4 +1908,63 @@ pub fn grant_revocations_pubsub_adapter_memory_and_postgres_test() {
   assert encode("gid-1") == "gid-1"
   assert decode("gid-1") == Ok("gid-1")
   assert decode("") == Error(Nil)
+}
+
+pub fn bearer_invalid_token_failures_are_rate_limited_per_ip_before_db_lookup_test() {
+  use tx <- test_helper.with_db
+  let pg_limiter = rate_limit.postgres(tx, test_secret)
+  let #(auth_ctx, oidc_ctx, post_pubsub, _grant_revocations) =
+    setup_contexts(tx, pg_limiter)
+
+  let dispatch_ip = fn(req: wisp.Request, ip: String) {
+    router.handle_request_with_oidc(req, auth_ctx, oidc_ctx, post_pubsub, ip)
+  }
+  let get_with_token = fn(tok: String, ip: String) {
+    simulate.request(http.Get, "/api/v1/posts")
+    |> request.set_header("authorization", "Bearer " <> tok)
+    |> dispatch_ip(ip)
+  }
+
+  let flood_ip = "198.51.100.77"
+  let fake_token = fn(idx: Int) {
+    "lote_at_" <> string.pad_start(int.to_string(idx), to: 43, with: "A")
+  }
+
+  // Well-formed but unknown tokens are rejected with 401 until the per-IP
+  // failure budget (burst) is exhausted...
+  let _ =
+    int.range(
+      from: 1,
+      to: bearer.auth_fail_ip_policy.burst + 1,
+      with: Nil,
+      run: fn(_, idx) {
+        let r = get_with_token(fake_token(idx), flood_ip)
+        assert r.status == 401
+        assert parse_error_code(r) == "invalid_token"
+        Nil
+      },
+    )
+
+  // ...then further attempts from the same IP bucket get 429 up front.
+  let blocked = get_with_token(fake_token(999), flood_ip)
+  assert blocked.status == 429
+  let assert Ok(_) = response.get_header(blocked, "retry-after")
+
+  // A different IP bucket is unaffected.
+  let other = get_with_token(fake_token(1000), "198.51.100.78")
+  assert other.status == 401
+
+  // Malformed tokens never consume the failure budget (O(1) format check first).
+  let fresh_ip = "198.51.100.79"
+  let _ =
+    int.range(
+      from: 1,
+      to: bearer.auth_fail_ip_policy.burst + 5,
+      with: Nil,
+      run: fn(_, _) {
+        assert get_with_token("lote_at_short", fresh_ip).status == 401
+        Nil
+      },
+    )
+  assert get_with_token(fake_token(1), fresh_ip).status == 401
 }

@@ -8,6 +8,7 @@ import lote/oidc.{type Oidc, type Principal}
 import lote/oidc/scope.{type Scope}
 import lote/oidc/token
 import lote/rate_limit.{type Limiter, type Policy}
+import lote/web/client_ip
 import lote/web/rate_policy
 import wisp
 
@@ -22,6 +23,8 @@ pub const user_write_policy = rate_policy.http_write_user_policy
 pub const client_post_create_policy = rate_policy.post_create_client_policy
 
 pub const user_post_create_policy = rate_policy.post_create_user_policy
+
+pub const auth_fail_ip_policy = rate_policy.api_auth_fail_ip_policy
 
 const bearer_realm = "Bearer realm=\"lote\""
 
@@ -42,11 +45,12 @@ pub type ApiTier {
 pub fn authorize(
   req: wisp.Request,
   oidc_ctx: Oidc,
+  client_ip: String,
   required_scope: Scope,
   tier: ApiTier,
   next: fn(Principal) -> wisp.Response,
 ) -> wisp.Response {
-  use principal <- authenticate(req, oidc_ctx)
+  use principal <- authenticate(req, oidc_ctx, client_ip)
   use <- require_scope(principal, required_scope)
   enforce_tier_rate_limit(oidc_ctx.rate_limiter, principal, tier, fn() {
     next(principal)
@@ -56,6 +60,7 @@ pub fn authorize(
 pub fn authenticate(
   req: wisp.Request,
   oidc_ctx: Oidc,
+  client_ip: String,
   next: fn(Principal) -> wisp.Response,
 ) -> wisp.Response {
   let auth_headers =
@@ -81,16 +86,12 @@ pub fn authenticate(
                   case token.is_valid_token_format("lote_at_", raw_token) {
                     False -> invalid_token_response()
                     True ->
-                      case
-                        token.authenticate_access_token(
-                          oidc_ctx.db,
-                          raw_token,
-                          Some(oidc_ctx.issuer),
-                        )
-                      {
-                        Ok(principal) -> next(principal)
-                        Error(_) -> invalid_token_response()
-                      }
+                      authenticate_with_failure_limit(
+                        oidc_ctx,
+                        client_ip,
+                        raw_token,
+                        next,
+                      )
                   }
               }
             }
@@ -100,6 +101,45 @@ pub fn authenticate(
     }
 
     _ -> unauthorized_response()
+  }
+}
+
+/// Looks up a well-formed access token while bounding DB lookups for invalid
+/// tokens per client IP bucket. Only failures are recorded (`check`); while the
+/// IP bucket is limited, requests are rejected up front (`peek`) without a DB
+/// lookup, so valid bots sharing an IP are never throttled by this guard.
+fn authenticate_with_failure_limit(
+  oidc_ctx: Oidc,
+  client_ip: String,
+  raw_token: String,
+  next: fn(Principal) -> wisp.Response,
+) -> wisp.Response {
+  let fail_key =
+    client_ip
+    |> client_ip.rate_limit_bucket
+    |> rate_policy.api_auth_fail_ip_key
+  let policy = rate_policy.api_auth_fail_ip_policy
+
+  case rate_limit.peek(oidc_ctx.rate_limiter, fail_key, policy) {
+    rate_limit.Limited(retry_after_seconds:) ->
+      too_many_requests(retry_after_seconds)
+
+    rate_limit.Allowed(_) ->
+      case
+        token.authenticate_access_token(
+          oidc_ctx.db,
+          raw_token,
+          Some(oidc_ctx.issuer),
+        )
+      {
+        Ok(principal) -> next(principal)
+        Error(_) ->
+          case rate_limit.check(oidc_ctx.rate_limiter, fail_key, policy) {
+            rate_limit.Limited(retry_after_seconds:) ->
+              too_many_requests(retry_after_seconds)
+            rate_limit.Allowed(_) -> invalid_token_response()
+          }
+      }
   }
 }
 

@@ -2,17 +2,12 @@ import gleam/int
 import lote/rate_limit.{Policy}
 
 // ---------------------------------------------------------------------------
-// Layer 1: Baseline Transport & IP Guards
+// Layer 1: WebSocket Transport Guards
+//
+// Volumetric per-IP HTTP flood protection is intentionally left to the
+// infrastructure edge (CDN / WAF / load balancer). The application only limits
+// the WebSocket transport, where each handshake spawns a server component.
 // ---------------------------------------------------------------------------
-
-/// Baseline front-door HTTP rate limit per client IP (/32 IPv4 or /64 IPv6).
-/// Applied across Web, OIDC, and API routes (exempting `/health`, `/static/*`
-/// hits, and `POST /auth/logout`).
-pub const http_ip_policy = Policy(limit: 300, window_ms: 60_000, burst: 120)
-
-pub fn http_ip_key(ip_bucket: String) -> String {
-  "http:ip:" <> ip_bucket
-}
 
 /// WebSocket `/ws` handshake rate limit per client IP bucket.
 pub const ws_connect_policy = Policy(limit: 120, window_ms: 60_000, burst: 60)
@@ -112,6 +107,15 @@ pub const oidc_client_auth_policy =
 
 pub fn oidc_client_auth_key(ip_bucket: String, client_id: String) -> String {
   "oidc:client_auth:ip_id:" <> ip_bucket <> ":" <> client_id
+}
+
+/// Per-IP Bearer API authentication failure ceiling. Only failed token lookups
+/// are recorded; while limited, requests are rejected before any DB lookup.
+pub const api_auth_fail_ip_policy =
+  Policy(limit: 20, window_ms: 900_000, burst: 20)
+
+pub fn api_auth_fail_ip_key(ip_bucket: String) -> String {
+  "api:auth_fail:ip:" <> ip_bucket
 }
 
 /// Per-OAuth-client post creation ceiling (`POST /api/v1/posts`).
