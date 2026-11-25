@@ -3,7 +3,6 @@ import gleam/http/response
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
-import gleam/string
 import lote/auth.{type Auth}
 import lote/auth/password
 import lote/auth/session
@@ -50,53 +49,70 @@ fn handle_login(
     Ok(login_id), Ok(pass) -> {
       let ip_bucket = client_ip.rate_limit_bucket(client_ip)
       let ip_key = rate_policy.login_ip_key(ip_bucket)
-      let normalized_id = string.lowercase(string.trim(login_id))
-      let account_key = rate_policy.login_account_key(ip_bucket, normalized_id)
 
-      case check_login_limits(auth_ctx.rate_limiter, ip_key, account_key) {
-        rate_limit.Limited(retry_after_seconds:) ->
-          too_many_requests_login(auth_ctx, csrf_token, retry_after_seconds)
-        rate_limit.Allowed(_) ->
-          case password.authenticate(auth_ctx.db, login_id, pass) {
-            Ok(auth_user) -> {
-              rate_limit.reset(auth_ctx.rate_limiter, account_key)
-              let previous_session_id =
-                session.session_id(req, auth_ctx.secret_key_base)
-              let _ =
-                session.destroy(
-                  wisp.ok(),
-                  req,
-                  auth_ctx.db,
-                  auth_ctx.secret_key_base,
-                )
-              case
-                session.create(
-                  wisp.redirect(to: "/"),
-                  req,
-                  auth_ctx.db,
-                  auth_ctx.secret_key_base,
-                  auth_user,
-                )
-              {
-                Ok(resp) -> {
-                  case previous_session_id {
-                    Some(prev_id) ->
-                      pubsub.publish(auth_ctx.session_revocations, prev_id)
-                    None -> Nil
-                  }
-                  csrf.rotate_cookie(resp, req, auth_ctx.secret_key_base)
-                }
-                Error(_) -> wisp.internal_server_error()
-              }
-            }
-            Error(password.InvalidCredentials) ->
+      case password.normalize_login_id(login_id) {
+        Error(_) ->
+          case rate_limit.check(auth_ctx.rate_limiter, ip_key, ip_policy) {
+            rate_limit.Limited(retry_after_seconds:) ->
+              too_many_requests_login(auth_ctx, csrf_token, retry_after_seconds)
+            rate_limit.Allowed(_) ->
               view.login_page(
                 auth_ctx.methods,
                 Some("ID またはパスワードが正しくありません"),
                 csrf_token,
               )
-            Error(_) -> wisp.internal_server_error()
           }
+
+        Ok(normalized_id) -> {
+          let account_key =
+            rate_policy.login_account_key(ip_bucket, normalized_id)
+
+          case check_login_limits(auth_ctx.rate_limiter, ip_key, account_key) {
+            rate_limit.Limited(retry_after_seconds:) ->
+              too_many_requests_login(auth_ctx, csrf_token, retry_after_seconds)
+            rate_limit.Allowed(_) ->
+              case password.authenticate(auth_ctx.db, normalized_id, pass) {
+                Ok(auth_user) -> {
+                  rate_limit.reset(auth_ctx.rate_limiter, account_key)
+                  let previous_session_id =
+                    session.session_id(req, auth_ctx.secret_key_base)
+                  let _ =
+                    session.destroy(
+                      wisp.ok(),
+                      req,
+                      auth_ctx.db,
+                      auth_ctx.secret_key_base,
+                    )
+                  case
+                    session.create(
+                      wisp.redirect(to: "/"),
+                      req,
+                      auth_ctx.db,
+                      auth_ctx.secret_key_base,
+                      auth_user,
+                    )
+                  {
+                    Ok(resp) -> {
+                      case previous_session_id {
+                        Some(prev_id) ->
+                          pubsub.publish(auth_ctx.session_revocations, prev_id)
+                        None -> Nil
+                      }
+                      csrf.rotate_cookie(resp, req, auth_ctx.secret_key_base)
+                    }
+                    Error(_) -> wisp.internal_server_error()
+                  }
+                }
+                Error(password.InvalidCredentials) ->
+                  view.login_page(
+                    auth_ctx.methods,
+                    Some("ID またはパスワードが正しくありません"),
+                    csrf_token,
+                  )
+                Error(_) -> wisp.internal_server_error()
+              }
+          }
+        }
       }
     }
     _, _ -> view.login_page(auth_ctx.methods, Some("入力が不足しています"), csrf_token)
