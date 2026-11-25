@@ -22,6 +22,7 @@ import lote/rate_limit
 import lote/realtime/pubsub.{type PubSub}
 import lote/web/client_ip
 import lote/web/components/timeline
+import lote/web/cookie_policy
 import lote/web/csrf
 import lote/web/origin
 import lote/web/rate_policy
@@ -271,6 +272,8 @@ pub fn handler_with_oidc(
   trusted_proxy_hops: Int,
 ) -> fn(Request(Connection)) -> Response(ResponseData) {
   fn(req: Request(Connection)) -> Response(ResponseData) {
+    let req =
+      cookie_policy.apply_trusted_forwarded_proto(req, trusted_proxy_hops)
     let ip = client_ip.from_mist_request(req, trusted_proxy_hops)
     case request.path_segments(req) {
       ["ws"] -> serve_timeline_ws(req, db, post_pubsub, auth_ctx, ip)

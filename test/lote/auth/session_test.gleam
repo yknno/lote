@@ -3,6 +3,7 @@ import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/http
 import gleam/http/request
+import gleam/http/response
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -27,6 +28,16 @@ pub fn create_verify_and_destroy_session_with_custom_secret_test() {
   let req = simulate.browser_request(http.Post, "/auth/password/login")
   let assert Ok(resp) = session.create(wisp.ok(), req, tx, secret, created)
 
+  let assert Ok(set_cookie_header) = response.get_header(resp, "set-cookie")
+  assert string.starts_with(
+    set_cookie_header,
+    session.secure_cookie_name <> "=",
+  )
+  assert string.contains(set_cookie_header, "Secure")
+  assert string.contains(set_cookie_header, "HttpOnly")
+  assert string.contains(set_cookie_header, "Path=/")
+  assert !string.contains(string.lowercase(set_cookie_header), "domain=")
+
   let authed_req =
     simulate.browser_request(http.Get, "/")
     |> simulate.session(req, resp)
@@ -35,6 +46,16 @@ pub fn create_verify_and_destroy_session_with_custom_secret_test() {
   // Verifying with a different secret must fail
   assert session.current_user(authed_req, tx, simulate.default_secret_key_base)
     == None
+
+  // Subdomain cookie-tossing defense: unprefixed lote_session_id is rejected on HTTPS
+  let assert Some(sid) = session.session_id(authed_req, secret)
+  let signed_sid =
+    crypto.sign_message(<<sid:utf8>>, <<secret:utf8>>, crypto.Sha512)
+  let tossed_req =
+    simulate.browser_request(http.Get, "/")
+    |> request.set_cookie(session.cookie_name, signed_sid)
+  assert session.session_id(tossed_req, secret) == None
+  assert session.current_user(tossed_req, tx, secret) == None
 
   let logout_req =
     simulate.browser_request(http.Post, "/auth/logout")
@@ -89,14 +110,17 @@ pub fn empty_or_tampered_session_cookie_is_rejected_test() {
   // must not be treated as a candidate session ID.
   let empty_cookie_req =
     simulate.browser_request(http.Get, "/")
-    |> request.set_cookie("lote_session_id", empty_signed)
+    |> request.set_cookie(session.secure_cookie_name, empty_signed)
   assert session.session_id(empty_cookie_req, secret) == None
   assert session.current_session(empty_cookie_req, tx, secret) == None
 
   // Tampered signature is rejected
   let tampered_req =
     simulate.browser_request(http.Get, "/")
-    |> request.set_cookie("lote_session_id", empty_signed <> "tampered")
+    |> request.set_cookie(
+      session.secure_cookie_name,
+      empty_signed <> "tampered",
+    )
   assert session.session_id(tampered_req, secret) == None
   assert session.current_session(tampered_req, tx, secret) == None
 }

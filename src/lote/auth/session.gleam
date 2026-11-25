@@ -5,14 +5,8 @@ import cake/insert as i
 import cake/join as j
 import cake/select as s
 import cake/where as w
-import gleam/bit_array
-import gleam/crypto
 import gleam/dynamic/decode
-import gleam/http
-import gleam/http/cookie
 import gleam/http/request.{type Request}
-import gleam/http/response
-import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
@@ -20,10 +14,13 @@ import gleam/time/calendar
 import gleam/time/timestamp.{type Timestamp}
 import lote/auth/user.{type AuthUser, AuthUser}
 import lote/db/uuid
+import lote/web/cookie_policy
 import pog
 import wisp
 
-const cookie_name = "lote_session_id"
+pub const cookie_name = "lote_session_id"
+
+pub const secure_cookie_name = "__Host-lote_session_id"
 
 const max_age_seconds = 604_800
 
@@ -318,19 +315,7 @@ fn read_session_id(
   req: Request(body),
   secret_key_base: String,
 ) -> Result(String, Nil) {
-  use raw <- result.try(
-    req
-    |> request.get_cookies
-    |> list.key_find(cookie_name),
-  )
-  use bits <- result.try(
-    crypto.verify_signed_message(raw, <<secret_key_base:utf8>>),
-  )
-  use id <- result.try(bit_array.to_string(bits))
-  case id {
-    "" -> Error(Nil)
-    _ -> Ok(id)
-  }
+  cookie_policy.read_signed(req, cookie_name, secret_key_base)
 }
 
 fn set_cookie(
@@ -340,19 +325,14 @@ fn set_cookie(
   secret_key_base: String,
   max_age: Int,
 ) -> wisp.Response {
-  let scheme = case req.host {
-    "localhost" | "127.0.0.1" | "[::1]" if req.scheme == http.Http ->
-      case request.get_header(req, "x-forwarded-proto") {
-        Ok(_) -> http.Https
-        Error(_) -> http.Http
-      }
-    _ -> http.Https
-  }
-  let attributes =
-    cookie.Attributes(..cookie.defaults(scheme), max_age: Some(max_age))
-  let signed =
-    crypto.sign_message(<<value:utf8>>, <<secret_key_base:utf8>>, crypto.Sha512)
-  response.set_cookie(resp, cookie_name, signed, attributes)
+  cookie_policy.set_signed(
+    resp,
+    req,
+    cookie_name,
+    value,
+    secret_key_base,
+    max_age,
+  )
 }
 
 fn timestamptz_decoder() -> decode.Decoder(Timestamp) {

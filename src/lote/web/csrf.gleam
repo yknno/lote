@@ -1,15 +1,13 @@
-import gleam/bit_array
 import gleam/crypto
-import gleam/http
-import gleam/http/cookie
 import gleam/http/request.{type Request}
-import gleam/http/response
 import gleam/list
-import gleam/option.{Some}
 import gleam/result
+import lote/web/cookie_policy
 import wisp
 
 pub const cookie_name = "lote_csrf_token"
+
+pub const secure_cookie_name = "__Host-lote_csrf_token"
 
 pub const form_field_name = "_csrf"
 
@@ -50,19 +48,7 @@ pub fn read_token(
   req: Request(body),
   secret_key_base: String,
 ) -> Result(String, Nil) {
-  use raw <- result.try(
-    req
-    |> request.get_cookies
-    |> list.key_find(cookie_name),
-  )
-  use bits <- result.try(
-    crypto.verify_signed_message(raw, <<secret_key_base:utf8>>),
-  )
-  use token <- result.try(bit_array.to_string(bits))
-  case token {
-    "" -> Error(Nil)
-    _ -> Ok(token)
-  }
+  cookie_policy.read_signed(req, cookie_name, secret_key_base)
 }
 
 pub fn verify_form_token(
@@ -96,19 +82,14 @@ fn set_cookie(
   token: String,
   secret_key_base: String,
 ) -> wisp.Response {
-  let scheme = case req.host {
-    "localhost" | "127.0.0.1" | "[::1]" if req.scheme == http.Http ->
-      case request.get_header(req, "x-forwarded-proto") {
-        Ok(_) -> http.Https
-        Error(_) -> http.Http
-      }
-    _ -> http.Https
-  }
-  let attributes =
-    cookie.Attributes(..cookie.defaults(scheme), max_age: Some(max_age_seconds))
-  let signed =
-    crypto.sign_message(<<token:utf8>>, <<secret_key_base:utf8>>, crypto.Sha512)
-  response.set_cookie(resp, cookie_name, signed, attributes)
+  cookie_policy.set_signed(
+    resp,
+    req,
+    cookie_name,
+    token,
+    secret_key_base,
+    max_age_seconds,
+  )
 }
 
 fn constant_time_equal(a: String, b: String) -> Bool {
