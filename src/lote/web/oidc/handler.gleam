@@ -41,7 +41,7 @@ type CredentialExtractError {
 }
 
 type ClientAuthOutcome {
-  ClientAuthenticated(Client)
+  ClientAuthenticated(Client, Option(Int))
   ClientAuthRejected(wisp.Response)
 }
 
@@ -82,42 +82,58 @@ fn handle_token(
       use client_id <- require_valid_client_id(creds)
       let ip_bucket = client_ip.rate_limit_bucket(client_ip)
       use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
-      use authed_client <- with_authenticated_client(
+      use authed_client, secret_id <- with_authenticated_client(
         oidc_ctx,
         client_id,
         creds,
         ip_bucket,
         True,
       )
-      handle_client_credentials_grant(req, oidc_ctx, authed_client, form_values)
+      handle_client_credentials_grant(
+        req,
+        oidc_ctx,
+        authed_client,
+        secret_id,
+        form_values,
+      )
     }
 
     Ok("authorization_code") -> {
       use client_id <- require_valid_client_id(creds)
       let ip_bucket = client_ip.rate_limit_bucket(client_ip)
       use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
-      use authed_client <- with_authenticated_client(
+      use authed_client, secret_id <- with_authenticated_client(
         oidc_ctx,
         client_id,
         creds,
         ip_bucket,
         False,
       )
-      handle_authorization_code_grant(oidc_ctx, authed_client, form_values)
+      handle_authorization_code_grant(
+        oidc_ctx,
+        authed_client,
+        secret_id,
+        form_values,
+      )
     }
 
     Ok("refresh_token") -> {
       use client_id <- require_valid_client_id(creds)
       let ip_bucket = client_ip.rate_limit_bucket(client_ip)
       use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
-      use authed_client <- with_authenticated_client(
+      use authed_client, secret_id <- with_authenticated_client(
         oidc_ctx,
         client_id,
         creds,
         ip_bucket,
         False,
       )
-      handle_refresh_token_grant(oidc_ctx, authed_client, form_values)
+      handle_refresh_token_grant(
+        oidc_ctx,
+        authed_client,
+        secret_id,
+        form_values,
+      )
     }
 
     Ok(_) -> oauth_error(400, "unsupported_grant_type", None)
@@ -128,6 +144,7 @@ fn handle_client_credentials_grant(
   req: wisp.Request,
   oidc_ctx: Oidc,
   authed_client: Client,
+  secret_id: Option(Int),
   form_values: List(#(String, String)),
 ) -> wisp.Response {
   let result = {
@@ -135,9 +152,10 @@ fn handle_client_credentials_grant(
     let requested_resource = optional_non_empty_param(form_values, "resource")
     let user_agent = request.get_header(req, "user-agent") |> result.unwrap("")
 
-    token.issue_client_credentials_for_client(
+    token.issue_client_credentials_with_secret(
       oidc_ctx,
       authed_client,
+      secret_id,
       requested_scopes,
       requested_resource,
       user_agent,
@@ -153,6 +171,7 @@ fn handle_client_credentials_grant(
 fn handle_authorization_code_grant(
   oidc_ctx: Oidc,
   authed_client: Client,
+  secret_id: Option(Int),
   form_values: List(#(String, String)),
 ) -> wisp.Response {
   let result = {
@@ -171,9 +190,10 @@ fn handle_authorization_code_grant(
     ))
     let requested_resource = optional_non_empty_param(form_values, "resource")
 
-    token.exchange_authorization_code(
+    token.exchange_authorization_code_with_secret(
       oidc_ctx,
       authed_client,
+      secret_id,
       code,
       redirect_uri,
       code_verifier,
@@ -190,6 +210,7 @@ fn handle_authorization_code_grant(
 fn handle_refresh_token_grant(
   oidc_ctx: Oidc,
   authed_client: Client,
+  secret_id: Option(Int),
   form_values: List(#(String, String)),
 ) -> wisp.Response {
   let result = {
@@ -204,9 +225,10 @@ fn handle_refresh_token_grant(
     use requested_scopes <- result.try(parse_optional_scopes(form_values))
     let requested_resource = optional_non_empty_param(form_values, "resource")
 
-    token.rotate_refresh_token(
+    token.rotate_refresh_token_with_secret(
       oidc_ctx,
       authed_client,
+      secret_id,
       raw_refresh_token,
       requested_scopes,
       requested_resource,
@@ -229,7 +251,7 @@ fn handle_revoke(
   use client_id <- require_valid_client_id(creds)
 
   let ip_bucket = client_ip.rate_limit_bucket(client_ip)
-  use authed_client <- with_authenticated_client(
+  use authed_client, _secret_id <- with_authenticated_client(
     oidc_ctx,
     client_id,
     creds,
@@ -258,7 +280,7 @@ fn handle_introspect(
 
   let ip_bucket = client_ip.rate_limit_bucket(client_ip)
   use <- require_ip_endpoint_limit(oidc_ctx.rate_limiter, ip_bucket)
-  use authed_client <- with_authenticated_client(
+  use authed_client, _secret_id <- with_authenticated_client(
     oidc_ctx,
     client_id,
     creds,
@@ -329,7 +351,7 @@ fn with_authenticated_client(
   creds: ExtractedCredentials,
   ip_bucket: String,
   require_confidential: Bool,
-  next: fn(Client) -> wisp.Response,
+  next: fn(Client, Option(Int)) -> wisp.Response,
 ) -> wisp.Response {
   case
     authenticate_client_with_limits(
@@ -340,7 +362,7 @@ fn with_authenticated_client(
       require_confidential,
     )
   {
-    ClientAuthenticated(authed) -> next(authed)
+    ClientAuthenticated(authed, secret_id) -> next(authed, secret_id)
     ClientAuthRejected(resp) -> resp
   }
 }
@@ -382,15 +404,15 @@ fn authenticate_client_with_limits(
 
                     True ->
                       case
-                        client.authenticate_secret_for_client(
+                        client.authenticate_secret_with_id_for_client(
                           oidc_ctx.db,
                           found,
                           raw_secret,
                         )
                       {
-                        Ok(authed) -> {
+                        Ok(#(authed, secret_id)) -> {
                           rate_limit.reset(oidc_ctx.rate_limiter, ip_client_key)
-                          ClientAuthenticated(authed)
+                          ClientAuthenticated(authed, Some(secret_id))
                         }
                         Error(client.InvalidClientCredentials) ->
                           ClientAuthRejected(invalid_client_response())
@@ -410,7 +432,7 @@ fn authenticate_client_with_limits(
           case require_confidential, creds.client_secret, creds.used_basic {
             True, _, _ | _, Some(_), _ | _, _, True ->
               ClientAuthRejected(invalid_client_response())
-            False, None, False -> ClientAuthenticated(found)
+            False, None, False -> ClientAuthenticated(found, None)
           }
       }
   }

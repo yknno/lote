@@ -722,28 +722,66 @@ pub fn revoke_secret(
   client_id: String,
   secret_public_id: String,
 ) -> Result(Bool, pog.QueryError) {
+  revoke_secret_returning_grants(db, owner_user_id, client_id, secret_public_id)
+  |> result.map(option.is_some)
+}
+
+pub fn revoke_secret_returning_grants(
+  db: pog.Connection,
+  owner_user_id: Int,
+  client_id: String,
+  secret_public_id: String,
+) -> Result(Option(List(String)), pog.QueryError) {
   case is_valid_client_id_format(client_id), uuid.normalize(secret_public_id) {
-    False, _ | _, Error(_) -> Ok(False)
+    False, _ | _, Error(_) -> Ok(None)
     True, Ok(normalized) -> {
       let sql =
-        "DELETE FROM oidc_client_secrets s
-        USING oidc_clients c
-        WHERE s.client_ref_id = c.id
-          AND s.public_id = $1::uuid
-          AND c.client_id = $2
-          AND c.owner_user_id = $3
-        RETURNING s.id"
+        "WITH target_secret AS (
+          DELETE FROM oidc_client_secrets s
+          USING oidc_clients c
+          WHERE s.client_ref_id = c.id
+            AND s.public_id = $1::uuid
+            AND c.client_id = $2
+            AND c.owner_user_id = $3
+          RETURNING s.id
+        ),
+        revoked_grants AS (
+          SELECT g.public_id
+          FROM oidc_grants g
+          INNER JOIN target_secret ts ON ts.id = g.issued_by_secret_id
+          WHERE g.expires_at > NOW()
+        )
+        SELECT ts.id, rg.public_id
+        FROM target_secret ts
+        LEFT JOIN revoked_grants rg ON TRUE"
+
+      let decoder = {
+        use deleted_id <- decode.field(0, decode.int)
+        use grant_public_id <- decode.field(1, decode.optional(uuid.decoder()))
+        decode.success(#(deleted_id, grant_public_id))
+      }
 
       use returned <- result.map(
         pog.query(sql)
         |> pog.parameter(pog.text(normalized))
         |> pog.parameter(pog.text(client_id))
         |> pog.parameter(pog.int(owner_user_id))
-        |> pog.returning(decode.dynamic)
+        |> pog.returning(decoder)
         |> pog.execute(db),
       )
 
-      returned.rows != []
+      case returned.rows {
+        [] -> None
+        rows ->
+          rows
+          |> list.filter_map(fn(row) {
+            case row.1 {
+              Some(gid) -> Ok(gid)
+              None -> Error(Nil)
+            }
+          })
+          |> Some
+      }
     }
   }
 }
@@ -808,6 +846,15 @@ pub fn authenticate_secret_for_client(
   client: Client,
   raw_secret: String,
 ) -> Result(Client, Error) {
+  authenticate_secret_with_id_for_client(db, client, raw_secret)
+  |> result.map(fn(pair) { pair.0 })
+}
+
+pub fn authenticate_secret_with_id_for_client(
+  db: pog.Connection,
+  client: Client,
+  raw_secret: String,
+) -> Result(#(Client, Int), Error) {
   case client.kind, is_valid_secret_format(raw_secret) {
     PublicApp, _ | Cimd, _ | _, False -> Error(InvalidClientCredentials)
     SubordinateBot, True | ConfidentialApp, True -> {
@@ -832,11 +879,12 @@ pub fn authenticate_secret_for_client(
               OR oidc_client_secrets.last_used_at < NOW() - INTERVAL '60 seconds'
             )
         )
-        SELECT secret_hash FROM matched"
+        SELECT id, secret_hash FROM matched"
 
       let decoder = {
-        use stored_hash <- decode.field(0, decode.bit_array)
-        decode.success(stored_hash)
+        use secret_id <- decode.field(0, decode.int)
+        use stored_hash <- decode.field(1, decode.bit_array)
+        decode.success(#(secret_id, stored_hash))
       }
 
       let result =
@@ -847,9 +895,9 @@ pub fn authenticate_secret_for_client(
         |> pog.execute(db)
 
       case result {
-        Ok(pog.Returned(rows: [stored_hash, ..], ..)) ->
+        Ok(pog.Returned(rows: [#(secret_id, stored_hash), ..], ..)) ->
           case crypto.secure_compare(secret_hash, stored_hash) {
-            True -> Ok(client)
+            True -> Ok(#(client, secret_id))
             False -> Error(InvalidClientCredentials)
           }
         Ok(pog.Returned(rows: [], ..)) -> Error(InvalidClientCredentials)
@@ -864,13 +912,23 @@ pub fn authenticate_secret(
   client_id: String,
   raw_secret: String,
 ) -> Result(Client, Error) {
+  authenticate_secret_with_id(db, client_id, raw_secret)
+  |> result.map(fn(pair) { pair.0 })
+}
+
+pub fn authenticate_secret_with_id(
+  db: pog.Connection,
+  client_id: String,
+  raw_secret: String,
+) -> Result(#(Client, Int), Error) {
   case
     is_valid_client_id_format(client_id) && is_valid_secret_format(raw_secret)
   {
     False -> Error(InvalidClientCredentials)
     True ->
       case find_by_client_id(db, client_id) {
-        Ok(Some(found)) -> authenticate_secret_for_client(db, found, raw_secret)
+        Ok(Some(found)) ->
+          authenticate_secret_with_id_for_client(db, found, raw_secret)
         Ok(None) -> Error(InvalidClientCredentials)
         Error(_) -> Error(InternalError)
       }

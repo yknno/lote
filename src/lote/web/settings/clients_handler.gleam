@@ -254,15 +254,18 @@ fn handle_revoke_secret(
       )
 
       case
-        client.revoke_secret(
+        client.revoke_secret_returning_grants(
           oidc_ctx.db,
           active.user.id,
           client_id,
           secret_public_id,
         )
       {
-        Ok(True) -> wisp.redirect(to: "/settings/clients")
-        Ok(False) -> wisp.not_found()
+        Ok(Some(revoked_grant_ids)) -> {
+          oidc.publish_revocations(oidc_ctx, revoked_grant_ids)
+          wisp.redirect(to: "/settings/clients")
+        }
+        Ok(None) -> wisp.not_found()
         Error(_) -> wisp.internal_server_error()
       }
     }
