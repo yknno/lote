@@ -177,10 +177,11 @@ pub fn list_after(
           f.prepared(f.placeholder <> "::uuid", [f.string(normalized)]),
         ),
       ))
-      |> s.order_by_desc("posts.id")
+      |> s.order_by_asc("posts.id")
       |> s.limit(limit)
       |> s.to_query
       |> postgres.run_read_query(post_row_decoder(), db)
+      |> result.map(list.reverse)
   }
 }
 

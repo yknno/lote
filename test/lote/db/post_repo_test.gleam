@@ -111,7 +111,7 @@ pub fn list_before_paginates_older_posts_in_descending_order_test() {
   assert post_repo.list_before(tx, "not-a-uuid", 2) == Ok([])
 }
 
-pub fn list_after_fetches_only_newer_posts_in_descending_order_test() {
+pub fn list_after_paginates_forward_without_skipping_intermediate_posts_test() {
   use tx <- test_helper.with_db
 
   let assert Ok(author) = user.create(tx, "AfterAuthor")
@@ -119,21 +119,27 @@ pub fn list_after_fetches_only_newer_posts_in_descending_order_test() {
   let assert Ok(p2) = post_repo.create(tx, author.id, "post 2")
   let assert Ok(p3) = post_repo.create(tx, author.id, "post 3")
   let assert Ok(p4) = post_repo.create(tx, author.id, "post 4")
+  let assert Ok(p5) = post_repo.create(tx, author.id, "post 5")
 
-  let assert Ok(after_p2) = post_repo.list_after(tx, p2.id, 10)
-  assert list.map(after_p2, fn(r) { r.id }) == [p4.id, p3.id]
+  let assert Ok(after_p3) = post_repo.list_after(tx, p3.id, 10)
+  assert list.map(after_p3, fn(r) { r.id }) == [p5.id, p4.id]
 
-  // Limit returns the newest matching rows in descending order
-  let assert Ok(limited) = post_repo.list_after(tx, p1.id, 2)
-  assert list.map(limited, fn(r) { r.id }) == [p4.id, p3.id]
+  // Forward cursor pagination from p1 with limit=2 returns [p3, p2] (no skipped p2!),
+  // then advancing cursor to head (p3) returns [p5, p4], then []!
+  let assert Ok(step1) = post_repo.list_after(tx, p1.id, 2)
+  assert list.map(step1, fn(r) { r.id }) == [p3.id, p2.id]
+
+  let assert [head1, ..] = step1
+  let assert Ok(step2) = post_repo.list_after(tx, head1.id, 2)
+  assert list.map(step2, fn(r) { r.id }) == [p5.id, p4.id]
+
+  let assert [head2, ..] = step2
+  assert post_repo.list_after(tx, head2.id, 2) == Ok([])
 
   // Uppercase UUID cursor works
   let assert Ok(after_upper) =
-    post_repo.list_after(tx, string.uppercase(p3.id), 10)
-  assert list.map(after_upper, fn(r) { r.id }) == [p4.id]
-
-  // After newest post returns empty list
-  assert post_repo.list_after(tx, p4.id, 10) == Ok([])
+    post_repo.list_after(tx, string.uppercase(p4.id), 10)
+  assert list.map(after_upper, fn(r) { r.id }) == [p5.id]
 
   // Invalid UUID cursor returns Ok([]) without DB error
   assert post_repo.list_after(tx, "not-a-uuid", 10) == Ok([])
