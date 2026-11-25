@@ -1453,8 +1453,8 @@ pub fn unified_three_layer_oidc_and_api_rate_limits_test() {
     router.handle_request_with_oidc(req, auth_ctx, oidc_ctx, post_pubsub, ip)
   }
 
-  // Part 1: Malformed client_id & malformed Bearer tokens fail fast after Layer 1 `http:ip:<ip>`
-  // without touching `oidc:ip` or creating per-client/per-token entries!
+  // Part 1: Malformed client_id & malformed Bearer tokens fail fast in O(1) memory
+  // with ZERO `rate_limits` / DB writes!
   let bad_format_ip = "198.51.100.10"
   let _ =
     list.each(
@@ -1488,13 +1488,10 @@ pub fn unified_three_layer_oidc_and_api_rate_limits_test() {
       assert r.status == 401
     })
 
-  // Only 1 row (`http:ip:198.51.100.10/32`) written across all 11 malformed requests!
-  assert count_rate_limit_rows() == initial_rl_rows + 1
-  let rows_after_part1 = count_rate_limit_rows()
+  assert count_rate_limit_rows() == initial_rl_rows
 
   // Part 2: Flooding 50 distinct valid-format non-existent `cli_<32hex>` IDs NEVER creates
-  // per-client_id rows in `rate_limits` (only `http:ip:<ip>` + `oidc:ip:<ip>` = 2 rows),
-  // and blocks the 51st attempt with 429!
+  // per-client_id rows in `rate_limits` (only 1 row `oidc:ip:<ip>`), and blocks the 51st attempt with 429!
   let scanner_ip = "203.0.113.200"
   let _ =
     int.range(
@@ -1523,8 +1520,8 @@ pub fn unified_three_layer_oidc_and_api_rate_limits_test() {
       },
     )
 
-  // Only 2 rows created for scanner_ip (`http:ip` + `oidc:ip`) despite 50 distinct fake client_ids!
-  assert count_rate_limit_rows() == rows_after_part1 + 2
+  // Only 1 row created for scanner_ip (`oidc:ip`) despite 50 distinct fake client_ids!
+  assert count_rate_limit_rows() == initial_rl_rows + 1
 
   let scanner_blocked =
     simulate.request(http.Post, "/oidc/token")
