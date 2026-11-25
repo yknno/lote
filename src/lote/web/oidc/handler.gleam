@@ -416,10 +416,9 @@ fn authenticate_client_with_limits(
   }
 }
 
-pub fn rate_limited_response(retry_after_seconds: Int) -> wisp.Response {
+fn rate_limited_response(retry_after_seconds: Int) -> wisp.Response {
   oauth_error(429, "temporarily_unavailable", Some("Too many requests"))
   |> response.set_header("retry-after", int.to_string(retry_after_seconds))
-  |> with_no_store_headers
 }
 
 fn require_oauth_form(
