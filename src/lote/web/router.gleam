@@ -134,7 +134,7 @@ pub fn handle_request_with_oidc(
     _, ["oidc", ..rest] ->
       oidc_handler.handle_request(req, rest, oidc_ctx, client_ip)
     _, ["api", "v1", "posts", ..rest] ->
-      posts_handler.handle_request(req, rest, oidc_ctx, post_pubsub, client_ip)
+      posts_handler.handle_request(req, rest, oidc_ctx, post_pubsub)
     _, ["api", ..] -> posts_handler.json_error(404, "not_found")
     _, ["health"] -> wisp.response(200) |> wisp.string_body("ok")
     _, _ -> wisp.not_found()

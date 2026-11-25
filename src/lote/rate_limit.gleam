@@ -43,12 +43,6 @@ pub opaque type Message {
     now_ms: Int,
     reply_to: Subject(Decision),
   )
-  Peek(
-    hashed_key: String,
-    policy: Policy,
-    now_ms: Int,
-    reply_to: Subject(Decision),
-  )
   Reset(hashed_key: String)
   Sweep
   Stop
@@ -217,31 +211,6 @@ pub fn now_ms() -> Int {
 
 pub fn check(limiter: Limiter, key: String, policy: Policy) -> Decision {
   check_at(limiter, key, policy, now_ms())
-}
-
-pub fn peek(limiter: Limiter, key: String, policy: Policy) -> Decision {
-  peek_at(limiter, key, policy, now_ms())
-}
-
-pub fn peek_at(
-  limiter: Limiter,
-  key: String,
-  policy: Policy,
-  current_ms: Int,
-) -> Decision {
-  case limiter {
-    DisabledLimiter -> Allowed(remaining: int.max(policy.burst - 1, 0))
-    MemoryLimiter(subject:, key_secret:) -> {
-      let hashed_key = hash_key(key_secret, key)
-      actor.call(subject, waiting: 1000, sending: fn(reply_to) {
-        Peek(hashed_key:, policy:, now_ms: current_ms, reply_to:)
-      })
-    }
-    PostgresLimiter(db:, key_secret:) -> {
-      let hashed_key = hash_key(key_secret, key)
-      peek_postgres(db, hashed_key, policy, current_ms)
-    }
-  }
 }
 
 pub fn check_at(
@@ -420,39 +389,6 @@ fn check_postgres(
   }
 }
 
-fn peek_postgres(
-  db: pog.Connection,
-  hashed_key: String,
-  policy: Policy,
-  current_ms: Int,
-) -> Decision {
-  let decoder = {
-    use tat_ms <- decode.field(0, decode.int)
-    decode.success(tat_ms)
-  }
-
-  case
-    pog.query("SELECT tat_ms FROM rate_limits WHERE key = $1 LIMIT 1")
-    |> pog.parameter(pog.text(hashed_key))
-    |> pog.returning(decoder)
-    |> pog.execute(db)
-  {
-    Ok(pog.Returned(rows: [existing_tat, ..], ..)) -> {
-      let #(decision, _) = check_gcra(existing_tat, current_ms, policy)
-      decision
-    }
-    Ok(pog.Returned(rows: [], ..)) ->
-      Allowed(remaining: int.max(policy.burst - 1, 0))
-    Error(err) -> {
-      wisp.log_warning(
-        "Postgres rate limit peek failed (failing open): "
-        <> string.inspect(err),
-      )
-      Allowed(remaining: int.max(policy.burst - 1, 0))
-    }
-  }
-}
-
 fn handle_memory_message(
   state: MemoryState,
   message: Message,
@@ -479,18 +415,6 @@ fn handle_memory_message(
       }
       process.send(reply_to, decision)
       actor.continue(MemoryState(..state, entries:))
-    }
-
-    Peek(hashed_key:, policy:, now_ms: current_ms, reply_to:) -> {
-      let decision = case dict.get(state.entries, hashed_key) {
-        Ok(existing_tat) -> {
-          let #(d, _) = check_gcra(existing_tat, current_ms, policy)
-          d
-        }
-        Error(_) -> Allowed(remaining: int.max(policy.burst - 1, 0))
-      }
-      process.send(reply_to, decision)
-      actor.continue(state)
     }
 
     Reset(hashed_key) ->

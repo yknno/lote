@@ -948,3 +948,155 @@ pub fn submitting_posts_past_rate_limit_shows_error_and_preserves_draft_test() {
 
   rate_limit.stop_memory(rate_limiter)
 }
+
+pub fn timeline_ws_read_and_delete_actions_enforce_rate_limits_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(alice) = user.create(tx, "WsRateAlice")
+  let assert Ok(bob) = user.create(tx, "WsRateBob")
+  let assert Ok(post_pubsub) = pubsub.start()
+  let assert Ok(rate_limiter) =
+    rate_limit.start_memory("timeline_ws_read_delete_rl_secret")
+
+  // Seed 25 posts by Alice so `has_more` is True (`page_size == 20`)
+  let created_posts =
+    int.range(from: 1, to: 26, with: [], run: fn(acc, n) {
+      let assert Ok(row) =
+        post_repo.create(tx, alice.id, "ws-rl-post-" <> int.to_string(n))
+      [row, ..acc]
+    })
+  let assert [newest_post, ..] = created_posts
+
+  let #(alice0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      rate_limiter:,
+      user: Some(alice),
+      csrf_token: "alice-csrf",
+    ))
+  assert alice0.has_more
+
+  // 1. Authenticated WS read quota (`ws:read:user:<id>`, burst 20) throttles Refresh & LoadMore
+  let alice_exhausted_reads =
+    int.range(
+      from: 1,
+      to: timeline.ws_read_policy.burst + 1,
+      with: alice0,
+      run: fn(m, _) { step(m, timeline.UserClickedRefresh) },
+    )
+  assert alice_exhausted_reads.timeline_error == None
+
+  // 21st read via Refresh is throttled without querying DB
+  let alice_refresh_limited =
+    step(alice_exhausted_reads, timeline.UserClickedRefresh)
+  assert !alice_refresh_limited.loading_newer
+  let assert Some(read_err) = alice_refresh_limited.timeline_error
+  assert string.contains(read_err, "Too many requests")
+
+  // LoadMore shares the same `ws:read:user:<alice>` bucket and is also throttled!
+  let alice_load_more_limited =
+    step(
+      step(alice_refresh_limited, timeline.UserDismissedError),
+      timeline.UserRequestedLoadMore,
+    )
+  assert !alice_load_more_limited.loading_more
+  assert list.length(alice_load_more_limited.posts) == timeline.page_size
+  let assert Some(load_more_err) = alice_load_more_limited.timeline_error
+  assert string.contains(load_more_err, "Too many requests")
+
+  // Bob's authenticated WS read quota is independent and loads older posts cleanly
+  let #(bob0, _) =
+    timeline.init(timeline.Flags(
+      db: tx,
+      pubsub: post_pubsub,
+      rate_limiter:,
+      user: Some(bob),
+      csrf_token: "bob-csrf",
+    ))
+  let bob_loaded_more = step(bob0, timeline.UserRequestedLoadMore)
+  assert bob_loaded_more.timeline_error == None
+  assert list.length(bob_loaded_more.posts) == 25
+
+  // 2. Anonymous WS connections from the same IP (/32 IPv4 or /64 IPv6) share `ws:read:ip:<bucket>`!
+  let #(anon_a, _) =
+    timeline.init_with_ip(
+      timeline.Flags(
+        db: tx,
+        pubsub: post_pubsub,
+        rate_limiter:,
+        user: None,
+        csrf_token: "anon-a",
+      ),
+      "2001:db8:abcd:42::1",
+    )
+  let #(anon_b, _) =
+    timeline.init_with_ip(
+      timeline.Flags(
+        db: tx,
+        pubsub: post_pubsub,
+        rate_limiter:,
+        user: None,
+        csrf_token: "anon-b",
+      ),
+      "2001:db8:abcd:42:ffff::99",
+    )
+  let #(anon_other_net, _) =
+    timeline.init_with_ip(
+      timeline.Flags(
+        db: tx,
+        pubsub: post_pubsub,
+        rate_limiter:,
+        user: None,
+        csrf_token: "anon-c",
+      ),
+      "2001:db8:abcd:43::1",
+    )
+
+  let _ =
+    int.range(
+      from: 1,
+      to: timeline.ws_read_policy.burst + 1,
+      with: anon_a,
+      run: fn(m, _) { step(m, timeline.UserClickedRefresh) },
+    )
+  // Separate anonymous connection in the same IPv6 /64 is throttled!
+  let anon_b_limited = step(anon_b, timeline.UserRequestedLoadMore)
+  assert list.length(anon_b_limited.posts) == timeline.page_size
+  let assert Some(anon_err) = anon_b_limited.timeline_error
+  assert string.contains(anon_err, "Too many requests")
+
+  // Anonymous connection in a different /64 is unaffected
+  let anon_other_ok = step(anon_other_net, timeline.UserRequestedLoadMore)
+  assert anon_other_ok.timeline_error == None
+  assert list.length(anon_other_ok.posts) == 25
+
+  // 3. WS `UserConfirmedDelete` enforces `http:write:user:<id>` (burst 10)!
+  let _ =
+    int.range(
+      from: 1,
+      to: timeline.delete_write_policy.burst + 1,
+      with: Nil,
+      run: fn(_, _) {
+        let _ =
+          rate_limit.check(
+            rate_limiter,
+            "http:write:user:" <> int.to_string(alice.id),
+            timeline.delete_write_policy,
+          )
+        Nil
+      },
+    )
+
+  let alice_delete_blocked =
+    alice0
+    |> step(timeline.UserRequestedDelete(newest_post.id))
+    |> step(timeline.UserConfirmedDelete(newest_post.id))
+
+  let assert Some(del_err) = alice_delete_blocked.timeline_error
+  assert string.contains(del_err, "Too many requests")
+  // Post was NOT deleted in PostgreSQL while write-throttled!
+  let assert Ok(Some(_)) = post_repo.find_by_id(tx, newest_post.id)
+
+  rate_limit.stop_memory(rate_limiter)
+}
