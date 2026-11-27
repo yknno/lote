@@ -2,12 +2,13 @@ import gleam/http
 import gleam/http/response
 import gleam/int
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import lote/auth.{type Auth}
 import lote/auth/password
 import lote/auth/session
 import lote/rate_limit
 import lote/realtime/pubsub
+import lote/web/auth/return_to
 import lote/web/auth/view
 import lote/web/client_ip
 import lote/web/csrf
@@ -42,6 +43,10 @@ fn handle_login(
     auth_ctx.secret_key_base,
   )
 
+  let safe_return_to =
+    list.key_find(form.values, "return_to")
+    |> option.from_result
+    |> return_to.sanitize
   let login_id = list.key_find(form.values, "login_id")
   let pass = list.key_find(form.values, "password")
 
@@ -54,12 +59,19 @@ fn handle_login(
         Error(_) ->
           case rate_limit.check(auth_ctx.rate_limiter, ip_key, ip_policy) {
             rate_limit.Limited(retry_after_seconds:) ->
-              too_many_requests_login(auth_ctx, csrf_token, retry_after_seconds)
+              too_many_requests_login(
+                auth_ctx,
+                csrf_token,
+                safe_return_to,
+                retry_after_seconds,
+              )
             rate_limit.Allowed(_) ->
-              view.login_page(
+              view.login_page_with_return_to(
                 auth_ctx.methods,
                 Some("ID またはパスワードが正しくありません"),
                 csrf_token,
+                safe_return_to,
+                200,
               )
           }
 
@@ -69,7 +81,12 @@ fn handle_login(
 
           case check_login_limits(auth_ctx.rate_limiter, ip_key, account_key) {
             rate_limit.Limited(retry_after_seconds:) ->
-              too_many_requests_login(auth_ctx, csrf_token, retry_after_seconds)
+              too_many_requests_login(
+                auth_ctx,
+                csrf_token,
+                safe_return_to,
+                retry_after_seconds,
+              )
             rate_limit.Allowed(_) ->
               case password.authenticate(auth_ctx.db, normalized_id, pass) {
                 Ok(auth_user) -> {
@@ -83,9 +100,10 @@ fn handle_login(
                       auth_ctx.db,
                       auth_ctx.secret_key_base,
                     )
+                  let destination = option.unwrap(safe_return_to, "/")
                   case
                     session.create(
-                      wisp.redirect(to: "/"),
+                      wisp.redirect(to: destination),
                       req,
                       auth_ctx.db,
                       auth_ctx.secret_key_base,
@@ -104,10 +122,12 @@ fn handle_login(
                   }
                 }
                 Error(password.InvalidCredentials) ->
-                  view.login_page(
+                  view.login_page_with_return_to(
                     auth_ctx.methods,
                     Some("ID またはパスワードが正しくありません"),
                     csrf_token,
+                    safe_return_to,
+                    200,
                   )
                 Error(_) -> wisp.internal_server_error()
               }
@@ -115,7 +135,14 @@ fn handle_login(
         }
       }
     }
-    _, _ -> view.login_page(auth_ctx.methods, Some("入力が不足しています"), csrf_token)
+    _, _ ->
+      view.login_page_with_return_to(
+        auth_ctx.methods,
+        Some("入力が不足しています"),
+        csrf_token,
+        safe_return_to,
+        200,
+      )
   }
 }
 
@@ -135,12 +162,14 @@ fn check_login_limits(
 fn too_many_requests_login(
   auth_ctx: Auth,
   csrf_token: String,
+  return_to: Option(String),
   retry_after_seconds: Int,
 ) -> wisp.Response {
-  view.login_page_with_status(
+  view.login_page_with_return_to(
     auth_ctx.methods,
     Some("ログイン試行回数が上限に達しました。しばらく待ってから再度お試しください。"),
     csrf_token,
+    return_to,
     429,
   )
   |> response.set_header("retry-after", int.to_string(retry_after_seconds))

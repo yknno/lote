@@ -14,10 +14,12 @@ import lote/web/auth/handler as auth_handler
 import lote/web/components/timeline
 import lote/web/csrf
 import lote/web/http_rate_limit
+import lote/web/oidc/authorize_handler
 import lote/web/oidc/handler as oidc_handler
 import lote/web/post/view as post_view
 import lote/web/sessions/handler as sessions_handler
 import lote/web/settings/clients_handler
+import lote/web/settings/grants_handler
 import lustre/attribute
 import lustre/element
 import lustre/element/html
@@ -129,8 +131,12 @@ pub fn handle_request_with_oidc(
       sessions_handler.handle_request(req, rest, auth_ctx)
     _, ["settings", "clients", ..rest] ->
       clients_handler.handle_request(req, rest, auth_ctx, oidc_ctx)
+    _, ["settings", "grants", ..rest] ->
+      grants_handler.handle_request(req, rest, auth_ctx, oidc_ctx)
     _, ["auth", ..rest] ->
       auth_handler.handle_request(req, rest, auth_ctx, client_ip)
+    _, ["oidc", "authorize"] ->
+      authorize_handler.handle_request(req, auth_ctx, oidc_ctx)
     _, ["oidc", ..rest] ->
       oidc_handler.handle_request(req, rest, oidc_ctx, client_ip)
     _, ["api", "v1", "posts", ..rest] ->
@@ -192,10 +198,12 @@ fn middleware(
     }
     serve_static_with_cache(req, static_dir, fn() {
       handle_request(req)
-      |> ensure_cache_control(default_cache_control)
+      |> ensure_header("cache-control", default_cache_control)
+      |> ensure_header("x-frame-options", "DENY")
+      |> ensure_header("referrer-policy", "same-origin")
     })
   }
-  |> ensure_cache_control(default_cache_control)
+  |> ensure_header("cache-control", default_cache_control)
 }
 
 fn apply_origin_or_strip_cookies(
@@ -229,14 +237,15 @@ fn serve_static_with_cache(
 ) -> Response {
   let resp = wisp.serve_static(req, under: "/static", from: static_dir, next:)
   case resp.status {
-    200 | 206 | 304 -> ensure_cache_control(resp, static_cache_control)
+    200 | 206 | 304 ->
+      ensure_header(resp, "cache-control", static_cache_control)
     _ -> resp
   }
 }
 
-fn ensure_cache_control(resp: Response, value: String) -> Response {
-  case response.get_header(resp, "cache-control") {
+fn ensure_header(resp: Response, name: String, value: String) -> Response {
+  case response.get_header(resp, name) {
     Ok(_) -> resp
-    Error(_) -> response.set_header(resp, "cache-control", value)
+    Error(_) -> response.set_header(resp, name, value)
   }
 }

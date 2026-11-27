@@ -1112,6 +1112,15 @@ fn account_bar(
         ),
         html.a(
           [
+            attribute.href("/settings/grants"),
+            attribute.class(
+              "text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
+            ),
+          ],
+          [html.text("Grants")],
+        ),
+        html.a(
+          [
             attribute.href("/sessions"),
             attribute.class(
               "text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",

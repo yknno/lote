@@ -132,6 +132,15 @@ pub fn index_page(
                   ),
                   html.a(
                     [
+                      attribute.href("/settings/grants"),
+                      attribute.class(
+                        "text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
+                      ),
+                    ],
+                    [html.text("Grants")],
+                  ),
+                  html.a(
+                    [
                       attribute.href("/sessions"),
                       attribute.class(
                         "text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
@@ -178,6 +187,7 @@ pub fn index_page(
               error_el,
               revealed_el,
               create_bot_section(csrf_token),
+              create_app_section(csrf_token),
               clients_list,
             ]),
           ],
@@ -372,26 +382,235 @@ fn create_bot_section(csrf_token: String) -> element.Element(Nil) {
   )
 }
 
+fn create_app_section(csrf_token: String) -> element.Element(Nil) {
+  let scope_checkboxes =
+    list.map(scope.all(), fn(sc) {
+      let sc_str = scope.to_string(sc)
+      let default_checked = sc == scope.OpenId || sc == scope.PostsRead
+      html.label(
+        [
+          attribute.class(
+            "inline-flex cursor-pointer items-center gap-1.5 border border-neutral-300 bg-white px-2.5 py-1 font-mono text-xs text-neutral-800 hover:border-neutral-950",
+          ),
+        ],
+        [
+          html.input([
+            attribute.type_("checkbox"),
+            attribute.name("scopes"),
+            attribute.value(sc_str),
+            attribute.checked(default_checked),
+            attribute.class("accent-neutral-950"),
+          ]),
+          html.span([], [html.text(sc_str)]),
+        ],
+      )
+    })
+
+  let select_class =
+    "w-full border border-neutral-300 bg-white px-2.5 py-1.5 text-sm text-neutral-950 focus:border-neutral-950 focus:outline-none"
+
+  html.section(
+    [attribute.class("mb-6 border border-neutral-200 bg-neutral-50/60 p-4")],
+    [
+      html.h2([attribute.class("text-xs font-semibold text-neutral-950")], [
+        html.text("Register OAuth App"),
+      ]),
+      html.p([attribute.class("mt-0.5 text-xs text-neutral-500")], [
+        html.text(
+          "Register an OAuth 2.1 / OIDC application using Authorization Code with PKCE.",
+        ),
+      ]),
+      html.form(
+        [
+          attribute.method("post"),
+          attribute.action("/settings/clients/apps"),
+          attribute.class("mt-3 flex flex-col gap-3"),
+        ],
+        [
+          html.input([
+            attribute.type_("hidden"),
+            attribute.name(csrf.form_field_name),
+            attribute.value(csrf_token),
+          ]),
+          html.div([attribute.class("grid grid-cols-1 gap-3 sm:grid-cols-2")], [
+            html.div([attribute.class("flex flex-col gap-1")], [
+              html.label(
+                [
+                  attribute.for("app_name"),
+                  attribute.class("text-xs text-neutral-600"),
+                ],
+                [html.text("App name")],
+              ),
+              html.input([
+                attribute.id("app_name"),
+                attribute.type_("text"),
+                attribute.name("name"),
+                attribute.required(True),
+                attribute.maxlength(100),
+                attribute.placeholder("My OAuth App"),
+                attribute.class(
+                  "w-full border border-neutral-300 bg-white px-2.5 py-1.5 text-sm text-neutral-950 placeholder:text-neutral-400 focus:border-neutral-950 focus:outline-none",
+                ),
+              ]),
+            ]),
+            html.div([attribute.class("flex flex-col gap-1")], [
+              html.label(
+                [
+                  attribute.for("app_client_type"),
+                  attribute.class("text-xs text-neutral-600"),
+                ],
+                [html.text("Client type")],
+              ),
+              html.select(
+                [
+                  attribute.id("app_client_type"),
+                  attribute.name("client_type"),
+                  attribute.class(select_class),
+                ],
+                [
+                  html.option(
+                    [attribute.value("confidential"), attribute.selected(True)],
+                    "Confidential (secret + PKCE)",
+                  ),
+                  html.option([attribute.value("public")], "Public (PKCE only)"),
+                ],
+              ),
+            ]),
+            html.div([attribute.class("flex flex-col gap-1")], [
+              html.label(
+                [
+                  attribute.for("app_application_type"),
+                  attribute.class("text-xs text-neutral-600"),
+                ],
+                [html.text("Application type")],
+              ),
+              html.select(
+                [
+                  attribute.id("app_application_type"),
+                  attribute.name("application_type"),
+                  attribute.class(select_class),
+                ],
+                [
+                  html.option(
+                    [attribute.value("web"), attribute.selected(True)],
+                    "Web",
+                  ),
+                  html.option([attribute.value("native")], "Native"),
+                ],
+              ),
+            ]),
+            html.div([attribute.class("flex flex-col gap-1")], [
+              html.label(
+                [
+                  attribute.for("app_visibility"),
+                  attribute.class("text-xs text-neutral-600"),
+                ],
+                [html.text("Visibility")],
+              ),
+              html.select(
+                [
+                  attribute.id("app_visibility"),
+                  attribute.name("visibility"),
+                  attribute.class(select_class),
+                ],
+                [
+                  html.option(
+                    [attribute.value("private"), attribute.selected(True)],
+                    "Private (owner only)",
+                  ),
+                  html.option([attribute.value("public")], "Public (any user)"),
+                ],
+              ),
+            ]),
+          ]),
+          html.div([attribute.class("flex flex-col gap-1")], [
+            html.label(
+              [
+                attribute.for("app_redirect_uris"),
+                attribute.class("text-xs text-neutral-600"),
+              ],
+              [html.text("Redirect URIs (one per line)")],
+            ),
+            html.textarea(
+              [
+                attribute.id("app_redirect_uris"),
+                attribute.name("redirect_uris"),
+                attribute.rows(3),
+                attribute.required(True),
+                attribute.placeholder(
+                  "https://app.example.com/callback\nhttp://127.0.0.1:3000/callback",
+                ),
+                attribute.class(
+                  "w-full border border-neutral-300 bg-white px-2.5 py-1.5 font-mono text-xs text-neutral-950 placeholder:text-neutral-400 focus:border-neutral-950 focus:outline-none",
+                ),
+              ],
+              "",
+            ),
+          ]),
+          html.div([attribute.class("flex flex-col gap-1.5")], [
+            html.span([attribute.class("text-xs text-neutral-600")], [
+              html.text("Allowed scopes"),
+            ]),
+            html.div(
+              [attribute.class("flex flex-wrap gap-2")],
+              scope_checkboxes,
+            ),
+          ]),
+          html.div([], [
+            html.button(
+              [
+                attribute.type_("submit"),
+                attribute.class(
+                  "cursor-pointer bg-neutral-950 px-4 py-1.5 text-xs font-medium text-white hover:bg-neutral-800",
+                ),
+              ],
+              [html.text("Register OAuth App")],
+            ),
+          ]),
+        ],
+      ),
+    ],
+  )
+}
+
 fn client_row(
   c: Client,
   secrets: List(SecretInfo),
   csrf_token: String,
 ) -> element.Element(Nil) {
-  let kind_badge =
-    html.span(
-      [
-        attribute.class(
-          "border border-neutral-300 bg-neutral-50 px-1.5 py-0.5 font-mono text-[10px] font-medium text-neutral-700",
-        ),
-      ],
-      [html.text(kind_label(c.kind))],
-    )
+  let badges = case c.kind {
+    client.SubordinateBot -> [badge_span(kind_label(c.kind))]
+    client.ConfidentialApp | client.PublicApp | client.Cimd -> [
+      badge_span(kind_label(c.kind)),
+      badge_span(visibility_label(c.visibility)),
+      badge_span(application_type_label(c.application_type)),
+    ]
+  }
 
   let scope_str = scope.format_space_delimited(c.allowed_scopes)
 
-  let secrets_section = case supports_secrets(c.kind) {
-    False -> element.none()
-    True ->
+  let redirect_uris_el = case c.kind, c.redirect_uris {
+    client.SubordinateBot, _ | _, [] -> element.none()
+    _, uris ->
+      html.div([attribute.class("mt-2 flex flex-col gap-1")], [
+        html.span([attribute.class("text-[11px] text-neutral-500")], [
+          html.text("Redirect URIs"),
+        ]),
+        html.ul(
+          [
+            attribute.class(
+              "flex flex-col gap-0.5 font-mono text-xs text-neutral-700",
+            ),
+          ],
+          list.map(uris, fn(u) {
+            html.li([attribute.class("break-all")], [html.text(u)])
+          }),
+        ),
+      ])
+  }
+
+  let secrets_section = case c.kind {
+    client.SubordinateBot | client.ConfidentialApp ->
       html.div([attribute.class("mt-3 border-t border-neutral-100 pt-2.5")], [
         html.div(
           [
@@ -419,16 +638,28 @@ fn client_row(
             )
         },
       ])
+
+    client.PublicApp ->
+      html.p(
+        [
+          attribute.class(
+            "mt-3 border-t border-neutral-100 pt-2.5 font-mono text-xs text-neutral-400",
+          ),
+        ],
+        [html.text("Public client (PKCE only — no client secret)")],
+      )
+
+    client.Cimd -> element.none()
   }
 
   html.li([attribute.class("py-4")], [
     html.div([attribute.class("flex items-center justify-between gap-2")], [
-      html.div([attribute.class("flex min-w-0 items-center gap-2")], [
+      html.div([attribute.class("flex min-w-0 flex-wrap items-center gap-2")], [
         html.span(
           [attribute.class("truncate text-sm font-medium text-neutral-950")],
           [html.text(c.name)],
         ),
-        kind_badge,
+        ..badges
       ]),
       html.form(
         [
@@ -470,8 +701,20 @@ fn client_row(
         ]),
       ],
     ),
+    redirect_uris_el,
     secrets_section,
   ])
+}
+
+fn badge_span(label: String) -> element.Element(Nil) {
+  html.span(
+    [
+      attribute.class(
+        "border border-neutral-300 bg-neutral-50 px-1.5 py-0.5 font-mono text-[10px] font-medium text-neutral-700",
+      ),
+    ],
+    [html.text(label)],
+  )
 }
 
 fn secret_row(
@@ -595,19 +838,26 @@ fn add_secret_form(
   )
 }
 
-fn supports_secrets(kind: client.Kind) -> Bool {
-  case kind {
-    client.SubordinateBot | client.ConfidentialApp -> True
-    client.PublicApp | client.Cimd -> False
-  }
-}
-
 fn kind_label(kind: client.Kind) -> String {
   case kind {
     client.SubordinateBot -> "Subordinate Bot"
     client.ConfidentialApp -> "Confidential App"
     client.PublicApp -> "Public App"
     client.Cimd -> "CIMD"
+  }
+}
+
+fn visibility_label(visibility: client.Visibility) -> String {
+  case visibility {
+    client.Private -> "Private"
+    client.Public -> "Public"
+  }
+}
+
+fn application_type_label(application_type: client.ApplicationType) -> String {
+  case application_type {
+    client.Web -> "Web"
+    client.Native -> "Native"
   }
 }
 
