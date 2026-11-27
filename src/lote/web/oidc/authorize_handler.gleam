@@ -152,12 +152,11 @@ fn handle_get(
           case validate_oauth_params(oidc_ctx, pre, params) {
             Error(resp) -> resp
             Ok(validated) -> {
-              let raw_prompt = extract_trimmed_param(params, "prompt")
-              case parse_prompt_mode(raw_prompt) {
-                Error(Nil) ->
+              case parse_prompt_mode(list.key_find(params, "prompt")) {
+                Error(err_code) ->
                   wisp.redirect(to: build_error_redirect(
                     pre.redirect_uri,
-                    "invalid_request",
+                    err_code,
                     None,
                     pre.state,
                     oidc_ctx.issuer,
@@ -604,6 +603,33 @@ fn validate_oauth_params(
     Ok(_) -> Error(err_redirect("unsupported_response_type"))
   })
 
+  use _ <- result.try(case list.key_find(params, "response_mode") {
+    Error(_) | Ok("query") -> Ok(Nil)
+    Ok(_) -> Error(err_redirect("invalid_request"))
+  })
+
+  use _ <- result.try(case list.key_find(params, "request") {
+    Error(_) -> Ok(Nil)
+    Ok(_) -> Error(err_redirect("request_not_supported"))
+  })
+
+  use _ <- result.try(case list.key_find(params, "request_uri") {
+    Error(_) -> Ok(Nil)
+    Ok(_) -> Error(err_redirect("request_uri_not_supported"))
+  })
+
+  use _ <- result.try(case list.key_find(params, "registration") {
+    Error(_) -> Ok(Nil)
+    Ok(_) -> Error(err_redirect("registration_not_supported"))
+  })
+
+  use _ <- result.try(
+    case list.key_find(params, "claims"), list.key_find(params, "max_age") {
+      Error(_), Error(_) -> Ok(Nil)
+      _, _ -> Error(err_redirect("invalid_request"))
+    },
+  )
+
   use code_challenge_method <- result.try(
     case list.key_find(params, "code_challenge_method") {
       Ok("S256") -> Ok("S256")
@@ -672,12 +698,38 @@ fn validate_oauth_params(
   )
 }
 
-fn parse_prompt_mode(raw_prompt: Option(String)) -> Result(PromptMode, Nil) {
+fn parse_prompt_mode(
+  raw_prompt: Result(String, Nil),
+) -> Result(PromptMode, String) {
   case raw_prompt {
-    None -> Ok(PromptDefault)
-    Some("consent") -> Ok(PromptConsent)
-    Some("none") -> Ok(PromptNone)
-    Some(_) -> Error(Nil)
+    Error(_) -> Ok(PromptDefault)
+    Ok(raw) -> {
+      let tokens =
+        raw
+        |> string.split(" ")
+        |> list.filter(fn(t) { t != "" })
+      let all_known =
+        list.all(tokens, fn(t) {
+          t == "none" || t == "consent" || t == "login" || t == "select_account"
+        })
+      case tokens, all_known {
+        [], _ | _, False -> Error("invalid_request")
+        ["none"], True -> Ok(PromptNone)
+        _, True ->
+          case list.contains(tokens, "none") {
+            True -> Error("invalid_request")
+            False ->
+              case list.contains(tokens, "select_account") {
+                True -> Error("account_selection_required")
+                False ->
+                  case list.contains(tokens, "login") {
+                    True -> Error("login_required")
+                    False -> Ok(PromptConsent)
+                  }
+              }
+          }
+      }
+    }
   }
 }
 
@@ -691,20 +743,6 @@ fn has_duplicate_keys(
       case set.contains(seen, k) {
         True -> True
         False -> has_duplicate_keys(rest, set.insert(seen, k))
-      }
-  }
-}
-
-fn extract_trimmed_param(
-  params: List(#(String, String)),
-  key: String,
-) -> Option(String) {
-  case list.key_find(params, key) {
-    Error(_) -> None
-    Ok(raw) ->
-      case string.trim(raw) {
-        "" -> None
-        trimmed -> Some(trimmed)
       }
   }
 }

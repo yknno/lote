@@ -9,6 +9,7 @@ import lote/oidc
 import lote/oidc/cleanup
 import lote/oidc/client
 import lote/oidc/grant
+import lote/oidc/jwt
 import lote/oidc/scope
 import lote/oidc/token
 import lote/rate_limit
@@ -943,6 +944,7 @@ fn make_oidc(
   oidc.Oidc(
     db:,
     issuer: oidc.default_issuer,
+    keyring: jwt.default_keyring(),
     grant_revocations:,
     rate_limiter: rate_limit.disabled(),
   )

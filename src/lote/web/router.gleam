@@ -8,6 +8,7 @@ import lote/auth.{type Auth}
 import lote/auth/session
 import lote/db/post_repo
 import lote/oidc.{type Oidc}
+import lote/oidc/jwt
 import lote/realtime/pubsub.{type PubSub}
 import lote/web/api/posts_handler
 import lote/web/auth/handler as auth_handler
@@ -15,6 +16,7 @@ import lote/web/components/timeline
 import lote/web/csrf
 import lote/web/http_rate_limit
 import lote/web/oidc/authorize_handler
+import lote/web/oidc/discovery_handler
 import lote/web/oidc/handler as oidc_handler
 import lote/web/post/view as post_view
 import lote/web/sessions/handler as sessions_handler
@@ -60,9 +62,12 @@ pub fn handle_request_with_oidc(
   post_pubsub: PubSub(timeline.PostEvent),
   client_ip: String,
 ) -> Response {
-  use req <- middleware(req)
+  use req <- middleware(req, oidc_ctx.issuer)
 
-  case req.method, wisp.path_segments(req) {
+  case
+    req.method,
+    strip_issuer_oidc_prefix(wisp.path_segments(req), oidc_ctx.issuer)
+  {
     _, [] -> {
       let #(csrf_token, should_set_cookie) =
         csrf.ensure_token(req, auth_ctx.secret_key_base)
@@ -135,6 +140,13 @@ pub fn handle_request_with_oidc(
       grants_handler.handle_request(req, rest, auth_ctx, oidc_ctx)
     _, ["auth", ..rest] ->
       auth_handler.handle_request(req, rest, auth_ctx, client_ip)
+    _, [".well-known", ..rest] ->
+      discovery_handler.handle_well_known(
+        req,
+        rest,
+        oidc_ctx.issuer,
+        jwt.jwks_json(oidc_ctx.keyring),
+      )
     _, ["oidc", "authorize"] ->
       authorize_handler.handle_request(req, auth_ctx, oidc_ctx)
     _, ["oidc", ..rest] ->
@@ -183,6 +195,7 @@ fn index_html() -> String {
 
 fn middleware(
   req: Request,
+  issuer: String,
   handle_request: fn(Request) -> Response,
 ) -> Response {
   let req = wisp.method_override(req)
@@ -190,7 +203,7 @@ fn middleware(
   {
     use <- wisp.rescue_crashes
     use req <- wisp.handle_head(req)
-    use req <- apply_origin_or_strip_cookies(req)
+    use req <- apply_origin_or_strip_cookies(req, issuer)
 
     let static_dir = case wisp.priv_directory("lote") {
       Ok(priv) -> priv <> "/static"
@@ -208,9 +221,11 @@ fn middleware(
 
 fn apply_origin_or_strip_cookies(
   req: Request,
+  issuer: String,
   next: fn(Request) -> Response,
 ) -> Response {
-  case is_cookieless_route(wisp.path_segments(req)) {
+  let segments = strip_issuer_oidc_prefix(wisp.path_segments(req), issuer)
+  case is_cookieless_route(segments) {
     True -> {
       let headers =
         list.filter(req.headers, fn(h) { string.lowercase(h.0) != "cookie" })
@@ -220,11 +235,34 @@ fn apply_origin_or_strip_cookies(
   }
 }
 
+fn strip_issuer_oidc_prefix(
+  segments: List(String),
+  issuer: String,
+) -> List(String) {
+  let prefix = discovery_handler.issuer_path_segments(issuer)
+  case prefix {
+    [] -> segments
+    _ -> {
+      let prefix_len = list.length(prefix)
+      case list.take(segments, prefix_len) == prefix {
+        False -> segments
+        True ->
+          case list.drop(segments, prefix_len) {
+            [".well-known", ..] as rest | ["oidc", ..] as rest -> rest
+            _ -> segments
+          }
+      }
+    }
+  }
+}
+
 fn is_cookieless_route(segments: List(String)) -> Bool {
   case segments {
-    ["oidc", "token"]
+    [".well-known", ..]
+    | ["oidc", "token"]
     | ["oidc", "revoke"]
     | ["oidc", "introspect"]
+    | ["oidc", "userinfo"]
     | ["api", ..] -> True
     _ -> False
   }

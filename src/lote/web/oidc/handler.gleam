@@ -12,10 +12,12 @@ import gleam/string
 import gleam/uri
 import lote/oidc.{type Oidc}
 import lote/oidc/client.{type Client}
+import lote/oidc/jwt
 import lote/oidc/scope.{type Scope}
 import lote/oidc/token
 import lote/rate_limit
 import lote/web/client_ip
+import lote/web/oidc/userinfo_handler
 import lote/web/rate_policy
 import wisp
 
@@ -60,6 +62,8 @@ pub fn handle_request(
 
     http.Post, ["introspect"] -> handle_introspect(req, oidc_ctx, client_ip)
     _, ["introspect"] -> wisp.method_not_allowed([http.Post])
+
+    _, ["userinfo"] -> userinfo_handler.handle_request(req, oidc_ctx)
 
     _, _ -> wisp.not_found()
   }
@@ -163,7 +167,7 @@ fn handle_client_credentials_grant(
   }
 
   case result {
-    Ok(issued) -> token_success_response(issued)
+    Ok(issued) -> token_success_response(issued, None)
     Error(err) -> token_error_response(err)
   }
 }
@@ -202,7 +206,11 @@ fn handle_authorization_code_grant(
   }
 
   case result {
-    Ok(issued) -> token_success_response(issued)
+    Ok(issued) ->
+      token_success_response(
+        issued,
+        maybe_mint_id_token(oidc_ctx, authed_client, issued),
+      )
     Error(err) -> token_error_response(err)
   }
 }
@@ -236,7 +244,11 @@ fn handle_refresh_token_grant(
   }
 
   case result {
-    Ok(issued) -> token_success_response(issued)
+    Ok(issued) ->
+      token_success_response(
+        issued,
+        maybe_mint_id_token(oidc_ctx, authed_client, issued),
+      )
     Error(err) -> token_error_response(err)
   }
 }
@@ -672,16 +684,52 @@ fn optional_non_empty_param(
   }
 }
 
-fn token_success_response(issued: token.IssuedTokens) -> wisp.Response {
+fn maybe_mint_id_token(
+  oidc_ctx: Oidc,
+  authed_client: Client,
+  issued: token.IssuedTokens,
+) -> Option(String) {
+  case set.contains(issued.scopes, scope.OpenId) {
+    False -> None
+    True -> {
+      let now = jwt.now_unix_seconds()
+      let name = case set.contains(issued.scopes, scope.Profile) {
+        True -> Some(issued.user.name)
+        False -> None
+      }
+      let claims =
+        jwt.IdTokenClaims(
+          iss: oidc_ctx.issuer,
+          sub: issued.sub,
+          aud: authed_client.client_id,
+          iat: now,
+          exp: now + jwt.id_token_ttl_seconds,
+          nonce: issued.nonce,
+          at_hash: Some(jwt.compute_at_hash(issued.access_token)),
+          name:,
+        )
+      Some(jwt.sign_id_token(oidc_ctx.keyring, claims))
+    }
+  }
+}
+
+fn token_success_response(
+  issued: token.IssuedTokens,
+  maybe_id_token: Option(String),
+) -> wisp.Response {
   let base_fields = [
     #("access_token", json.string(issued.access_token)),
     #("token_type", json.string(issued.token_type)),
     #("expires_in", json.int(issued.expires_in)),
     #("scope", json.string(scope.format_space_delimited(issued.scopes))),
   ]
-  let fields = case issued.refresh_token {
+  let with_rt = case issued.refresh_token {
     Some(rt) -> list.append(base_fields, [#("refresh_token", json.string(rt))])
     None -> base_fields
+  }
+  let fields = case maybe_id_token {
+    Some(idt) -> list.append(with_rt, [#("id_token", json.string(idt))])
+    None -> with_rt
   }
 
   json.object(fields)
