@@ -9,6 +9,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/order
 import gleam/otp/static_supervisor as supervisor
 import gleam/result
+import gleam/string
 import gleam/time/duration
 import gleam/time/timestamp.{type Timestamp}
 import lote/auth.{type Auth, Auth, Password}
@@ -18,6 +19,7 @@ import lote/config
 import lote/db/pool
 import lote/oidc.{type Oidc}
 import lote/oidc/cleanup as oidc_cleanup
+import lote/oidc/jwt
 import lote/rate_limit
 import lote/realtime/pubsub.{type PubSub}
 import lote/web/client_ip
@@ -77,7 +79,33 @@ pub fn main() -> Nil {
       rate_limiter:,
     )
 
-  let oidc_ctx = oidc.new(db, cfg.issuer_url, grant_revocations, rate_limiter)
+  let keyring = case
+    jwt.load_keyring_from_pem(
+      cfg.oidc_signing_key_pem,
+      cfg.oidc_verify_keys_pem,
+    )
+  {
+    Ok(#(kr, True)) -> {
+      wisp.log_info(
+        "OIDC_SIGNING_KEY_PEM not set; using ephemeral ES256 signing key",
+      )
+      kr
+    }
+    Ok(#(kr, False)) -> kr
+    Error(err) -> {
+      wisp.log_error("Invalid OIDC key configuration: " <> string.inspect(err))
+      panic as "Invalid OIDC key configuration"
+    }
+  }
+
+  let oidc_ctx =
+    oidc.new_with_keyring(
+      db,
+      cfg.issuer_url,
+      keyring,
+      grant_revocations,
+      rate_limiter,
+    )
 
   let post_pubsub_name = process.new_name("lote_post_pubsub")
   let post_pubsub = process.named_subject(post_pubsub_name)

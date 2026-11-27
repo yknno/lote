@@ -271,4 +271,12 @@ pub fn config_parsers_for_rate_limit_adapter_and_proxy_hops_test() {
     == Error("https://lote.example.com#frag")
   assert config.parse_issuer_url("https://user:pass@lote.example.com", 8080)
     == Error("https://user:pass@lote.example.com")
+  assert config.parse_issuer_url("https://lote.example.com:443/", 8080)
+    == Ok("https://lote.example.com")
+  assert config.parse_issuer_url("http://lote.example.com:80/sub/", 8080)
+    == Ok("http://lote.example.com/sub")
+  assert config.parse_issuer_url("https://lote.example.com:0", 8080)
+    == Error("https://lote.example.com:0")
+  assert config.parse_issuer_url("https://lote.example.com:99999", 8080)
+    == Error("https://lote.example.com:99999")
 }

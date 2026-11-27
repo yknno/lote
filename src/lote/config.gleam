@@ -1,7 +1,7 @@
 import envoy
 import gleam/int
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 import gleam/uri
@@ -23,6 +23,8 @@ pub type Config {
     secret_key_base: String,
     database_url: String,
     issuer_url: String,
+    oidc_signing_key_pem: Option(String),
+    oidc_verify_keys_pem: Option(String),
     auth_adapters: List(String),
     pubsub_adapter: PubSubAdapter,
     rate_limit_adapter: RateLimitAdapter,
@@ -62,6 +64,16 @@ pub fn load() -> Config {
       default_issuer
     }
   }
+
+  let oidc_signing_key_pem =
+    envoy.get("OIDC_SIGNING_KEY_PEM")
+    |> result.unwrap("")
+    |> parse_optional_pem
+
+  let oidc_verify_keys_pem =
+    envoy.get("OIDC_VERIFY_KEYS_PEM")
+    |> result.unwrap("")
+    |> parse_optional_pem
 
   let auth_adapters =
     envoy.get("AUTH_ADAPTERS")
@@ -125,6 +137,8 @@ pub fn load() -> Config {
     secret_key_base:,
     database_url:,
     issuer_url:,
+    oidc_signing_key_pem:,
+    oidc_verify_keys_pem:,
     auth_adapters:,
     pubsub_adapter:,
     rate_limit_adapter:,
@@ -154,25 +168,45 @@ pub fn parse_issuer_url(raw: String, port: Int) -> Result(String, String) {
             parsed.query,
             parsed.fragment
           {
-            Some(scheme), Some(host), None, None, None
-              if { scheme == "http" || scheme == "https" } && host != ""
-            -> {
-              let clean_path = trim_trailing_slashes(parsed.path)
-              let normalized =
-                uri.Uri(
-                  scheme: Some(string.lowercase(scheme)),
-                  userinfo: None,
-                  host: Some(string.lowercase(host)),
-                  port: parsed.port,
-                  path: clean_path,
-                  query: None,
-                  fragment: None,
-                )
-              Ok(uri.to_string(normalized))
+            Some(scheme), Some(host), None, None, None if host != "" -> {
+              let lower_scheme = string.lowercase(scheme)
+              case
+                lower_scheme == "http" || lower_scheme == "https",
+                normalize_issuer_port(lower_scheme, parsed.port)
+              {
+                True, Ok(normalized_port) -> {
+                  let clean_path = trim_trailing_slashes(parsed.path)
+                  let normalized =
+                    uri.Uri(
+                      scheme: Some(lower_scheme),
+                      userinfo: None,
+                      host: Some(string.lowercase(host)),
+                      port: normalized_port,
+                      path: clean_path,
+                      query: None,
+                      fragment: None,
+                    )
+                  Ok(uri.to_string(normalized))
+                }
+                _, _ -> Error(trimmed)
+              }
             }
             _, _, _, _, _ -> Error(trimmed)
           }
       }
+  }
+}
+
+fn normalize_issuer_port(
+  scheme: String,
+  port: Option(Int),
+) -> Result(Option(Int), Nil) {
+  case scheme, port {
+    _, None -> Ok(None)
+    "http", Some(80) -> Ok(None)
+    "https", Some(443) -> Ok(None)
+    _, Some(p) if p >= 1 && p <= 65_535 -> Ok(Some(p))
+    _, Some(_) -> Error(Nil)
   }
 }
 
@@ -183,6 +217,13 @@ fn trim_trailing_slashes(path: String) -> String {
       |> string.drop_end(up_to: 1)
       |> trim_trailing_slashes
     False -> path
+  }
+}
+
+pub fn parse_optional_pem(raw: String) -> Option(String) {
+  case string.trim(raw) {
+    "" -> None
+    trimmed -> Some(trimmed)
   }
 }
 

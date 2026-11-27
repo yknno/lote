@@ -3,6 +3,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/set.{type Set}
 import lote/auth.{type Auth}
 import lote/auth/user.{type AuthUser}
+import lote/oidc/jwt
 import lote/oidc/scope.{type Scope}
 import lote/rate_limit.{type Limiter}
 import lote/realtime/pubsub.{type PubSub}
@@ -14,6 +15,7 @@ pub type Oidc {
   Oidc(
     db: pog.Connection,
     issuer: String,
+    keyring: jwt.Keyring,
     grant_revocations: Option(PubSub(String)),
     rate_limiter: Limiter,
   )
@@ -36,13 +38,36 @@ pub fn new(
   grant_revocations: PubSub(String),
   rate_limiter: Limiter,
 ) -> Oidc {
-  Oidc(db:, issuer:, grant_revocations: Some(grant_revocations), rate_limiter:)
+  new_with_keyring(
+    db,
+    issuer,
+    jwt.default_keyring(),
+    grant_revocations,
+    rate_limiter,
+  )
+}
+
+pub fn new_with_keyring(
+  db: pog.Connection,
+  issuer: String,
+  keyring: jwt.Keyring,
+  grant_revocations: PubSub(String),
+  rate_limiter: Limiter,
+) -> Oidc {
+  Oidc(
+    db:,
+    issuer:,
+    keyring:,
+    grant_revocations: Some(grant_revocations),
+    rate_limiter:,
+  )
 }
 
 pub fn from_auth(auth_ctx: Auth) -> Oidc {
   Oidc(
     db: auth_ctx.db,
     issuer: default_issuer,
+    keyring: jwt.default_keyring(),
     grant_revocations: None,
     rate_limiter: auth_ctx.rate_limiter,
   )
