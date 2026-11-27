@@ -300,10 +300,7 @@ pub fn issue_authorization_code(
     False -> Error(InvalidRequest("Missing redirect_uri or audience"))
   })
 
-  let grant_ttl = case set.contains(scopes, scope.OfflineAccess) {
-    True -> refresh_token_ttl_seconds
-    False -> access_token_ttl_seconds
-  }
+  let grant_ttl = auth_code_ttl_seconds
   let #(raw_code, code_hash) = generate_token("lote_ac_")
   let scope_strings = scope.to_sorted_strings(scopes)
   let clean_ua = sanitize_user_agent(user_agent)
@@ -530,7 +527,9 @@ pub fn exchange_authorization_code_with_secret(
                 ),
                 touch_grant AS (
                   UPDATE oidc_grants
-                  SET last_used_at = NOW()
+                  SET
+                    last_used_at = NOW(),
+                    expires_at = NOW() + ($7::bigint * INTERVAL '1 second')
                   FROM mark_used
                   WHERE oidc_grants.id = mark_used.grant_id
                     AND oidc_grants.expires_at > NOW()
@@ -615,7 +614,9 @@ pub fn exchange_authorization_code_with_secret(
                 ),
                 touch_grant AS (
                   UPDATE oidc_grants
-                  SET last_used_at = NOW()
+                  SET
+                    last_used_at = NOW(),
+                    expires_at = NOW() + ($5::bigint * INTERVAL '1 second')
                   FROM mark_used
                   WHERE oidc_grants.id = mark_used.grant_id
                     AND oidc_grants.expires_at > NOW()

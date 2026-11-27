@@ -5,6 +5,7 @@ import lote/auth.{type Auth, Password}
 import lote/auth/session
 import lote/realtime/pubsub
 import lote/web/auth/password_handler
+import lote/web/auth/return_to
 import lote/web/auth/view
 import lote/web/csrf
 import wisp
@@ -17,9 +18,20 @@ pub fn handle_request(
 ) -> wisp.Response {
   case req.method, segments {
     http.Get, ["login"] -> {
+      let safe_return_to =
+        wisp.get_query(req)
+        |> list.key_find("return_to")
+        |> option.from_result
+        |> return_to.sanitize
       let #(csrf_token, should_set_cookie) =
         csrf.ensure_token(req, auth_ctx.secret_key_base)
-      view.login_page(auth_ctx.methods, None, csrf_token)
+      view.login_page_with_return_to(
+        auth_ctx.methods,
+        None,
+        csrf_token,
+        safe_return_to,
+        200,
+      )
       |> csrf.attach_cookie(
         req,
         csrf_token,

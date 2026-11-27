@@ -112,6 +112,15 @@ pub fn index_page(
                     ],
                     [html.text("Clients")],
                   ),
+                  html.a(
+                    [
+                      attribute.href("/settings/grants"),
+                      attribute.class(
+                        "text-neutral-500 underline-offset-2 hover:text-neutral-950 hover:underline",
+                      ),
+                    ],
+                    [html.text("Grants")],
+                  ),
                   html.form(
                     [
                       attribute.method("post"),

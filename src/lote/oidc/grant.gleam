@@ -87,6 +87,38 @@ pub fn upsert_consent(
   }
 }
 
+pub fn ensure_consent_row(
+  db: pog.Connection,
+  user_id: Int,
+  client_ref_id: Int,
+) -> Result(#(Int, String), pog.QueryError) {
+  let sql =
+    "INSERT INTO oidc_consents (user_id, client_ref_id, scopes)
+    VALUES ($1, $2, '{}')
+    ON CONFLICT (user_id, client_ref_id) DO UPDATE
+    SET user_id = EXCLUDED.user_id
+    RETURNING id, public_id"
+
+  let decoder = {
+    use id <- decode.field(0, decode.int)
+    use public_id <- decode.field(1, uuid.decoder())
+    decode.success(#(id, public_id))
+  }
+
+  use returned <- result.try(
+    pog.query(sql)
+    |> pog.parameter(pog.int(user_id))
+    |> pog.parameter(pog.int(client_ref_id))
+    |> pog.returning(decoder)
+    |> pog.execute(db),
+  )
+
+  case returned.rows {
+    [row, ..] -> Ok(row)
+    [] -> Error(pog.ConnectionUnavailable)
+  }
+}
+
 pub fn find_consent(
   db: pog.Connection,
   user_id: Int,
@@ -116,6 +148,63 @@ pub fn find_consent(
   case returned.rows {
     [row, ..] -> Some(row)
     [] -> None
+  }
+}
+
+pub fn find_consent_for_audience(
+  db: pog.Connection,
+  user_id: Int,
+  client_ref_id: Int,
+  audience: String,
+  default_issuer: String,
+) -> Result(Option(#(Int, String, Set(Scope))), pog.QueryError) {
+  case audience == default_issuer {
+    True -> find_consent(db, user_id, client_ref_id)
+    False -> {
+      let sql =
+        "SELECT
+          con.id,
+          con.public_id,
+          ARRAY(
+            SELECT DISTINCT unnest(g.scopes)
+            FROM oidc_grants g
+            WHERE g.consent_id = con.id
+              AND g.audience = $3
+              AND g.expires_at > NOW()
+              AND (
+                g.last_used_at IS NOT NULL
+                OR NOT EXISTS (
+                  SELECT 1 FROM oidc_auth_codes ac
+                  WHERE ac.grant_id = g.id AND ac.used_at IS NULL
+                )
+              )
+            ORDER BY 1
+          )
+        FROM oidc_consents con
+        WHERE con.user_id = $1 AND con.client_ref_id = $2
+        LIMIT 1"
+
+      let decoder = {
+        use id <- decode.field(0, decode.int)
+        use public_id <- decode.field(1, uuid.decoder())
+        use scopes <- decode.field(2, scopes_decoder())
+        decode.success(#(id, public_id, scopes))
+      }
+
+      use returned <- result.map(
+        pog.query(sql)
+        |> pog.parameter(pog.int(user_id))
+        |> pog.parameter(pog.int(client_ref_id))
+        |> pog.parameter(pog.text(audience))
+        |> pog.returning(decoder)
+        |> pog.execute(db),
+      )
+
+      case returned.rows {
+        [row, ..] -> Some(row)
+        [] -> None
+      }
+    }
   }
 }
 
@@ -244,6 +333,13 @@ pub fn list_active_grants_for_user(
     INNER JOIN oidc_clients c ON c.id = con.client_ref_id
     WHERE con.user_id = $1
       AND g.expires_at > NOW()
+      AND (
+        g.last_used_at IS NOT NULL
+        OR NOT EXISTS (
+          SELECT 1 FROM oidc_auth_codes ac
+          WHERE ac.grant_id = g.id AND ac.used_at IS NULL
+        )
+      )
     ORDER BY g.created_at DESC, g.id DESC"
 
   let decoder = {
@@ -328,13 +424,18 @@ pub fn revoke_consent_by_public_id(
       let sql =
         "WITH target_consent AS (
           DELETE FROM oidc_consents
-          WHERE public_id = $1::uuid AND user_id = $2
-          RETURNING id
+          USING oidc_clients
+          WHERE oidc_consents.client_ref_id = oidc_clients.id
+            AND oidc_consents.public_id = $1::uuid
+            AND oidc_consents.user_id = $2
+            AND oidc_clients.kind <> 'subordinate_bot'
+          RETURNING oidc_consents.id
         ),
         revoked_grants AS (
           SELECT g.public_id
           FROM oidc_grants g
           INNER JOIN target_consent tc ON tc.id = g.consent_id
+          WHERE g.expires_at > NOW()
         )
         SELECT tc.id, rg.public_id
         FROM target_consent tc

@@ -16,6 +16,10 @@ import pog
 
 pub const max_active_secrets_per_client = 5
 
+pub const max_redirect_uris = 20
+
+pub const max_redirect_uri_bytes = 2048
+
 const max_name_length = 100
 
 const max_secret_label_length = 100
@@ -133,7 +137,12 @@ pub fn application_type_from_string(
 }
 
 pub fn validate_redirect_uri(raw: String) -> Result(String, String) {
-  case raw != "" && string.trim(raw) == raw && !contains_whitespace(raw) {
+  case
+    raw != ""
+    && bit_array.byte_size(<<raw:utf8>>) <= max_redirect_uri_bytes
+    && string.trim(raw) == raw
+    && !contains_whitespace(raw)
+  {
     False -> Error("Redirect URI must be a non-empty URI without whitespace")
     True ->
       case uri.parse(raw) {
@@ -325,6 +334,15 @@ pub fn create_app(
   allowed_scopes: Set(Scope),
 ) -> Result(#(Client, Option(CreatedSecret)), Error) {
   use trimmed_name <- result.try(validate_name(name))
+  use _ <- result.try(
+    case confidential && application_type == Native && visibility == Public {
+      True ->
+        Error(InvalidInput(
+          "Publicly distributed native apps cannot use a confidential client secret",
+        ))
+      False -> Ok(Nil)
+    },
+  )
   use validated_uris <- result.try(validate_redirect_uris(redirect_uris))
   use _ <- result.try(case set.is_empty(allowed_scopes) {
     True -> Error(InvalidScope("At least one scope is required"))
@@ -1029,10 +1047,17 @@ fn validate_redirect_uris(
   case unique_uris {
     [] -> Error(InvalidRedirectUri("At least one redirect URI is required"))
     _ ->
-      list.try_map(unique_uris, fn(u) {
-        validate_redirect_uri(u)
-        |> result.map_error(InvalidRedirectUri)
-      })
+      case list.length(unique_uris) > max_redirect_uris {
+        True ->
+          Error(InvalidRedirectUri(
+            "At most 20 redirect URIs may be registered per client",
+          ))
+        False ->
+          list.try_map(unique_uris, fn(u) {
+            validate_redirect_uri(u)
+            |> result.map_error(InvalidRedirectUri)
+          })
+      }
   }
 }
 

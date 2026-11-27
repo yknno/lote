@@ -12,13 +12,23 @@ pub fn login_page(
   error: Option(String),
   csrf_token: String,
 ) -> wisp.Response {
-  login_page_with_status(methods, error, csrf_token, 200)
+  login_page_with_return_to(methods, error, csrf_token, None, 200)
 }
 
 pub fn login_page_with_status(
   methods: List(Method),
   error: Option(String),
   csrf_token: String,
+  status: Int,
+) -> wisp.Response {
+  login_page_with_return_to(methods, error, csrf_token, None, status)
+}
+
+pub fn login_page_with_return_to(
+  methods: List(Method),
+  error: Option(String),
+  csrf_token: String,
+  return_to: Option(String),
   status: Int,
 ) -> wisp.Response {
   let error_el = case error {
@@ -40,7 +50,7 @@ pub fn login_page_with_status(
         html.text("No login methods enabled."),
       ]),
     ]
-    _ -> list.map(methods, method_section(_, csrf_token))
+    _ -> list.map(methods, method_section(_, csrf_token, return_to))
   }
 
   let doc =
@@ -100,7 +110,21 @@ pub fn login_page_with_status(
   wisp.html_response(doc, status)
 }
 
-fn method_section(method: Method, csrf_token: String) -> element.Element(Nil) {
+fn method_section(
+  method: Method,
+  csrf_token: String,
+  return_to: Option(String),
+) -> element.Element(Nil) {
+  let return_to_input = case return_to {
+    Some(path) ->
+      html.input([
+        attribute.type_("hidden"),
+        attribute.name("return_to"),
+        attribute.value(path),
+      ])
+    None -> element.none()
+  }
+
   case method {
     Password ->
       html.form(
@@ -115,6 +139,7 @@ fn method_section(method: Method, csrf_token: String) -> element.Element(Nil) {
             attribute.name(csrf.form_field_name),
             attribute.value(csrf_token),
           ]),
+          return_to_input,
           html.div([attribute.class("flex flex-col gap-1")], [
             html.label(
               [
