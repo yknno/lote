@@ -17,7 +17,10 @@ RUN gleam run -m lustre/dev add tailwind \
 
 FROM erlang:29.1.3-slim AS runtime
 
-RUN groupadd --system app && useradd --system --gid app app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system app && useradd --system --gid app app
 
 WORKDIR /app
 COPY --from=builder --chown=app:app /build/build/erlang-shipment ./
