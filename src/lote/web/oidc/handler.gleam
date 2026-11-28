@@ -523,7 +523,8 @@ fn require_oauth_form(
 ) -> wisp.Response {
   case has_form_urlencoded_content_type(req) {
     False -> oauth_error(400, "invalid_request", None)
-    True ->
+    True -> {
+      let req = wisp.set_max_body_size(req, max_oauth_form_bytes)
       case wisp.read_body_bits(req) {
         Error(_) -> oauth_error(400, "invalid_request", None)
         Ok(bits) ->
@@ -544,6 +545,7 @@ fn require_oauth_form(
               }
           }
       }
+    }
   }
 }
 
