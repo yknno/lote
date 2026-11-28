@@ -19,9 +19,27 @@ pub fn from_mist_request(
     |> result.map(fn(info) { mist.ip_address_to_string(info.ip_address) })
     |> option.from_result
 
-  let forwarded_for =
-    request.get_header(req, "x-forwarded-for")
-    |> option.from_result
+  from_request(req, peer_ip, trusted_proxy_hops)
+}
+
+/// Extract the canonical client IP from any HTTP request and peer IP,
+/// combining multiple `X-Forwarded-For` header fields in order per RFC 9110 §5.3.
+pub fn from_request(
+  req: Request(body),
+  peer_ip: Option(String),
+  trusted_proxy_hops: Int,
+) -> String {
+  let forwarded_for = case
+    list.filter_map(req.headers, fn(header) {
+      case string.lowercase(header.0) == "x-forwarded-for" {
+        True -> Ok(header.1)
+        False -> Error(Nil)
+      }
+    })
+  {
+    [] -> None
+    values -> Some(string.join(values, ","))
+  }
 
   extract(peer_ip, forwarded_for, trusted_proxy_hops)
 }

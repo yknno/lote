@@ -79,6 +79,18 @@ pub fn verify_same_origin_rejects_cross_scheme_origin_downgrade_test() {
     |> request.set_header("origin", "http://localhost:8080")
     |> cookie_policy.apply_trusted_forwarded_proto(0)
   assert origin.verify_same_origin(spoofed_xfp_loopback)
+
+  // Multiple X-Forwarded-Proto headers: attacker sends "http", proxy appends "https".
+  let multi_xfp_req =
+    request.Request(..request.new(), scheme: http.Http, headers: [
+      #("host", "localhost:8443"),
+      #("x-forwarded-proto", "http"),
+      #("X-Forwarded-Proto", "https"),
+      #("origin", "https://localhost:8443"),
+    ])
+    |> cookie_policy.apply_trusted_forwarded_proto(1)
+  assert multi_xfp_req.scheme == http.Https
+  assert origin.verify_same_origin(multi_xfp_req)
 }
 
 pub fn verify_same_origin_rejects_mismatched_missing_or_malformed_origin_test() {

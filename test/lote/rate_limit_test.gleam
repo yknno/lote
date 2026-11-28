@@ -1,5 +1,6 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/http/request
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/static_supervisor as supervisor
@@ -272,6 +273,30 @@ pub fn client_ip_extract_respects_trusted_proxy_hops_and_resists_spoofing_test()
     == "10.0.0.1"
   assert client_ip.extract(Some("10.0.0.1"), Some("2001:db8::あ"), 1)
     == "10.0.0.1"
+}
+
+pub fn client_ip_from_request_combines_multiple_forwarded_for_headers_test() {
+  // Attacker sends a spoofed X-Forwarded-For header and the reverse proxy
+  // appends a second X-Forwarded-For header field instead of folding it.
+  let req =
+    request.Request(..request.new(), headers: [
+      #("x-forwarded-for", "1.2.3.4"),
+      #("X-Forwarded-For", "203.0.113.5"),
+    ])
+
+  // With 1 trusted proxy hop, the proxy-appended rightmost header must win.
+  assert client_ip.from_request(req, Some("10.0.0.1"), 1) == "203.0.113.5"
+
+  // With 2 trusted proxy hops across comma-separated + separate headers:
+  let req2 =
+    request.Request(..request.new(), headers: [
+      #("x-forwarded-for", "9.9.9.9, 203.0.113.5"),
+      #("x-forwarded-for", "198.51.100.1"),
+    ])
+  assert client_ip.from_request(req2, Some("10.0.0.1"), 2) == "203.0.113.5"
+
+  // With 0 trusted proxy hops, all X-Forwarded-For headers are ignored.
+  assert client_ip.from_request(req, Some("10.0.0.1"), 0) == "10.0.0.1"
 }
 
 pub fn client_ip_rate_limit_bucket_masks_ipv4_32_and_ipv6_64_test() {
