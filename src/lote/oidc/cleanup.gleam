@@ -147,7 +147,15 @@ fn delete_expired_auth_codes(
   batch_limit: Int,
 ) -> Result(Int, pog.QueryError) {
   pog.query(
-    "DELETE FROM oidc_auth_codes WHERE code_hash IN (SELECT code_hash FROM oidc_auth_codes WHERE expires_at <= NOW() LIMIT $1)",
+    "DELETE FROM oidc_auth_codes
+    WHERE code_hash IN (
+      SELECT ac.code_hash
+      FROM oidc_auth_codes ac
+      INNER JOIN oidc_grants g ON g.id = ac.grant_id
+      WHERE ac.expires_at <= NOW()
+        AND (ac.used_at IS NULL OR g.expires_at <= NOW())
+      LIMIT $1
+    )",
   )
   |> pog.parameter(pog.int(batch_limit))
   |> pog.returning(decode.dynamic)
