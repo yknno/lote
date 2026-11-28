@@ -20,10 +20,19 @@ pub fn apply_trusted_forwarded_proto(
   req: Request(body),
   trusted_proxy_hops: Int,
 ) -> Request(body) {
-  case trusted_proxy_hops > 0, request.get_header(req, "x-forwarded-proto") {
-    True, Ok(header) -> {
+  let forwarded_protos =
+    list.filter_map(req.headers, fn(header) {
+      case string.lowercase(header.0) == "x-forwarded-proto" {
+        True -> Ok(header.1)
+        False -> Error(Nil)
+      }
+    })
+
+  case trusted_proxy_hops > 0, forwarded_protos {
+    True, [_, ..] -> {
       let hops =
-        header
+        forwarded_protos
+        |> string.join(",")
         |> string.split(",")
         |> list.map(string.trim)
         |> list.filter(fn(part) { part != "" })
