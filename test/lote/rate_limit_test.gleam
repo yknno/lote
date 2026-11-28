@@ -1,5 +1,6 @@
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/otp/static_supervisor as supervisor
 import gleam/string
@@ -171,6 +172,66 @@ pub fn postgres_limiter_enforces_atomic_gcra_hashes_keys_and_cleans_expired_test
   // pg:active still exists and has remaining == 1 on next check at t0 + 100_000
   assert rate_limit.check_at(limiter, "pg:active", policy, t0 + 100_000)
     == rate_limit.Allowed(remaining: 1)
+}
+
+pub fn postgres_limiter_enforces_burst_under_concurrent_cold_key_burst_test() {
+  let cfg = config.load()
+  let pool_name = process.new_name("lote_rate_limit_concurrent_db")
+  let assert Ok(db_config) = pog.url_config(pool_name, cfg.database_url)
+  let db_config =
+    db_config
+    |> pog.pool_size(12)
+    |> pog.connection_parameter("timezone", "UTC")
+  let assert Ok(started) = pog.start(db_config)
+  let db = started.data
+
+  let limiter = rate_limit.postgres(db, test_secret)
+  let policy = rate_limit.Policy(limit: 10, window_ms: 60_000, burst: 3)
+  let t0 = 9_000_000
+  let raw_key = "concurrent:cold-key:" <> string.inspect(process.self())
+  rate_limit.reset(limiter, raw_key)
+
+  let results_subject = process.new_subject()
+  let workers = 10
+
+  let _ =
+    list.repeat(Nil, workers)
+    |> list.each(fn(_) {
+      let _ =
+        process.spawn(fn() {
+          let decision = rate_limit.check_at(limiter, raw_key, policy, t0)
+          process.send(results_subject, decision)
+        })
+      Nil
+    })
+
+  let decisions =
+    list.repeat(Nil, workers)
+    |> list.map(fn(_) {
+      let assert Ok(decision) = process.receive(results_subject, 5000)
+      decision
+    })
+
+  rate_limit.reset(limiter, raw_key)
+  process.send_exit(started.pid)
+
+  let allowed_count =
+    list.count(decisions, fn(d) {
+      case d {
+        rate_limit.Allowed(_) -> True
+        rate_limit.Limited(_) -> False
+      }
+    })
+  let limited_count =
+    list.count(decisions, fn(d) {
+      case d {
+        rate_limit.Limited(_) -> True
+        rate_limit.Allowed(_) -> False
+      }
+    })
+
+  assert allowed_count == 3
+  assert limited_count == workers - 3
 }
 
 pub fn client_ip_extract_respects_trusted_proxy_hops_and_resists_spoofing_test() {
