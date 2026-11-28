@@ -99,16 +99,17 @@ fn delete_batches(
         batch_limit,
       ))
       use deleted_grant_ids <- result.try(delete_expired_grants(db, batch_limit))
-      use deleted_cimd <- result.try(delete_expired_unused_cimd_clients(
-        db,
-        batch_limit,
-      ))
 
       case grant_revocations {
         Some(subject) ->
           list.each(deleted_grant_ids, fn(id) { pubsub.publish(subject, id) })
         None -> Nil
       }
+
+      use deleted_cimd <- result.try(delete_expired_unused_cimd_clients(
+        db,
+        batch_limit,
+      ))
 
       let deleted_grants = list.length(deleted_grant_ids)
       let batch_total =
