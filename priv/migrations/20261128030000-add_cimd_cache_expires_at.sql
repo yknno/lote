@@ -2,6 +2,11 @@
 ALTER TABLE oidc_clients
     ADD COLUMN cimd_expires_at TIMESTAMPTZ;
 
+UPDATE oidc_clients
+SET visibility = 'public',
+    cimd_expires_at = COALESCE(cimd_expires_at, NOW())
+WHERE kind = 'cimd';
+
 ALTER TABLE oidc_clients
     ADD CONSTRAINT oidc_clients_cimd_check
         CHECK (
