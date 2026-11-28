@@ -57,8 +57,20 @@ subscriber_table_holder_init(Parent, Ref) ->
             subscriber_table_holder_loop()
     catch
         error:badarg ->
+            wait_for_subscriber_table(500),
             Parent ! {Ref, ok}
     end.
+
+wait_for_subscriber_table(Attempts) when Attempts > 0 ->
+    case ets:whereis(?SUBSCRIBER_ETS_TABLE) of
+        undefined ->
+            timer:sleep(1),
+            wait_for_subscriber_table(Attempts - 1);
+        _Tid ->
+            ok
+    end;
+wait_for_subscriber_table(_) ->
+    ok.
 
 subscriber_table_holder_loop() ->
     receive
