@@ -9,9 +9,8 @@ import gleam/uri
 import lote/oidc.{type Oidc}
 import lote/oidc/scope
 import lote/web/oidc/bearer
+import lote/web/oidc/discovery_handler
 import wisp
-
-const bearer_invalid_request = "Bearer realm=\"lote\", error=\"invalid_request\""
 
 const max_form_bytes = 16_384
 
@@ -28,7 +27,7 @@ pub fn handle_request(req: wisp.Request, oidc_ctx: Oidc) -> wisp.Response {
 
 fn handle_userinfo(req: wisp.Request, oidc_ctx: Oidc) -> wisp.Response {
   case has_query_access_token(req) {
-    True -> invalid_request_response()
+    True -> invalid_request_response(oidc_ctx.issuer)
     False -> {
       use principal <- bearer.authorize(
         req,
@@ -37,7 +36,7 @@ fn handle_userinfo(req: wisp.Request, oidc_ctx: Oidc) -> wisp.Response {
         bearer.Read,
       )
       case validate_post_body_without_access_token(req) {
-        Error(Nil) -> invalid_request_response()
+        Error(Nil) -> invalid_request_response(oidc_ctx.issuer)
         Ok(Nil) -> {
           let claims = case oidc.has_scope(principal, scope.Profile) {
             True -> [
@@ -104,11 +103,17 @@ fn has_form_urlencoded_content_type(req: wisp.Request) -> Bool {
   }
 }
 
-fn invalid_request_response() -> wisp.Response {
+fn invalid_request_response(issuer: String) -> wisp.Response {
+  let meta_url = discovery_handler.resource_metadata_url(issuer)
   json.object([#("error", json.string("invalid_request"))])
   |> json.to_string
   |> wisp.json_response(400)
-  |> response.set_header("www-authenticate", bearer_invalid_request)
+  |> response.set_header(
+    "www-authenticate",
+    "Bearer realm=\"lote\", error=\"invalid_request\", resource_metadata=\""
+      <> meta_url
+      <> "\"",
+  )
 }
 
 fn with_no_store_headers(resp: wisp.Response) -> wisp.Response {
