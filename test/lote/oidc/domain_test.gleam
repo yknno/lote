@@ -938,6 +938,118 @@ pub fn offline_token_introspection_revocation_and_client_delete_grants_test() {
   pubsub.stop(revocations)
 }
 
+pub fn cleanup_preserves_used_auth_code_for_replay_detection_and_cleans_expired_refresh_tokens_test() {
+  use tx <- test_helper.with_db
+
+  let assert Ok(revocations) = pubsub.start()
+  let rev_sub = process.new_subject()
+  pubsub.subscribe(revocations, rev_sub)
+  let oidc_ctx = make_oidc(tx, Some(revocations))
+
+  let assert Ok(alice) = user.create(tx, "ReplayCleanupAlice")
+  let scopes =
+    set.from_list([scope.OpenId, scope.OfflineAccess, scope.PostsRead])
+  let redirect_uri = "https://replay-cleanup.example.com/cb"
+  let assert Ok(#(app, None)) =
+    client.create_app(
+      tx,
+      alice.id,
+      "Replay Cleanup App",
+      False,
+      client.Private,
+      client.Web,
+      [redirect_uri],
+      scopes,
+    )
+  let assert Ok(#(consent_id, _, _)) =
+    grant.upsert_consent(tx, alice.id, app.id, scopes)
+
+  // 1. Exchange auth code -> mark auth code expired -> run cleanup -> replay must still revoke grant
+  let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
+  let challenge = token.compute_pkce_s256_challenge(verifier)
+  let assert Ok(#(code1, _)) =
+    token.issue_authorization_code(
+      tx,
+      consent_id,
+      scopes,
+      oidc.default_issuer,
+      redirect_uri,
+      challenge,
+      None,
+      "TestAgent/1.0",
+    )
+  let assert Ok(issued1) =
+    token.exchange_authorization_code(
+      oidc_ctx,
+      app,
+      code1,
+      redirect_uri,
+      verifier,
+      None,
+    )
+
+  // Backdate used auth code expires_at while parent grant remains active
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE oidc_auth_codes SET expires_at = NOW() - INTERVAL '1 hour'",
+    )
+    |> pog.returning(decode.dynamic)
+    |> pog.execute(tx)
+
+  assert cleanup.run_once(tx, Some(revocations), 50) == Ok(0)
+
+  // Replaying the used auth code still triggers compromised-grant revocation!
+  assert token.exchange_authorization_code(
+      oidc_ctx,
+      app,
+      code1,
+      redirect_uri,
+      verifier,
+      None,
+    )
+    == Error(token.InvalidGrant)
+  assert process.receive(rev_sub, 200) == Ok(issued1.grant_public_id)
+  assert token.authenticate_access_token(tx, issued1.access_token, None)
+    == Error(Nil)
+
+  // 2. Rotated refresh tokens are deleted once their own 30-day expires_at elapses
+  // so long-lived sliding-window grants do not accumulate unbounded RT rows.
+  let assert Ok(#(code2, _)) =
+    token.issue_authorization_code(
+      tx,
+      consent_id,
+      scopes,
+      oidc.default_issuer,
+      redirect_uri,
+      challenge,
+      None,
+      "TestAgent/1.0",
+    )
+  let assert Ok(issued2) =
+    token.exchange_authorization_code(
+      oidc_ctx,
+      app,
+      code2,
+      redirect_uri,
+      verifier,
+      None,
+    )
+  let assert Some(rt1) = issued2.refresh_token
+  let assert Ok(_rotated) =
+    token.rotate_refresh_token(oidc_ctx, app, rt1, None, None)
+
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE oidc_refresh_tokens SET expires_at = NOW() - INTERVAL '1 hour' WHERE used_at IS NOT NULL",
+    )
+    |> pog.returning(decode.dynamic)
+    |> pog.execute(tx)
+
+  assert cleanup.run_once(tx, Some(revocations), 50) == Ok(1)
+
+  pubsub.stop(revocations)
+}
+
 fn make_oidc(
   db: pog.Connection,
   grant_revocations: Option(pubsub.PubSub(String)),
