@@ -182,7 +182,8 @@ pub fn parse_and_validate_document_strict_compliance_test() {
   assert meta1.client_name == "app.example.com"
   assert meta1.application_type == client.Web
   assert meta1.redirect_uris == ["https://app.example.com/cb"]
-  assert meta1.allowed_scopes == set.from_list(scope.all())
+  assert meta1.allowed_scopes
+    == set.delete(set.from_list(scope.all()), scope.OfflineAccess)
   assert meta1.cache_ttl_seconds == cimd.default_cache_ttl_seconds
 
   // Full native client metadata + scope filtering + Cache-Control clamping
@@ -669,6 +670,19 @@ pub fn cimd_security_audit_regressions_test() {
     )
   assert !set.contains(parsed_no_rt.allowed_scopes, scope.OfflineAccess)
   assert parsed_no_rt.cache_ttl_seconds == cimd.min_cache_ttl_seconds
+
+  // 6. Omitted grant_types defaults to ["authorization_code"] (RFC 7591 §2), stripping offline_access
+  let omitted_gt_doc =
+    "{\"client_id\":\""
+    <> cid
+    <> "\",\"scope\":\"openid offline_access posts:read\",\"redirect_uris\":[\"https://app.example.com/cb\"]}"
+  let assert Ok(parsed_omitted_gt) =
+    cimd.parse_and_validate_document(
+      cid,
+      json_response(200, "application/json", None, omitted_gt_doc),
+    )
+  assert parsed_omitted_gt.allowed_scopes
+    == set.from_list([scope.OpenId, scope.PostsRead])
 }
 
 @external(erlang, "lote_cimd_http_ffi", "is_global_public_ip_string")
