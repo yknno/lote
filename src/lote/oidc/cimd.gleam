@@ -599,7 +599,7 @@ fn validate_grant_types(
   grant_types_opt: Option(List(String)),
 ) -> Result(Bool, CimdError) {
   case grant_types_opt {
-    None -> Ok(True)
+    None -> Ok(False)
     Some([]) -> Error(InvalidDocument("grant_types must not be an empty array"))
     Some(gts) ->
       case
