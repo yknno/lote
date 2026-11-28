@@ -10,6 +10,7 @@ import gleam/string
 import lote/auth.{Auth, Password}
 import lote/auth/session
 import lote/auth/user
+import lote/config
 import lote/oidc
 import lote/oidc/client
 import lote/oidc/grant
@@ -20,6 +21,7 @@ import lote/realtime/pubsub
 import lote/test_helper
 import lote/web/csrf
 import lote/web/router
+import pog
 import wisp
 import wisp/simulate
 
@@ -321,4 +323,83 @@ pub fn revoking_confidential_app_secret_invalidates_access_token_while_preservin
       |> request.set_header("authorization", "Bearer " <> at_2),
     ).status
     == 200
+}
+
+pub fn concurrent_create_secret_enforces_max_active_secrets_limit_test() {
+  let cfg = config.load()
+  let pool_name = process.new_name("lote_create_secret_concurrent_db")
+  let assert Ok(db_config) = pog.url_config(pool_name, cfg.database_url)
+  let db_config =
+    db_config
+    |> pog.pool_size(10)
+    |> pog.connection_parameter("timezone", "UTC")
+  let assert Ok(started) = pog.start(db_config)
+  let db = started.data
+
+  let assert Ok(alice) = user.create(db, "ConcurrentSecretAlice")
+  let assert Ok(bot) =
+    client.create_subordinate_bot(
+      db,
+      alice.id,
+      "Concurrent Secret Bot",
+      set.from_list([scope.PostsRead]),
+      "initial",
+      None,
+    )
+
+  let results_subject = process.new_subject()
+  let workers = 8
+
+  let _ =
+    list.repeat(Nil, workers)
+    |> list.each(fn(_) {
+      let _ =
+        process.spawn(fn() {
+          let res =
+            client.create_secret(
+              db,
+              alice.id,
+              bot.client.client_id,
+              "concurrent",
+              None,
+            )
+          process.send(results_subject, res)
+        })
+      Nil
+    })
+
+  let results =
+    list.repeat(Nil, workers)
+    |> list.map(fn(_) {
+      let assert Ok(res) = process.receive(results_subject, 5000)
+      res
+    })
+
+  let succeeded =
+    list.count(results, fn(r) {
+      case r {
+        Ok(_) -> True
+        Error(_) -> False
+      }
+    })
+  let limit_exceeded =
+    list.count(results, fn(r) {
+      case r {
+        Error(client.SecretLimitExceeded) -> True
+        _ -> False
+      }
+    })
+
+  // Clean up test user (cascades to oidc_clients & oidc_client_secrets)
+  let _ =
+    pog.query("DELETE FROM users WHERE id = $1")
+    |> pog.parameter(pog.int(alice.id))
+    |> pog.returning(decode.dynamic)
+    |> pog.execute(db)
+  process.send_exit(started.pid)
+
+  // Initial secret (1) + 4 newly created == max_active_secrets_per_client (5)
+  assert succeeded == client.max_active_secrets_per_client - 1
+  assert limit_exceeded
+    == workers - { client.max_active_secrets_per_client - 1 }
 }

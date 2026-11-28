@@ -10,6 +10,7 @@ import gleam/string
 import gleam/time/calendar
 import gleam/time/timestamp.{type Timestamp}
 import gleam/uri.{type Uri}
+import lote/db/pool
 import lote/db/uuid
 import lote/oidc/scope.{type Scope}
 import pog
@@ -795,84 +796,95 @@ pub fn create_secret(
       use trimmed_label <- result.try(validate_secret_label(label))
       use _ <- result.try(validate_ttl(ttl_seconds))
 
-      let lookup_sql =
-        "SELECT id, kind
-        FROM oidc_clients
-        WHERE client_id = $1 AND owner_user_id = $2
-        FOR UPDATE"
+      let tx_result =
+        pool.with_transaction(db, fn(tx) {
+          let lookup_sql =
+            "SELECT id, kind
+            FROM oidc_clients
+            WHERE client_id = $1 AND owner_user_id = $2
+            FOR UPDATE"
 
-      let lookup_decoder = {
-        use id <- decode.field(0, decode.int)
-        use kind <- decode.field(1, kind_decoder())
-        decode.success(#(id, kind))
-      }
-
-      let lookup_result =
-        pog.query(lookup_sql)
-        |> pog.parameter(pog.text(client_id))
-        |> pog.parameter(pog.int(owner_user_id))
-        |> pog.returning(lookup_decoder)
-        |> pog.execute(db)
-
-      case lookup_result {
-        Error(_) -> Error(InternalError)
-        Ok(pog.Returned(rows: [], ..)) -> Error(NotFound)
-        Ok(pog.Returned(rows: [#(_, PublicApp), ..], ..))
-        | Ok(pog.Returned(rows: [#(_, Cimd), ..], ..)) ->
-          Error(InvalidInput("This client kind does not support client secrets"))
-        Ok(pog.Returned(rows: [#(client_ref_id, _), ..], ..)) -> {
-          let #(raw_secret, secret_prefix, secret_hash) =
-            generate_client_secret()
-
-          let insert_sql =
-            "INSERT INTO oidc_client_secrets (
-              client_ref_id,
-              label,
-              secret_prefix,
-              secret_hash,
-              expires_at
-            )
-            SELECT
-              $1,
-              $2,
-              $3,
-              $4,
-              CASE
-                WHEN $5::bigint IS NULL THEN NULL
-                ELSE NOW() + ($5::bigint * INTERVAL '1 second')
-              END
-            WHERE (
-              SELECT COUNT(*)
-              FROM oidc_client_secrets
-              WHERE client_ref_id = $1
-                AND (expires_at IS NULL OR expires_at > NOW())
-            ) < $6
-            RETURNING
-              public_id,
-              label,
-              secret_prefix,
-              expires_at,
-              last_used_at,
-              created_at"
-
-          let insert_result =
-            pog.query(insert_sql)
-            |> pog.parameter(pog.int(client_ref_id))
-            |> pog.parameter(pog.text(trimmed_label))
-            |> pog.parameter(pog.text(secret_prefix))
-            |> pog.parameter(pog.bytea(secret_hash))
-            |> pog.parameter(pog.nullable(pog.int, ttl_seconds))
-            |> pog.parameter(pog.int(max_active_secrets_per_client))
-            |> pog.returning(secret_info_decoder_at(0))
-            |> pog.execute(db)
-
-          case insert_result {
-            Ok(pog.Returned(rows: [info, ..], ..)) ->
-              Ok(CreatedSecret(secret: raw_secret, info:))
-            Ok(pog.Returned(rows: [], ..)) -> Error(SecretLimitExceeded)
-            Error(_) -> Error(InternalError)
+          let lookup_decoder = {
+            use id <- decode.field(0, decode.int)
+            use kind <- decode.field(1, kind_decoder())
+            decode.success(#(id, kind))
           }
-        }
+
+          let lookup_result =
+            pog.query(lookup_sql)
+            |> pog.parameter(pog.text(client_id))
+            |> pog.parameter(pog.int(owner_user_id))
+            |> pog.returning(lookup_decoder)
+            |> pog.execute(tx)
+
+          case lookup_result {
+            Error(_) -> Error(InternalError)
+            Ok(pog.Returned(rows: [], ..)) -> Error(NotFound)
+            Ok(pog.Returned(rows: [#(_, PublicApp), ..], ..))
+            | Ok(pog.Returned(rows: [#(_, Cimd), ..], ..)) ->
+              Error(InvalidInput(
+                "This client kind does not support client secrets",
+              ))
+            Ok(pog.Returned(rows: [#(client_ref_id, _), ..], ..)) -> {
+              let #(raw_secret, secret_prefix, secret_hash) =
+                generate_client_secret()
+
+              let insert_sql =
+                "INSERT INTO oidc_client_secrets (
+                  client_ref_id,
+                  label,
+                  secret_prefix,
+                  secret_hash,
+                  expires_at
+                )
+                SELECT
+                  $1,
+                  $2,
+                  $3,
+                  $4,
+                  CASE
+                    WHEN $5::bigint IS NULL THEN NULL
+                    ELSE NOW() + ($5::bigint * INTERVAL '1 second')
+                  END
+                WHERE (
+                  SELECT COUNT(*)
+                  FROM oidc_client_secrets
+                  WHERE client_ref_id = $1
+                    AND (expires_at IS NULL OR expires_at > NOW())
+                ) < $6
+                RETURNING
+                  public_id,
+                  label,
+                  secret_prefix,
+                  expires_at,
+                  last_used_at,
+                  created_at"
+
+              let insert_result =
+                pog.query(insert_sql)
+                |> pog.parameter(pog.int(client_ref_id))
+                |> pog.parameter(pog.text(trimmed_label))
+                |> pog.parameter(pog.text(secret_prefix))
+                |> pog.parameter(pog.bytea(secret_hash))
+                |> pog.parameter(pog.nullable(pog.int, ttl_seconds))
+                |> pog.parameter(pog.int(max_active_secrets_per_client))
+                |> pog.returning(secret_info_decoder_at(0))
+                |> pog.execute(tx)
+
+              case insert_result {
+                Ok(pog.Returned(rows: [info, ..], ..)) ->
+                  Ok(CreatedSecret(secret: raw_secret, info:))
+                Ok(pog.Returned(rows: [], ..)) -> Error(SecretLimitExceeded)
+                Error(_) -> Error(InternalError)
+              }
+            }
+          }
+        })
+
+      case tx_result {
+        Ok(created) -> Ok(created)
+        Error(pog.TransactionRolledBack(err)) -> Error(err)
+        Error(pog.TransactionQueryError(_)) -> Error(InternalError)
       }
     }
   }
