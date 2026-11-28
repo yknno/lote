@@ -1,5 +1,6 @@
 import gleam/bit_array
 import gleam/dynamic/decode
+import gleam/erlang/atom.{type Atom}
 import gleam/erlang/process
 import gleam/list
 import gleam/otp/static_supervisor as supervisor
@@ -14,6 +15,13 @@ import lote/realtime/pubsub
 import lote/test_helper
 import lote/web/components/timeline
 import pog
+
+@external(erlang, "erlang", "system_info")
+fn erlang_system_info_int(key: Atom) -> Int
+
+fn atom_count() -> Int {
+  erlang_system_info_int(atom.create("atom_count"))
+}
 
 pub fn publish_broadcasts_to_all_subscribers_test() {
   let assert Ok(bus) = pubsub.start()
@@ -368,6 +376,8 @@ pub fn postgres_listener_reconnects_after_backend_termination_preserving_subscri
     process.receive(sub, 50) == Ok("before-drop")
   })
 
+  let atoms_before_reconnect = atom_count()
+
   // Simulate DB restart / admin disconnect by terminating the LISTEN backend connection
   let pid_decoder = {
     use pid <- decode.field(0, decode.int)
@@ -392,7 +402,7 @@ pub fn postgres_listener_reconnects_after_backend_termination_preserving_subscri
   })
 
   // Wait for automatic reconnect and verify the existing subscriber receives new events
-  // without re-subscribing and without crashing the PubSub actor
+  // without re-subscribing, without crashing the PubSub actor, and without leaking atoms
   assert wait_until_listening(db, channel, "after-reconnect", fn() {
     case process.receive(sub, 80) {
       Ok("after-reconnect") -> True
@@ -400,6 +410,7 @@ pub fn postgres_listener_reconnects_after_backend_termination_preserving_subscri
     }
   })
   assert pubsub.subscriber_count(bus) == 1
+  assert atom_count() == atoms_before_reconnect
 
   pubsub.stop(bus)
   process.send_exit(started_pool.pid)
