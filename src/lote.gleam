@@ -39,7 +39,13 @@ import wisp/wisp_mist
 pub fn main() -> Nil {
   wisp.configure_logger()
 
-  let cfg = config.load()
+  let cfg = case config.load_strict() {
+    Ok(loaded) -> loaded
+    Error(err) -> {
+      wisp.log_error("Invalid configuration: " <> config.format_error(err))
+      panic as "Invalid configuration"
+    }
+  }
   let db_pool_name = process.new_name("lote_db")
   let db_config = pool.config(db_pool_name, cfg.database_url)
   let db = pog.named_connection(db_pool_name)

@@ -56,11 +56,11 @@ AUTH_ADAPTERS=password mise exec -- gleam run
 
 | Variable | Description | Default |
 | --- | --- | --- |
-| `PORT` | HTTP サーバーの待ち受けポート | `8080` |
+| `PORT` | HTTP サーバーの待ち受けポート（`1..65535`） | `8080` |
 | `DATABASE_URL` | PostgreSQL 接続 URL | `postgres://postgres:postgres@localhost:5432/lote` |
-| `SECRET_KEY_BASE` | Cookie 署名キー | 起動時にランダム生成 |
-| `ISSUER_URL` | OAuth 2.0 / OIDC Issuer URL（兼デフォルト API Audience） | `http://localhost:<PORT>` |
-| `OIDC_SIGNING_KEY_PEM` | ES256 `id_token` 署名用 EC P-256 秘密鍵 PEM | 起動時にエフェメラル生成 |
+| `SECRET_KEY_BASE` | Cookie 署名キー（64 バイト以上、`https://` Issuer 時は必須） | `http://` 時のみ起動時にランダム生成 |
+| `ISSUER_URL` | OAuth 2.0 / OIDC Issuer URL（兼デフォルト API Audience、不正値は起動エラー） | `http://localhost:<PORT>` |
+| `OIDC_SIGNING_KEY_PEM` | ES256 `id_token` 署名用 EC P-256 秘密鍵 PEM（`https://` Issuer 時は必須） | `http://` 時のみ起動時にエフェメラル生成 |
 | `OIDC_VERIFY_KEYS_PEM` | 鍵ローテーション中の旧 EC P-256 公開鍵 PEM バンドル | 空（なし） |
 | `AUTH_ADAPTERS` | 有効にするログイン方式（カンマ区切り、例: `password`） | 空（すべて無効） |
 | `PUBSUB_ADAPTER` | PubSub バックエンド（`memory` または `postgres`） | `memory` |
