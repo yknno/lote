@@ -11,6 +11,7 @@ import gleam/set.{type Set}
 import gleam/string
 import gleam/uri
 import lote/oidc.{type Oidc}
+import lote/oidc/cimd
 import lote/oidc/client.{type Client}
 import lote/oidc/jwt
 import lote/oidc/scope.{type Scope}
@@ -92,6 +93,7 @@ fn handle_token(
         creds,
         ip_bucket,
         True,
+        True,
       )
       handle_client_credentials_grant(
         req,
@@ -112,6 +114,7 @@ fn handle_token(
         creds,
         ip_bucket,
         False,
+        True,
       )
       handle_authorization_code_grant(
         oidc_ctx,
@@ -131,6 +134,7 @@ fn handle_token(
         creds,
         ip_bucket,
         False,
+        True,
       )
       handle_refresh_token_grant(
         oidc_ctx,
@@ -269,6 +273,7 @@ fn handle_revoke(
     creds,
     ip_bucket,
     False,
+    False,
   )
 
   case require_non_empty_param(form_values, "token") {
@@ -297,6 +302,7 @@ fn handle_introspect(
     client_id,
     creds,
     ip_bucket,
+    True,
     True,
   )
 
@@ -336,7 +342,7 @@ fn require_valid_client_id(
 ) -> wisp.Response {
   case creds.client_id {
     Some(cid) ->
-      case client.is_valid_client_id_format(cid) {
+      case client.is_lookupable_client_id(cid) {
         True -> next(cid)
         False -> invalid_client_response()
       }
@@ -363,6 +369,7 @@ fn with_authenticated_client(
   creds: ExtractedCredentials,
   ip_bucket: String,
   require_confidential: Bool,
+  revalidate_cimd: Bool,
   next: fn(Client, Option(Int)) -> wisp.Response,
 ) -> wisp.Response {
   case
@@ -372,6 +379,7 @@ fn with_authenticated_client(
       creds,
       ip_bucket,
       require_confidential,
+      revalidate_cimd,
     )
   {
     ClientAuthenticated(authed, secret_id) -> next(authed, secret_id)
@@ -385,6 +393,7 @@ fn authenticate_client_with_limits(
   creds: ExtractedCredentials,
   ip_bucket: String,
   require_confidential: Bool,
+  revalidate_cimd: Bool,
 ) -> ClientAuthOutcome {
   case client.find_by_client_id(oidc_ctx.db, client_id) {
     Error(_) -> ClientAuthRejected(oauth_error(500, "server_error", None))
@@ -440,13 +449,66 @@ fn authenticate_client_with_limits(
           }
         }
 
-        client.PublicApp | client.Cimd ->
+        client.PublicApp ->
           case require_confidential, creds.client_secret, creds.used_basic {
             True, _, _ | _, Some(_), _ | _, _, True ->
               ClientAuthRejected(invalid_client_response())
             False, None, False -> ClientAuthenticated(found, None)
           }
+
+        client.Cimd ->
+          case require_confidential, creds.client_secret, creds.used_basic {
+            True, _, _ | _, Some(_), _ | _, _, True ->
+              ClientAuthRejected(invalid_client_response())
+            False, None, False ->
+              case revalidate_cimd {
+                False -> ClientAuthenticated(found, None)
+                True ->
+                  revalidate_existing_cimd_client(oidc_ctx, found, ip_bucket)
+              }
+          }
       }
+  }
+}
+
+fn revalidate_existing_cimd_client(
+  oidc_ctx: Oidc,
+  found: Client,
+  ip_bucket: String,
+) -> ClientAuthOutcome {
+  case client.find_fresh_cimd_by_client_id(oidc_ctx.db, found.client_id) {
+    Error(_) -> ClientAuthRejected(oauth_error(500, "server_error", None))
+    Ok(Some(fresh)) -> ClientAuthenticated(fresh, None)
+    Ok(None) -> {
+      let on_network_fetch = fn() {
+        case
+          rate_limit.check(
+            oidc_ctx.rate_limiter,
+            rate_policy.cimd_fetch_ip_key(ip_bucket),
+            rate_policy.cimd_fetch_ip_policy,
+          )
+        {
+          rate_limit.Allowed(_) -> Ok(Nil)
+          rate_limit.Limited(retry_after_seconds:) ->
+            Error(rate_limited_response(retry_after_seconds))
+        }
+      }
+
+      case
+        cimd.resolve_client(
+          oidc_ctx.db,
+          oidc_ctx.cimd_fetcher,
+          found.client_id,
+          on_network_fetch,
+        )
+      {
+        Error(rate_resp) -> ClientAuthRejected(rate_resp)
+        Ok(Ok(refreshed_client)) -> ClientAuthenticated(refreshed_client, None)
+        Ok(Error(cimd.DatabaseError)) ->
+          ClientAuthRejected(oauth_error(500, "server_error", None))
+        Ok(Error(_)) -> ClientAuthRejected(invalid_client_response())
+      }
+    }
   }
 }
 

@@ -589,6 +589,15 @@ pub fn is_valid_client_id_format(raw: String) -> Bool {
   }
 }
 
+pub fn is_lookupable_client_id(raw: String) -> Bool {
+  is_valid_client_id_format(raw)
+  || {
+    string.starts_with(raw, "https://")
+    && bit_array.byte_size(<<raw:utf8>>) <= 512
+    && !contains_whitespace(raw)
+  }
+}
+
 pub fn is_valid_secret_format(raw: String) -> Bool {
   case bit_array.byte_size(<<raw:utf8>>) == 51 {
     False -> False
@@ -604,7 +613,7 @@ pub fn find_by_client_id(
   db: pog.Connection,
   client_id: String,
 ) -> Result(Option(Client), pog.QueryError) {
-  case is_valid_client_id_format(client_id) {
+  case is_lookupable_client_id(client_id) {
     False -> Ok(None)
     True -> {
       let sql =
@@ -635,6 +644,141 @@ pub fn find_by_client_id(
         [] -> None
       }
     }
+  }
+}
+
+pub fn find_fresh_cimd_by_client_id(
+  db: pog.Connection,
+  client_id: String,
+) -> Result(Option(Client), pog.QueryError) {
+  case is_lookupable_client_id(client_id) {
+    False -> Ok(None)
+    True -> {
+      let sql =
+        "SELECT
+          id,
+          client_id,
+          owner_user_id,
+          kind,
+          visibility,
+          application_type,
+          name,
+          redirect_uris,
+          allowed_scopes,
+          created_at
+        FROM oidc_clients
+        WHERE client_id = $1
+          AND kind = 'cimd'
+          AND cimd_expires_at > NOW()
+        LIMIT 1"
+
+      use returned <- result.map(
+        pog.query(sql)
+        |> pog.parameter(pog.text(client_id))
+        |> pog.returning(client_decoder_at(0))
+        |> pog.execute(db),
+      )
+
+      case returned.rows {
+        [client, ..] -> Some(client)
+        [] -> None
+      }
+    }
+  }
+}
+
+pub fn upsert_cimd_client(
+  db: pog.Connection,
+  client_id: String,
+  name: String,
+  application_type: ApplicationType,
+  redirect_uris: List(String),
+  allowed_scopes: Set(Scope),
+  ttl_seconds: Int,
+) -> Result(Client, Error) {
+  use trimmed_name <- result.try(validate_name(name))
+  use validated_uris <- result.try(validate_redirect_uris(redirect_uris))
+  use _ <- result.try(case set.is_empty(allowed_scopes) {
+    True -> Error(InvalidScope("At least one scope is required"))
+    False -> Ok(Nil)
+  })
+  use _ <- result.try(
+    case
+      string.starts_with(client_id, "https://")
+      && bit_array.byte_size(<<client_id:utf8>>) <= 512
+      && !contains_whitespace(client_id)
+    {
+      True -> Ok(Nil)
+      False -> Error(InvalidInput("Invalid CIMD client_id"))
+    },
+  )
+  use _ <- result.try(case ttl_seconds > 0 {
+    True -> Ok(Nil)
+    False -> Error(InvalidInput("CIMD cache TTL must be positive"))
+  })
+
+  let app_type_str = application_type_to_string(application_type)
+  let scope_strings = scope.to_sorted_strings(allowed_scopes)
+
+  let sql =
+    "INSERT INTO oidc_clients (
+      client_id,
+      owner_user_id,
+      kind,
+      visibility,
+      application_type,
+      name,
+      redirect_uris,
+      allowed_scopes,
+      cimd_expires_at
+    )
+    VALUES (
+      $1,
+      NULL,
+      'cimd',
+      'public',
+      $2,
+      $3,
+      $4,
+      $5,
+      NOW() + ($6::bigint * INTERVAL '1 second')
+    )
+    ON CONFLICT (client_id)
+    DO UPDATE SET
+      application_type = EXCLUDED.application_type,
+      name = EXCLUDED.name,
+      redirect_uris = EXCLUDED.redirect_uris,
+      allowed_scopes = EXCLUDED.allowed_scopes,
+      cimd_expires_at = EXCLUDED.cimd_expires_at,
+      updated_at = NOW()
+    WHERE oidc_clients.kind = 'cimd'
+    RETURNING
+      id,
+      client_id,
+      owner_user_id,
+      kind,
+      visibility,
+      application_type,
+      name,
+      redirect_uris,
+      allowed_scopes,
+      created_at"
+
+  let result =
+    pog.query(sql)
+    |> pog.parameter(pog.text(client_id))
+    |> pog.parameter(pog.text(app_type_str))
+    |> pog.parameter(pog.text(trimmed_name))
+    |> pog.parameter(pog.array(pog.text, validated_uris))
+    |> pog.parameter(pog.array(pog.text, scope_strings))
+    |> pog.parameter(pog.int(ttl_seconds))
+    |> pog.returning(client_decoder_at(0))
+    |> pog.execute(db)
+
+  case result {
+    Ok(pog.Returned(rows: [client, ..], ..)) -> Ok(client)
+    Ok(pog.Returned(rows: [], ..)) -> Error(InternalError)
+    Error(_) -> Error(InternalError)
   }
 }
 

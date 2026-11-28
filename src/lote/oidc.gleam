@@ -3,6 +3,7 @@ import gleam/option.{type Option, None, Some}
 import gleam/set.{type Set}
 import lote/auth.{type Auth}
 import lote/auth/user.{type AuthUser}
+import lote/oidc/cimd
 import lote/oidc/jwt
 import lote/oidc/scope.{type Scope}
 import lote/rate_limit.{type Limiter}
@@ -16,6 +17,7 @@ pub type Oidc {
     db: pog.Connection,
     issuer: String,
     keyring: jwt.Keyring,
+    cimd_fetcher: cimd.Fetcher,
     grant_revocations: Option(PubSub(String)),
     rate_limiter: Limiter,
   )
@@ -58,6 +60,7 @@ pub fn new_with_keyring(
     db:,
     issuer:,
     keyring:,
+    cimd_fetcher: cimd.default_fetcher(),
     grant_revocations: Some(grant_revocations),
     rate_limiter:,
   )
@@ -68,9 +71,14 @@ pub fn from_auth(auth_ctx: Auth) -> Oidc {
     db: auth_ctx.db,
     issuer: default_issuer,
     keyring: jwt.default_keyring(),
+    cimd_fetcher: cimd.default_fetcher(),
     grant_revocations: None,
     rate_limiter: auth_ctx.rate_limiter,
   )
+}
+
+pub fn with_cimd_fetcher(oidc_ctx: Oidc, fetcher: cimd.Fetcher) -> Oidc {
+  Oidc(..oidc_ctx, cimd_fetcher: fetcher)
 }
 
 pub fn publish_revocation(oidc: Oidc, grant_public_id: String) -> Nil {

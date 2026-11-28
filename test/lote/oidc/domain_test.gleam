@@ -6,6 +6,7 @@ import gleam/set
 import gleam/string
 import lote/auth/user
 import lote/oidc
+import lote/oidc/cimd
 import lote/oidc/cleanup
 import lote/oidc/client
 import lote/oidc/grant
@@ -945,6 +946,7 @@ fn make_oidc(
     db:,
     issuer: oidc.default_issuer,
     keyring: jwt.default_keyring(),
+    cimd_fetcher: cimd.default_fetcher(),
     grant_revocations:,
     rate_limiter: rate_limit.disabled(),
   )

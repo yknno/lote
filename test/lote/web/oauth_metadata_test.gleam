@@ -130,7 +130,7 @@ pub fn rfc9728_protected_resource_and_rfc8414_as_metadata_root_issuer_test() {
       issuer <> "/oidc/authorize",
       issuer <> "/oidc/token",
       ["S256"],
-      False,
+      True,
     ))
 
   // 3. Browser MCP CORS preflight OPTIONS works with 204; POST returns 405

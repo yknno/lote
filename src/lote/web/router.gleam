@@ -148,7 +148,12 @@ pub fn handle_request_with_oidc(
         jwt.jwks_json(oidc_ctx.keyring),
       )
     _, ["oidc", "authorize"] ->
-      authorize_handler.handle_request(req, auth_ctx, oidc_ctx)
+      authorize_handler.handle_request_with_ip(
+        req,
+        auth_ctx,
+        oidc_ctx,
+        client_ip,
+      )
     _, ["oidc", ..rest] ->
       oidc_handler.handle_request(req, rest, oidc_ctx, client_ip)
     _, ["api", "v1", "posts", ..rest] ->

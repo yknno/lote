@@ -176,7 +176,7 @@ pub fn metadata_json(issuer: String) -> String {
     ),
     #("code_challenge_methods_supported", json.array(["S256"], json.string)),
     #("authorization_response_iss_parameter_supported", json.bool(True)),
-    #("client_id_metadata_document_supported", json.bool(False)),
+    #("client_id_metadata_document_supported", json.bool(True)),
     #("claims_parameter_supported", json.bool(False)),
     #("request_parameter_supported", json.bool(False)),
     #("request_uri_parameter_supported", json.bool(False)),

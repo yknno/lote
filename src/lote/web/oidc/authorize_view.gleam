@@ -5,6 +5,7 @@ import gleam/set.{type Set}
 import gleam/string
 import gleam/uri
 import lote/auth/user.{type AuthUser}
+import lote/oidc/cimd
 import lote/oidc/client.{type Client}
 import lote/oidc/scope.{type Scope}
 import lote/web/csrf
@@ -34,6 +35,7 @@ pub type ConsentParams {
 pub fn consent_page(params: ConsentParams) -> wisp.Response {
   let kind_label = client_kind_label(params.client.kind)
   let redirect_host = redirect_host_label(params.redirect_uri)
+  let cimd_callout = render_cimd_callout(params, redirect_host)
   let audience_row = case
     params.resource != None || params.audience != params.default_issuer
   {
@@ -99,7 +101,7 @@ pub fn consent_page(params: ConsentParams) -> wisp.Response {
                 ),
                 html.div([attribute.class("flex items-center gap-3 text-xs")], [
                   html.span([attribute.class("font-medium text-neutral-900")], [
-                    html.text(params.current_user.name),
+                    html.bdi([], [html.text(params.current_user.name)]),
                   ]),
                   html.a(
                     [
@@ -130,7 +132,7 @@ pub fn consent_page(params: ConsentParams) -> wisp.Response {
                     ),
                   ],
                   [
-                    html.text(params.client.name),
+                    html.bdi([], [html.text(params.client.name)]),
                     html.span(
                       [attribute.class("font-normal text-neutral-600")],
                       [html.text(" wants access to your account")],
@@ -138,6 +140,7 @@ pub fn consent_page(params: ConsentParams) -> wisp.Response {
                   ],
                 ),
               ]),
+              cimd_callout,
               html.div(
                 [
                   attribute.class(
@@ -149,7 +152,7 @@ pub fn consent_page(params: ConsentParams) -> wisp.Response {
                     html.text("Signed in as "),
                     html.span(
                       [attribute.class("font-semibold text-neutral-950")],
-                      [html.text(params.current_user.name)],
+                      [html.bdi([], [html.text(params.current_user.name)])],
                     ),
                     html.text(
                       ". Issued tokens will act on behalf of your personal account. You can revoke access anytime in ",
@@ -456,6 +459,107 @@ fn scope_description(s: Scope) -> String {
   }
 }
 
+fn render_cimd_callout(
+  params: ConsentParams,
+  redirect_host: String,
+) -> element.Element(Nil) {
+  case params.client.kind {
+    client.Cimd -> {
+      let cimd_authority =
+        cimd.client_id_authority(params.client.client_id)
+        |> option.unwrap(params.client.client_id)
+      let cimd_origin = "https://" <> string.lowercase(cimd_authority)
+      let cross_domain_warning = case
+        normalized_web_origin(params.redirect_uri) == Some(cimd_origin)
+      {
+        True -> element.none()
+        False ->
+          html.p(
+            [
+              attribute.class(
+                "border-t border-neutral-300 pt-2 text-xs font-medium text-neutral-950",
+              ),
+            ],
+            [
+              html.text(
+                "Callback origin ("
+                <> redirect_host
+                <> ") differs from client domain ("
+                <> cimd_authority
+                <> ").",
+              ),
+            ],
+          )
+      }
+
+      html.div(
+        [
+          attribute.role("region"),
+          attribute.attribute("aria-label", "External client metadata notice"),
+          attribute.class(
+            "mb-4 border-2 border-neutral-950 bg-neutral-50 px-3 py-2.5",
+          ),
+        ],
+        [
+          html.p([attribute.class("text-xs font-semibold text-neutral-950")], [
+            html.text("Unregistered external client"),
+          ]),
+          html.p([attribute.class("mt-1 text-xs text-neutral-700")], [
+            html.text(
+              "This application was loaded dynamically from its domain metadata document rather than pre-registered on lote. Verify you trust this domain before authorizing.",
+            ),
+          ]),
+          html.div(
+            [
+              attribute.class(
+                "mt-2.5 flex flex-col gap-1.5 border-t border-neutral-300 pt-2 text-xs",
+              ),
+            ],
+            [
+              html.div(
+                [
+                  attribute.class("flex items-baseline justify-between gap-3"),
+                ],
+                [
+                  html.span([attribute.class("shrink-0 text-neutral-600")], [
+                    html.text("Client domain"),
+                  ]),
+                  html.span(
+                    [
+                      attribute.class(
+                        "break-all font-mono font-bold text-neutral-950",
+                      ),
+                    ],
+                    [html.text(cimd_authority)],
+                  ),
+                ],
+              ),
+              html.div(
+                [
+                  attribute.class("flex items-baseline justify-between gap-3"),
+                ],
+                [
+                  html.span([attribute.class("shrink-0 text-neutral-600")], [
+                    html.text("Metadata URL"),
+                  ]),
+                  html.span(
+                    [
+                      attribute.class("break-all font-mono text-neutral-900"),
+                    ],
+                    [html.text(params.client.client_id)],
+                  ),
+                ],
+              ),
+              cross_domain_warning,
+            ],
+          ),
+        ],
+      )
+    }
+    _ -> element.none()
+  }
+}
+
 fn client_kind_label(kind: client.Kind) -> String {
   case kind {
     client.ConfidentialApp -> "Confidential App"
@@ -476,6 +580,27 @@ fn redirect_host_label(redirect_uri: String) -> String {
         _, None, _ -> redirect_uri
       }
     Error(_) -> redirect_uri
+  }
+}
+
+fn normalized_web_origin(raw_uri: String) -> Option(String) {
+  case uri.parse(raw_uri) {
+    Ok(parsed) ->
+      case parsed.scheme, parsed.host {
+        Some(raw_scheme), Some(raw_host) -> {
+          let scheme = string.lowercase(raw_scheme)
+          let host = string.lowercase(format_host(raw_host))
+          case scheme, parsed.port {
+            "https", None | "https", Some(443) -> Some("https://" <> host)
+            "http", None | "http", Some(80) -> Some("http://" <> host)
+            _, Some(port) ->
+              Some(scheme <> "://" <> host <> ":" <> int.to_string(port))
+            _, None -> Some(scheme <> "://" <> host)
+          }
+        }
+        _, _ -> None
+      }
+    Error(_) -> None
   }
 }
 
