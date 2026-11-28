@@ -20,3 +20,25 @@ pub fn start(database_url: String) -> pog.Connection {
   let assert Ok(started) = pog.start(db_config)
   started.data
 }
+
+@external(erlang, "lote_db_ffi", "is_single_connection")
+fn is_single_connection(db: pog.Connection) -> Bool
+
+/// Run `callback` inside a PostgreSQL transaction when `db` is a connection pool.
+/// When `db` is already a checked-out single connection (for example inside an
+/// outer `pog.transaction` such as `test_helper.with_db`), run `callback(db)`
+/// directly so we do not issue a nested `BEGIN`/`COMMIT` that would prematurely
+/// commit the caller's transaction.
+pub fn with_transaction(
+  db: pog.Connection,
+  callback: fn(pog.Connection) -> Result(a, err),
+) -> Result(a, pog.TransactionError(err)) {
+  case is_single_connection(db) {
+    False -> pog.transaction(db, callback)
+    True ->
+      case callback(db) {
+        Ok(value) -> Ok(value)
+        Error(err) -> Error(pog.TransactionRolledBack(err))
+      }
+  }
+}
