@@ -220,7 +220,8 @@ fn require_json_body(
 ) -> wisp.Response {
   case has_json_content_type(req) {
     False -> json_error(400, "invalid_request")
-    True ->
+    True -> {
+      let req = wisp.set_max_body_size(req, max_json_payload_bytes)
       case wisp.read_body_bits(req) {
         Error(_) -> json_error(413, "payload_too_large")
         Ok(bits) ->
@@ -237,6 +238,7 @@ fn require_json_body(
               }
           }
       }
+    }
   }
 }
 
