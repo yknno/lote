@@ -209,6 +209,8 @@ pub fn revoking_confidential_app_secret_invalidates_access_token_while_preservin
   let assert Ok(session_revocations) = pubsub.start()
   let assert Ok(grant_revocations) = pubsub.start()
   let assert Ok(post_pubsub) = pubsub.start()
+  let grant_rev_sub = process.new_subject()
+  pubsub.subscribe(grant_revocations, grant_rev_sub)
 
   let secret_key = "conf_app_secret_revocation_key_base_0123456789abcdefghijkl"
   let issuer = "https://lote.example"
@@ -286,14 +288,18 @@ pub fn revoking_confidential_app_secret_invalidates_access_token_while_preservin
   assert ex_resp.status == 200
   let assert #(at_1, Some(rt_1)) = parse_issued_tokens(ex_resp)
 
-  // Revoke secret_1 -> at_1 is immediately invalidated (401), while the user's offline_access grant survives!
-  assert client.revoke_secret(
+  let assert Ok([active_grant]) =
+    grant.list_active_grants_for_user(tx, alice.id)
+
+  // Revoke secret_1 -> at_1 is immediately invalidated (401), revoke_secret_returning_grants
+  // reports active_grant.public_id for PubSub notification, while the offline_access grant survives!
+  assert client.revoke_secret_returning_grants(
       tx,
       alice.id,
       conf_app.client_id,
       secret_1.info.public_id,
     )
-    == Ok(True)
+    == Ok(Some([active_grant.public_id]))
 
   assert dispatch(
       simulate.request(http.Get, "/api/v1/posts")
@@ -321,4 +327,20 @@ pub fn revoking_confidential_app_secret_invalidates_access_token_while_preservin
       |> request.set_header("authorization", "Bearer " <> at_2),
     ).status
     == 200
+
+  // Revoking at_2 via RFC 7009 /oidc/revoke publishes a grant_revocations PubSub event
+  // even though the parent offline_access grant still has an active refresh token.
+  let revoke_at_resp =
+    simulate.request(http.Post, "/oidc/revoke")
+    |> request.set_header(
+      "authorization",
+      basic_header(conf_app.client_id, secret_2.secret),
+    )
+    |> simulate.form_body([#("token", at_2)])
+    |> dispatch
+  assert revoke_at_resp.status == 200
+  assert process.receive(grant_rev_sub, 200) == Ok(active_grant.public_id)
+
+  // Parent grant still survives because rt_2 is still active
+  assert grant.list_active_grants_for_user(tx, alice.id) == Ok([active_grant])
 }

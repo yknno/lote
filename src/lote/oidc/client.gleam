@@ -912,6 +912,13 @@ pub fn revoke_secret_returning_grants(
           FROM oidc_grants g
           INNER JOIN target_secret ts ON ts.id = g.issued_by_secret_id
           WHERE g.expires_at > NOW()
+          UNION
+          SELECT g.public_id
+          FROM oidc_access_tokens at
+          INNER JOIN target_secret ts ON ts.id = at.issued_by_secret_id
+          INNER JOIN oidc_grants g ON g.id = at.grant_id
+          WHERE at.expires_at > NOW()
+            AND g.expires_at > NOW()
         )
         SELECT ts.id, rg.public_id
         FROM target_secret ts

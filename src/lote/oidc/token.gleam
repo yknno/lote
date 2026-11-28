@@ -1078,18 +1078,29 @@ pub fn revoke_by_raw_token(
             AND g.consent_id = con.id
             AND at.token_hash = $1
             AND con.client_ref_id = $2
-          RETURNING g.id AS grant_id
+          RETURNING g.id AS grant_id, g.public_id AS grant_public_id
         ),
         deleted_grant AS (
           DELETE FROM oidc_grants g
           USING deleted_at da
           WHERE g.id = da.grant_id
             AND NOT EXISTS (
-              SELECT 1 FROM oidc_refresh_tokens rt WHERE rt.grant_id = g.id
+              SELECT 1
+              FROM oidc_refresh_tokens rt
+              WHERE rt.grant_id = g.id
+                AND rt.used_at IS NULL
+                AND rt.expires_at > NOW()
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM oidc_access_tokens other_at
+              WHERE other_at.grant_id = g.id
+                AND other_at.token_hash <> $1
+                AND other_at.expires_at > NOW()
             )
           RETURNING g.public_id
         )
-        SELECT public_id FROM deleted_grant"
+        SELECT grant_public_id FROM deleted_at"
 
       use at_returned <- result.map(
         pog.query(at_sql)
