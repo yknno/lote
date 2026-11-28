@@ -50,6 +50,7 @@ type State(event) {
     name: Option(Name(Message(event))),
     subscribers: Dict(Subject(event), Monitor),
     adapter: Adapter(event),
+    listener_config: Option(pog.Config),
     listener_monitor: Option(Monitor),
     reconnect_attempt: Int,
     publisher: Option(Subject(event)),
@@ -152,44 +153,52 @@ fn start_actor(
 ) -> Result(actor.Started(PubSub(event)), actor.StartError) {
   let builder =
     actor.new_with_initialiser(5000, fn(self) {
-      use #(listener_monitor, publisher, publisher_pid, decoder, decoder_pid) <- result.try(
-        case adapter {
-          Memory -> Ok(#(None, None, None, None, None))
-          Postgres(db:, database_url:, channel:, encode:, decode:) -> {
-            use db_config <- result.try(build_listener_config(database_url))
-            // Validate channel identifier and spawn the async LISTEN worker
-            // without blocking actor startup on TCP/Postgres handshake.
-            use listener_pid <- result.try(spawn_pg_listener(db_config, channel))
-            let listener_monitor = Some(process.monitor(listener_pid))
+      use
+        #(
+          listener_config,
+          listener_monitor,
+          publisher,
+          publisher_pid,
+          decoder,
+          decoder_pid,
+        )
+      <- result.try(case adapter {
+        Memory -> Ok(#(None, None, None, None, None, None))
+        Postgres(db:, database_url:, channel:, encode:, decode:) -> {
+          use db_config <- result.try(build_listener_config(database_url))
+          // Validate channel identifier and spawn the async LISTEN worker
+          // without blocking actor startup on TCP/Postgres handshake.
+          use listener_pid <- result.try(spawn_pg_listener(db_config, channel))
+          let listener_monitor = Some(process.monitor(listener_pid))
 
-            use pub_started <- result.try(
-              start_publisher_worker(self, db, channel, encode)
-              |> result.map_error(fn(err) {
-                "failed to start Postgres PubSub publisher worker: "
-                <> string.inspect(err)
-              }),
-            )
-            let _ = process.link(pub_started.pid)
+          use pub_started <- result.try(
+            start_publisher_worker(self, db, channel, encode)
+            |> result.map_error(fn(err) {
+              "failed to start Postgres PubSub publisher worker: "
+              <> string.inspect(err)
+            }),
+          )
+          let _ = process.link(pub_started.pid)
 
-            use dec_started <- result.try(
-              start_decoder_worker(self, channel, decode)
-              |> result.map_error(fn(err) {
-                "failed to start Postgres PubSub decoder worker: "
-                <> string.inspect(err)
-              }),
-            )
-            let _ = process.link(dec_started.pid)
+          use dec_started <- result.try(
+            start_decoder_worker(self, channel, decode)
+            |> result.map_error(fn(err) {
+              "failed to start Postgres PubSub decoder worker: "
+              <> string.inspect(err)
+            }),
+          )
+          let _ = process.link(dec_started.pid)
 
-            Ok(#(
-              listener_monitor,
-              Some(pub_started.data),
-              Some(pub_started.pid),
-              Some(dec_started.data),
-              Some(dec_started.pid),
-            ))
-          }
-        },
-      )
+          Ok(#(
+            Some(db_config),
+            listener_monitor,
+            Some(pub_started.data),
+            Some(pub_started.pid),
+            Some(dec_started.data),
+            Some(dec_started.pid),
+          ))
+        }
+      })
 
       let base_selector =
         process.new_selector()
@@ -251,6 +260,7 @@ fn start_actor(
         name:,
         subscribers:,
         adapter:,
+        listener_config:,
         listener_monitor:,
         reconnect_attempt: 0,
         publisher:,
@@ -514,9 +524,19 @@ fn handle_message(
     }
 
     ReconnectListener(attempt) ->
-      case state.listener_monitor, state.adapter {
-        None, Postgres(database_url:, channel:, ..) ->
-          case build_listener_config(database_url) {
+      case state.listener_monitor, state.listener_config, state.adapter {
+        None, Some(db_config), Postgres(channel:, ..) ->
+          case spawn_pg_listener(db_config, channel) {
+            Ok(pid) -> {
+              let monitor = process.monitor(pid)
+              actor.continue(
+                State(
+                  ..state,
+                  listener_monitor: Some(monitor),
+                  reconnect_attempt: attempt,
+                ),
+              )
+            }
             Error(err) -> {
               wisp.log_warning(
                 "Postgres PubSub reconnect aborted on channel \""
@@ -526,30 +546,8 @@ fn handle_message(
               )
               actor.continue(state)
             }
-            Ok(db_config) ->
-              case spawn_pg_listener(db_config, channel) {
-                Ok(pid) -> {
-                  let monitor = process.monitor(pid)
-                  actor.continue(
-                    State(
-                      ..state,
-                      listener_monitor: Some(monitor),
-                      reconnect_attempt: attempt,
-                    ),
-                  )
-                }
-                Error(err) -> {
-                  wisp.log_warning(
-                    "Postgres PubSub reconnect aborted on channel \""
-                    <> channel
-                    <> "\": "
-                    <> err,
-                  )
-                  actor.continue(state)
-                }
-              }
           }
-        _, _ -> actor.continue(state)
+        _, _, _ -> actor.continue(state)
       }
 
     Ignore -> actor.continue(state)
