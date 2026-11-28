@@ -17,6 +17,16 @@ pub type RateLimitAdapter {
   PostgresRateLimit
 }
 
+pub const min_secret_key_base_bytes = 64
+
+pub type ConfigError {
+  InvalidPort(String)
+  InvalidIssuerUrl(String)
+  MissingOidcSigningKeyForHttps(String)
+  MissingSecretKeyBaseForHttps(String)
+  ShortSecretKeyBase(Int)
+}
+
 pub type Config {
   Config(
     port: Int,
@@ -32,10 +42,152 @@ pub type Config {
   )
 }
 
+pub fn format_error(err: ConfigError) -> String {
+  case err {
+    InvalidPort(raw) ->
+      "Invalid PORT \"" <> raw <> "\" (expected integer 1..65535)"
+    InvalidIssuerUrl(raw) ->
+      "Invalid ISSUER_URL \""
+      <> raw
+      <> "\" (expected http:// or https:// origin/path without query or fragment)"
+    MissingOidcSigningKeyForHttps(issuer) ->
+      "OIDC_SIGNING_KEY_PEM must be set when ISSUER_URL uses https:// ("
+      <> issuer
+      <> ")"
+    MissingSecretKeyBaseForHttps(issuer) ->
+      "SECRET_KEY_BASE must be set when ISSUER_URL uses https:// ("
+      <> issuer
+      <> ")"
+    ShortSecretKeyBase(bytes) ->
+      "SECRET_KEY_BASE must be at least 64 bytes (got "
+      <> int.to_string(bytes)
+      <> " bytes)"
+  }
+}
+
+pub fn load_strict() -> Result(Config, ConfigError) {
+  from_env(envoy.get)
+}
+
+pub fn from_env(
+  lookup: fn(String) -> Result(String, Nil),
+) -> Result(Config, ConfigError) {
+  use port <- result.try(
+    lookup("PORT")
+    |> result.unwrap("")
+    |> parse_port,
+  )
+
+  use issuer_url <- result.try(
+    lookup("ISSUER_URL")
+    |> result.unwrap("")
+    |> parse_issuer_url(port)
+    |> result.map_error(InvalidIssuerUrl),
+  )
+
+  let is_https_issuer = string.starts_with(issuer_url, "https://")
+
+  let oidc_signing_key_pem =
+    lookup("OIDC_SIGNING_KEY_PEM")
+    |> result.unwrap("")
+    |> parse_optional_pem
+
+  use _ <- result.try(case is_https_issuer, oidc_signing_key_pem {
+    True, None -> Error(MissingOidcSigningKeyForHttps(issuer_url))
+    _, _ -> Ok(Nil)
+  })
+
+  use secret_key_base <- result.try(parse_secret_key_base(
+    lookup("SECRET_KEY_BASE"),
+    is_https_issuer,
+    issuer_url,
+  ))
+
+  let database_url =
+    lookup("DATABASE_URL")
+    |> result.unwrap("postgres://postgres:postgres@localhost:5432/lote")
+
+  let oidc_verify_keys_pem =
+    lookup("OIDC_VERIFY_KEYS_PEM")
+    |> result.unwrap("")
+    |> parse_optional_pem
+
+  let auth_adapters =
+    lookup("AUTH_ADAPTERS")
+    |> result.unwrap("")
+    |> string.split(",")
+    |> list.map(fn(s) { string.lowercase(string.trim(s)) })
+    |> list.filter(fn(s) { s != "" })
+
+  let pubsub_adapter = case
+    lookup("PUBSUB_ADAPTER")
+    |> result.unwrap("")
+    |> parse_pubsub_adapter
+  {
+    Ok(adapter) -> adapter
+    Error(invalid) -> {
+      wisp.log_warning(
+        "Unknown PUBSUB_ADAPTER \""
+        <> invalid
+        <> "\", falling back to \"memory\"",
+      )
+      MemoryPubSub
+    }
+  }
+
+  let default_rate_limit = case pubsub_adapter {
+    MemoryPubSub -> MemoryRateLimit
+    PostgresPubSub -> PostgresRateLimit
+  }
+  let rate_limit_adapter = case
+    lookup("RATE_LIMIT_ADAPTER")
+    |> result.unwrap("")
+    |> parse_rate_limit_adapter(default_rate_limit)
+  {
+    Ok(adapter) -> adapter
+    Error(invalid) -> {
+      wisp.log_warning(
+        "Unknown RATE_LIMIT_ADAPTER \""
+        <> invalid
+        <> "\", falling back to default",
+      )
+      default_rate_limit
+    }
+  }
+
+  let trusted_proxy_hops = case
+    lookup("TRUSTED_PROXY_HOPS")
+    |> result.unwrap("")
+    |> parse_trusted_proxy_hops
+  {
+    Ok(hops) -> hops
+    Error(invalid) -> {
+      wisp.log_warning(
+        "Invalid TRUSTED_PROXY_HOPS \"" <> invalid <> "\", falling back to 0",
+      )
+      0
+    }
+  }
+
+  Ok(Config(
+    port:,
+    secret_key_base:,
+    database_url:,
+    issuer_url:,
+    oidc_signing_key_pem:,
+    oidc_verify_keys_pem:,
+    auth_adapters:,
+    pubsub_adapter:,
+    rate_limit_adapter:,
+    trusted_proxy_hops:,
+  ))
+}
+
 pub fn load() -> Config {
   let port =
     envoy.get("PORT")
-    |> result.try(int.parse)
+    |> result.unwrap("")
+    |> parse_port
     |> result.unwrap(8080)
 
   let secret_key_base =
@@ -144,6 +296,37 @@ pub fn load() -> Config {
     rate_limit_adapter:,
     trusted_proxy_hops:,
   )
+}
+
+pub fn parse_port(raw: String) -> Result(Int, ConfigError) {
+  let trimmed = string.trim(raw)
+  case trimmed {
+    "" -> Ok(8080)
+    _ ->
+      case int.parse(trimmed) {
+        Ok(p) if p >= 1 && p <= 65_535 -> Ok(p)
+        _ -> Error(InvalidPort(trimmed))
+      }
+  }
+}
+
+fn parse_secret_key_base(
+  raw: Result(String, Nil),
+  is_https_issuer: Bool,
+  issuer_url: String,
+) -> Result(String, ConfigError) {
+  case raw {
+    Error(Nil) | Ok("") ->
+      case is_https_issuer {
+        True -> Error(MissingSecretKeyBaseForHttps(issuer_url))
+        False -> Ok(wisp.random_string(64))
+      }
+    Ok(val) ->
+      case string.byte_size(val) >= min_secret_key_base_bytes {
+        True -> Ok(val)
+        False -> Error(ShortSecretKeyBase(string.byte_size(val)))
+      }
+  }
 }
 
 pub fn default_issuer_url(port: Int) -> String {
