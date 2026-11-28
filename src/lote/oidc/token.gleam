@@ -496,10 +496,18 @@ pub fn exchange_authorization_code_with_secret(
               code_active
               && grant_active
               && redirect_uri == stored_redirect_uri
+              && client.matches_redirect_uri(client, redirect_uri)
               && verify_pkce_s256(code_verifier, stored_challenge)
             {
               True -> Ok(Nil)
               False -> Error(InvalidGrant)
+            },
+          )
+
+          use _ <- result.try(
+            case scope.is_subset(grant_scopes, client.allowed_scopes) {
+              True -> Ok(Nil)
+              False -> Error(InvalidScope)
             },
           )
 
@@ -794,15 +802,27 @@ pub fn rotate_refresh_token_with_secret(
           Error(InvalidGrant)
         }
         False -> {
-          use _ <- result.try(case rt_active && grant_active {
-            True -> Ok(Nil)
-            False -> Error(InvalidGrant)
-          })
+          use _ <- result.try(
+            case
+              rt_active
+              && grant_active
+              && set.contains(client.allowed_scopes, scope.OfflineAccess)
+            {
+              True -> Ok(Nil)
+              False -> Error(InvalidGrant)
+            },
+          )
 
+          let permitted_grant_scopes =
+            set.intersection(grant_scopes, client.allowed_scopes)
           use effective_scopes <- result.try(resolve_refresh_scopes(
             requested_scopes,
-            grant_scopes,
+            permitted_grant_scopes,
           ))
+          use _ <- result.try(case !set.is_empty(effective_scopes) {
+            True -> Ok(Nil)
+            False -> Error(InvalidScope)
+          })
 
           use audience <- result.try(verify_bound_audience(
             requested_resource,

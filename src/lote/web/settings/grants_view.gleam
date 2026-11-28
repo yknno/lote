@@ -140,7 +140,7 @@ pub fn index_page(
                 ),
                 html.div([attribute.class("flex items-center gap-3 text-xs")], [
                   html.span([attribute.class("font-medium text-neutral-900")], [
-                    html.text(current_user.name),
+                    html.bdi([], [html.text(current_user.name)]),
                   ]),
                   html.a(
                     [
@@ -247,7 +247,7 @@ fn consent_row(c: ConsentInfo, csrf_token: String) -> element.Element(Nil) {
       html.div([attribute.class("flex min-w-0 flex-wrap items-center gap-2")], [
         html.span(
           [attribute.class("truncate text-sm font-medium text-neutral-950")],
-          [html.text(c.client_name)],
+          [html.bdi([], [html.text(c.client_name)])],
         ),
         badge_span(kind_label(c.client_kind)),
       ]),
@@ -328,7 +328,7 @@ fn grant_row(
       html.div([attribute.class("flex min-w-0 flex-wrap items-center gap-2")], [
         html.span(
           [attribute.class("truncate text-sm font-medium text-neutral-950")],
-          [html.text(g.client_name)],
+          [html.bdi([], [html.text(g.client_name)])],
         ),
         kind_badge,
       ]),
@@ -382,7 +382,7 @@ fn grant_row(
       ],
       [
         html.span([attribute.class("break-all text-neutral-600")], [
-          html.text(ua_label),
+          html.bdi([], [html.text(ua_label)]),
         ]),
         html.span([], [
           html.text("Created "),

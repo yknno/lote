@@ -48,6 +48,14 @@ pub fn oidc_client_auth_key(ip_bucket: String, client_id: String) -> String {
   "oidc:client_auth:ip_id:" <> ip_bucket <> ":" <> client_id
 }
 
+/// Outbound OAuth Client ID Metadata Document (CIMD) network fetch ceiling per
+/// client IP bucket (guards outbound HTTPS metadata lookups on cache misses).
+pub const cimd_fetch_ip_policy = Policy(limit: 20, window_ms: 60_000, burst: 10)
+
+pub fn cimd_fetch_ip_key(ip_bucket: String) -> String {
+  "oidc:cimd_fetch:ip:" <> ip_bucket
+}
+
 /// WebSocket `/ws` handshake rate limit per client IP bucket (guards stateful
 /// Lustre Server Component actor creation and initial DB snapshot load).
 pub const ws_connect_policy = Policy(limit: 120, window_ms: 60_000, burst: 60)

@@ -99,6 +99,10 @@ fn delete_batches(
         batch_limit,
       ))
       use deleted_grant_ids <- result.try(delete_expired_grants(db, batch_limit))
+      use deleted_cimd <- result.try(delete_expired_unused_cimd_clients(
+        db,
+        batch_limit,
+      ))
 
       case grant_revocations {
         Some(subject) ->
@@ -108,7 +112,11 @@ fn delete_batches(
 
       let deleted_grants = list.length(deleted_grant_ids)
       let batch_total =
-        deleted_codes + deleted_access + deleted_refresh + deleted_grants
+        deleted_codes
+        + deleted_access
+        + deleted_refresh
+        + deleted_grants
+        + deleted_cimd
       let total = acc_deleted + batch_total
 
       let has_more =
@@ -116,6 +124,7 @@ fn delete_batches(
         || deleted_access >= batch_limit
         || deleted_refresh >= batch_limit
         || deleted_grants >= batch_limit
+        || deleted_cimd >= batch_limit
 
       case has_more {
         False -> Ok(total)
@@ -187,6 +196,30 @@ fn delete_expired_grants(
   |> pog.returning(decoder)
   |> pog.execute(db)
   |> result.map(fn(returned) { returned.rows })
+}
+
+fn delete_expired_unused_cimd_clients(
+  db: pog.Connection,
+  batch_limit: Int,
+) -> Result(Int, pog.QueryError) {
+  pog.query(
+    "DELETE FROM oidc_clients
+    WHERE id IN (
+      SELECT c.id
+      FROM oidc_clients c
+      WHERE c.kind = 'cimd'
+        AND c.cimd_expires_at IS NOT NULL
+        AND c.cimd_expires_at <= NOW()
+        AND NOT EXISTS (
+          SELECT 1 FROM oidc_consents con WHERE con.client_ref_id = c.id
+        )
+      LIMIT $1
+    )",
+  )
+  |> pog.parameter(pog.int(batch_limit))
+  |> pog.returning(decode.dynamic)
+  |> pog.execute(db)
+  |> result.map(fn(returned) { returned.count })
 }
 
 fn handle_message(

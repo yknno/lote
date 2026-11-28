@@ -2,6 +2,7 @@ import gleam/bit_array
 import gleam/http
 import gleam/http/request
 import gleam/http/response
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -12,14 +13,18 @@ import lote/auth.{type Auth}
 import lote/auth/session
 import lote/auth/user.{type AuthUser}
 import lote/oidc.{type Oidc}
+import lote/oidc/cimd
 import lote/oidc/client.{type Client}
 import lote/oidc/grant
 import lote/oidc/scope.{type Scope}
 import lote/oidc/token
+import lote/rate_limit
 import lote/web/auth/return_to
+import lote/web/client_ip
 import lote/web/csrf
 import lote/web/http_rate_limit
 import lote/web/oidc/authorize_view.{ConsentParams}
+import lote/web/rate_policy
 import wisp
 
 const authorize_csp =
@@ -55,11 +60,20 @@ pub fn handle_request(
   auth_ctx: Auth,
   oidc_ctx: Oidc,
 ) -> wisp.Response {
+  handle_request_with_ip(req, auth_ctx, oidc_ctx, "127.0.0.1")
+}
+
+pub fn handle_request_with_ip(
+  req: wisp.Request,
+  auth_ctx: Auth,
+  oidc_ctx: Oidc,
+  client_ip: String,
+) -> wisp.Response {
   let is_head = request.get_header(req, "x-original-method") == Ok("HEAD")
   let resp = case req.method, is_head {
     _, True -> wisp.method_not_allowed([http.Get, http.Post])
-    http.Get, False -> handle_get(req, auth_ctx, oidc_ctx)
-    http.Post, False -> handle_post(req, auth_ctx, oidc_ctx)
+    http.Get, False -> handle_get(req, auth_ctx, oidc_ctx, client_ip)
+    http.Post, False -> handle_post(req, auth_ctx, oidc_ctx, client_ip)
     _, False -> wisp.method_not_allowed([http.Get, http.Post])
   }
 
@@ -142,11 +156,12 @@ fn handle_get(
   req: wisp.Request,
   auth_ctx: Auth,
   oidc_ctx: Oidc,
+  client_ip: String,
 ) -> wisp.Response {
   case parse_get_query(req) {
     Error(resp) -> resp
     Ok(params) ->
-      case validate_pre_redirect(oidc_ctx, params) {
+      case validate_pre_redirect(oidc_ctx, params, client_ip) {
         Error(resp) -> resp
         Ok(pre) ->
           case validate_oauth_params(oidc_ctx, pre, params) {
@@ -233,14 +248,16 @@ fn handle_authenticated_get(
         Error(_) -> wisp.internal_server_error()
         Ok(found) -> {
           let existing_scopes = case found {
-            Some(#(_, _, s)) -> s
+            Some(#(_, _, s)) -> set.intersection(s, pre.client.allowed_scopes)
             None -> set.new()
           }
           case found, prompt_mode {
-            Some(#(consent_id, _, s)), PromptDefault
-            | Some(#(consent_id, _, s)), PromptNone
+            Some(#(consent_id, _, _)), PromptDefault
+            | Some(#(consent_id, _, _)), PromptNone
             ->
-              case scope.is_subset(validated.requested_scopes, s) {
+              case
+                scope.is_subset(validated.requested_scopes, existing_scopes)
+              {
                 True -> {
                   use <- http_rate_limit.require_user_write(
                     auth_ctx.rate_limiter,
@@ -306,6 +323,7 @@ fn handle_post(
   req: wisp.Request,
   auth_ctx: Auth,
   oidc_ctx: Oidc,
+  client_ip: String,
 ) -> wisp.Response {
   use form <- wisp.require_form(req)
   use _csrf <- csrf.require_form_token(
@@ -317,7 +335,7 @@ fn handle_post(
   case session.current_session(req, auth_ctx.db, auth_ctx.secret_key_base) {
     None -> wisp.response(401)
     Some(active) ->
-      case validate_pre_redirect(oidc_ctx, form.values) {
+      case validate_pre_redirect(oidc_ctx, form.values, client_ip) {
         Error(resp) -> resp
         Ok(pre) ->
           case validate_client_visibility(oidc_ctx, pre, active.user.id) {
@@ -475,6 +493,7 @@ fn parse_get_query(
 fn validate_pre_redirect(
   oidc_ctx: Oidc,
   params: List(#(String, String)),
+  client_ip: String,
 ) -> Result(PreRedirectValidated, wisp.Response) {
   use _ <- result.try(case has_duplicate_keys(params, set.new()) {
     True ->
@@ -496,27 +515,11 @@ fn validate_pre_redirect(
       ))
   })
 
-  use found_client <- result.try(
-    case client.find_by_client_id(oidc_ctx.db, client_id) {
-      Error(_) -> Error(wisp.internal_server_error())
-      Ok(None) ->
-        Error(authorize_view.error_page(
-          "Invalid Authorization Request",
-          "Invalid client",
-          400,
-        ))
-      Ok(Some(c)) ->
-        case c.kind {
-          client.ConfidentialApp | client.PublicApp -> Ok(c)
-          client.SubordinateBot | client.Cimd ->
-            Error(authorize_view.error_page(
-              "Invalid Authorization Request",
-              "This client does not support interactive authorization",
-              400,
-            ))
-        }
-    },
-  )
+  use found_client <- result.try(resolve_authorize_client(
+    oidc_ctx,
+    client_id,
+    client_ip,
+  ))
 
   use redirect_uri <- result.try(case list.key_find(params, "redirect_uri") {
     Ok(uri_str) if uri_str != "" ->
@@ -539,6 +542,81 @@ fn validate_pre_redirect(
 
   use state <- result.map(validate_state(params))
   PreRedirectValidated(client: found_client, redirect_uri:, state:)
+}
+
+fn resolve_authorize_client(
+  oidc_ctx: Oidc,
+  client_id: String,
+  client_ip: String,
+) -> Result(Client, wisp.Response) {
+  case cimd.is_cimd_client_id(client_id) {
+    True -> {
+      let ip_bucket = client_ip.rate_limit_bucket(client_ip)
+      let on_network_fetch = fn() {
+        case
+          rate_limit.check(
+            oidc_ctx.rate_limiter,
+            rate_policy.cimd_fetch_ip_key(ip_bucket),
+            rate_policy.cimd_fetch_ip_policy,
+          )
+        {
+          rate_limit.Allowed(_) -> Ok(Nil)
+          rate_limit.Limited(retry_after_seconds:) ->
+            Error(
+              authorize_view.error_page(
+                "Too Many Requests",
+                "Too many client metadata lookups. Please try again shortly.",
+                429,
+              )
+              |> response.set_header(
+                "retry-after",
+                int.to_string(retry_after_seconds),
+              ),
+            )
+        }
+      }
+
+      case
+        cimd.resolve_client(
+          oidc_ctx.db,
+          oidc_ctx.cimd_fetcher,
+          client_id,
+          on_network_fetch,
+        )
+      {
+        Error(rate_limit_resp) -> Error(rate_limit_resp)
+        Ok(Ok(resolved_client)) -> Ok(resolved_client)
+        Ok(Error(cimd.DatabaseError)) -> Error(wisp.internal_server_error())
+        Ok(Error(_)) ->
+          Error(authorize_view.error_page(
+            "Invalid Authorization Request",
+            "Unable to verify client metadata document",
+            400,
+          ))
+      }
+    }
+
+    False ->
+      case client.find_by_client_id(oidc_ctx.db, client_id) {
+        Error(_) -> Error(wisp.internal_server_error())
+        Ok(None) ->
+          Error(authorize_view.error_page(
+            "Invalid Authorization Request",
+            "Invalid client",
+            400,
+          ))
+        Ok(Some(c)) ->
+          case c.kind {
+            client.ConfidentialApp | client.PublicApp -> Ok(c)
+            client.SubordinateBot | client.Cimd ->
+              Error(authorize_view.error_page(
+                "Invalid Authorization Request",
+                "This client does not support interactive authorization",
+                400,
+              ))
+          }
+      }
+  }
 }
 
 fn validate_state(
@@ -810,6 +888,6 @@ fn with_security_headers(resp: wisp.Response) -> wisp.Response {
 fn should_set_authorize_csp(resp: wisp.Response) -> Bool {
   case response.get_header(resp, "content-type") {
     Ok("text/html" <> _) -> True
-    _ -> resp.status == 400 || resp.status == 403
+    _ -> resp.status == 400 || resp.status == 403 || resp.status == 429
   }
 }
