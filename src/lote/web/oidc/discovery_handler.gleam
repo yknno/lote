@@ -1,6 +1,7 @@
 import gleam/http
 import gleam/http/response
 import gleam/json
+import gleam/option.{None}
 import gleam/uri
 import wisp
 
@@ -15,11 +16,21 @@ pub fn handle_well_known(
   let issuer_segments = issuer_path_segments(issuer)
 
   case segments {
-    ["openid-configuration"] ->
+    ["openid-configuration"] | ["oauth-authorization-server"] ->
       serve_discovery_doc(req, fn() { metadata_json(issuer) })
 
-    ["openid-configuration", ..tail] if tail != [] && tail == issuer_segments ->
-      serve_discovery_doc(req, fn() { metadata_json(issuer) })
+    ["openid-configuration", ..tail]
+      | ["oauth-authorization-server", ..tail]
+      if tail != [] && tail == issuer_segments
+    -> serve_discovery_doc(req, fn() { metadata_json(issuer) })
+
+    ["oauth-protected-resource"] ->
+      serve_discovery_doc(req, fn() { protected_resource_metadata_json(issuer) })
+
+    ["oauth-protected-resource", ..tail]
+      if tail != [] && tail == issuer_segments
+    ->
+      serve_discovery_doc(req, fn() { protected_resource_metadata_json(issuer) })
 
     ["jwks.json"] -> serve_discovery_doc(req, fn() { jwks_json })
 
@@ -37,6 +48,20 @@ pub fn issuer_path_segments(issuer: String) -> List(String) {
   }
 }
 
+/// Constructs the RFC 9728 §3.1 Protected Resource Metadata URL by inserting
+/// `/.well-known/oauth-protected-resource` between the origin and any path.
+pub fn resource_metadata_url(issuer: String) -> String {
+  case uri.parse(issuer) {
+    Ok(parsed) -> {
+      let origin =
+        uri.Uri(..parsed, path: "", query: None, fragment: None)
+        |> uri.to_string
+      origin <> "/.well-known/oauth-protected-resource" <> parsed.path
+    }
+    Error(_) -> issuer <> "/.well-known/oauth-protected-resource"
+  }
+}
+
 fn serve_discovery_doc(
   req: wisp.Request,
   render_json: fn() -> String,
@@ -47,8 +72,44 @@ fn serve_discovery_doc(
       |> wisp.json_response(200)
       |> response.set_header("cache-control", discovery_cache_control)
       |> response.set_header("access-control-allow-origin", "*")
-    _ -> wisp.method_not_allowed([http.Get, http.Head])
+    http.Options ->
+      wisp.response(204)
+      |> response.set_header("access-control-allow-origin", "*")
+      |> response.set_header(
+        "access-control-allow-methods",
+        "GET, HEAD, OPTIONS",
+      )
+      |> response.set_header(
+        "access-control-allow-headers",
+        "authorization, content-type, mcp-protocol-version",
+      )
+      |> response.set_header("access-control-max-age", "86400")
+    _ -> wisp.method_not_allowed([http.Get, http.Head, http.Options])
   }
+}
+
+pub fn protected_resource_metadata_json(issuer: String) -> String {
+  json.object([
+    #("resource", json.string(issuer)),
+    #("authorization_servers", json.array([issuer], json.string)),
+    #("jwks_uri", json.string(issuer <> "/.well-known/jwks.json")),
+    #(
+      "scopes_supported",
+      json.array(
+        [
+          "openid",
+          "profile",
+          "offline_access",
+          "posts:read",
+          "posts:write",
+          "posts:delete",
+        ],
+        json.string,
+      ),
+    ),
+    #("bearer_methods_supported", json.array(["header"], json.string)),
+  ])
+  |> json.to_string
 }
 
 pub fn metadata_json(issuer: String) -> String {
@@ -115,6 +176,7 @@ pub fn metadata_json(issuer: String) -> String {
     ),
     #("code_challenge_methods_supported", json.array(["S256"], json.string)),
     #("authorization_response_iss_parameter_supported", json.bool(True)),
+    #("client_id_metadata_document_supported", json.bool(False)),
     #("claims_parameter_supported", json.bool(False)),
     #("request_parameter_supported", json.bool(False)),
     #("request_uri_parameter_supported", json.bool(False)),

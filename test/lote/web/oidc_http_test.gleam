@@ -783,7 +783,9 @@ pub fn oidc_token_client_credentials_auth_methods_origin_cookies_scopes_and_audi
   assert wrong_aud_api.status == 401
   assert parse_error_code(wrong_aud_api) == "invalid_token"
   assert response.get_header(wrong_aud_api, "www-authenticate")
-    == Ok("Bearer realm=\"lote\", error=\"invalid_token\"")
+    == Ok(
+      "Bearer realm=\"lote\", error=\"invalid_token\", resource_metadata=\"https://lote.example/.well-known/oauth-protected-resource\"",
+    )
 }
 
 pub fn oidc_auth_code_pkce_refresh_rotation_reuse_introspect_and_revoke_http_test() {
@@ -1180,7 +1182,9 @@ pub fn api_v1_posts_crud_scopes_pagination_realtime_and_privilege_separation_tes
   assert no_auth.status == 401
   assert parse_error_code(no_auth) == "unauthorized"
   assert response.get_header(no_auth, "www-authenticate")
-    == Ok("Bearer realm=\"lote\"")
+    == Ok(
+      "Bearer realm=\"lote\", resource_metadata=\"https://lote.example/.well-known/oauth-protected-resource\"",
+    )
 
   let basic_on_api =
     simulate.request(http.Get, "/api/v1/posts")
@@ -1189,7 +1193,7 @@ pub fn api_v1_posts_crud_scopes_pagination_realtime_and_privilege_separation_tes
   assert basic_on_api.status == 401
   assert parse_error_code(basic_on_api) == "unauthorized"
 
-  // Invalid Bearer token -> 401 invalid_token + WWW-Authenticate error="invalid_token"
+  // Invalid Bearer token -> 401 invalid_token + WWW-Authenticate error="invalid_token" + resource_metadata
   let bad_tok =
     simulate.request(http.Get, "/api/v1/posts")
     |> request.set_header("authorization", "Bearer lote_at_nonexistent")
@@ -1197,9 +1201,11 @@ pub fn api_v1_posts_crud_scopes_pagination_realtime_and_privilege_separation_tes
   assert bad_tok.status == 401
   assert parse_error_code(bad_tok) == "invalid_token"
   assert response.get_header(bad_tok, "www-authenticate")
-    == Ok("Bearer realm=\"lote\", error=\"invalid_token\"")
+    == Ok(
+      "Bearer realm=\"lote\", error=\"invalid_token\", resource_metadata=\"https://lote.example/.well-known/oauth-protected-resource\"",
+    )
 
-  // 2. Insufficient scope -> 403 + RFC 6750 WWW-Authenticate with required scope
+  // 2. Insufficient scope -> 403 + RFC 6750 / RFC 9728 WWW-Authenticate with required scope + resource_metadata
   let ro_write =
     simulate.request(http.Post, "/api/v1/posts")
     |> request.set_header("authorization", "Bearer " <> ro_token)
@@ -1209,7 +1215,7 @@ pub fn api_v1_posts_crud_scopes_pagination_realtime_and_privilege_separation_tes
   assert parse_error_code(ro_write) == "insufficient_scope"
   assert response.get_header(ro_write, "www-authenticate")
     == Ok(
-      "Bearer realm=\"lote\", error=\"insufficient_scope\", scope=\"posts:write\"",
+      "Bearer realm=\"lote\", error=\"insufficient_scope\", scope=\"posts:write\", resource_metadata=\"https://lote.example/.well-known/oauth-protected-resource\"",
     )
 
   // 3. POST /api/v1/posts validation, creation, cross-origin Origin support, and post_pubsub event
@@ -1373,7 +1379,7 @@ pub fn api_v1_posts_crud_scopes_pagination_realtime_and_privilege_separation_tes
   assert rw_delete.status == 403
   assert response.get_header(rw_delete, "www-authenticate")
     == Ok(
-      "Bearer realm=\"lote\", error=\"insufficient_scope\", scope=\"posts:delete\"",
+      "Bearer realm=\"lote\", error=\"insufficient_scope\", scope=\"posts:delete\", resource_metadata=\"https://lote.example/.well-known/oauth-protected-resource\"",
     )
 
   // Bob's bot cannot delete Alice's post -> 404
