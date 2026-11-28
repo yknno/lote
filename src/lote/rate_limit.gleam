@@ -344,19 +344,17 @@ fn check_postgres(
   }
 
   let sql =
-    "WITH attempt AS (
-       INSERT INTO rate_limits (key, tat_ms)
-       VALUES ($1, $2::bigint + $3::bigint)
-       ON CONFLICT (key) DO UPDATE
-       SET tat_ms = GREATEST(rate_limits.tat_ms, $2::bigint) + $3::bigint
-       WHERE rate_limits.tat_ms - $4::bigint <= $2::bigint
-       RETURNING tat_ms
-     )
-     SELECT TRUE AS allowed, tat_ms FROM attempt
-     UNION ALL
-     SELECT FALSE AS allowed, tat_ms FROM rate_limits
-     WHERE key = $1 AND NOT EXISTS (SELECT 1 FROM attempt)
-     LIMIT 1"
+    "INSERT INTO rate_limits (key, tat_ms)
+     VALUES ($1, $2::bigint + $3::bigint)
+     ON CONFLICT (key) DO UPDATE
+     SET tat_ms = CASE
+       WHEN rate_limits.tat_ms - $4::bigint <= $2::bigint
+         THEN GREATEST(rate_limits.tat_ms, $2::bigint) + $3::bigint
+       ELSE rate_limits.tat_ms
+     END
+     RETURNING
+       (OLD.tat_ms IS NULL OR OLD.tat_ms - $4::bigint <= $2::bigint) AS allowed,
+       NEW.tat_ms AS tat_ms"
 
   case
     pog.query(sql)
@@ -377,7 +375,7 @@ fn check_postgres(
       Limited(retry_after_seconds: ceil_seconds(wait_ms))
     }
     Ok(pog.Returned(rows: [], ..)) ->
-      // Row was deleted concurrently between attempt and fallback select; fail open.
+      // Defensive fallback; ON CONFLICT DO UPDATE always returns a row.
       Allowed(remaining: int.max(policy.burst - 1, 0))
     Error(err) -> {
       wisp.log_warning(
